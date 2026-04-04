@@ -363,6 +363,9 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
     }
     v256 nullifier_target = LC.template vinput<256>();
 
+    // Holder binding public input
+    v256 binding_target = LC.template vinput<256>();
+
     Q.private_input();
     v256 e = LC.template vinput<256>();
     v256 dpkx = LC.template vinput<256>();
@@ -372,7 +375,8 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
     vwc.input(LC);
 
     mdoc_hash.assert_valid_hash_mdoc(oa.data(), now, contract_hash,
-                                     nullifier_target, e, dpkx, dpky, vwc);
+                                     nullifier_target, binding_target,
+                                     e, dpkx, dpky, vwc);
 
     CIRCUIT = Q.mkcircuit(/*nc=*/1);
     dump_info("mdoc hash and parse", Q);
@@ -395,6 +399,7 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
   uint8_t test_contract_hash[8] = {0x01, 0x02, 0x03, 0x04,
                                    0x05, 0x06, 0x07, 0x08};
   hw.compute_nullifier(test_contract_hash);
+  hw.compute_binding(attrs[0]);
 
   log(INFO, "Witness done");
 
@@ -428,6 +433,19 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
     }
     filler.push_back(nv);
     pub_filler.push_back(nv);
+  }
+  // binding_hash as v256
+  {
+    std::vector<typename Field::Elt> bv(256, F.zero());
+    for (size_t j = 0; j < 256; ++j) {
+      size_t byte_idx = (255 - j) / 8;
+      size_t bit_idx = j % 8;
+      bv[j] = (hw.binding_hash_[byte_idx] >> bit_idx) & 1
+                   ? F.one()
+                   : F.zero();
+    }
+    filler.push_back(bv);
+    pub_filler.push_back(bv);
   }
 
   // Private inputs

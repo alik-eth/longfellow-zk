@@ -132,6 +132,10 @@ class MdocHash {
     v8 nullifier_in_[64];
     ShaBlockWitness nullifier_bw_;
 
+    // Holder binding witness: SHA-256(first_attr_v1[0..31]), 1 block
+    v8 binding_in_[64];
+    ShaBlockWitness binding_bw_;
+
     explicit Witness(size_t num_attr) {
       num_attr_ = num_attr;
       attr_mso_.resize(num_attr);
@@ -181,6 +185,12 @@ class MdocHash {
         nullifier_in_[i] = lc.template vinput<8>();
       }
       nullifier_bw_.input(lc);
+
+      // Holder binding witness
+      for (size_t i = 0; i < 64; ++i) {
+        binding_in_[i] = lc.template vinput<8>();
+      }
+      binding_bw_.input(lc);
     }
   };
 
@@ -191,6 +201,7 @@ class MdocHash {
                               const v8 now[/*20*/],
                               const v8 contract_hash[/*8*/],
                               const v256& nullifier_target,
+                              const v256& binding_target,
                               const v256& e,
                               const v256& dpkx, const v256& dpky,
                               const Witness& vw) const {
@@ -241,6 +252,9 @@ class MdocHash {
 
     // Nullifier: SHA-256(e || contract_hash) == nullifier_target
     assert_nullifier(e, contract_hash, nullifier_target, vw);
+
+    // Holder binding: SHA-256(oa[0].v1[0..31]) == binding_target
+    assert_binding(oa[0], binding_target, vw);
 
     // Attributes parsing
     // valueDigests, ignore byte 13 \in {A1,A2} representing map size.
@@ -602,6 +616,32 @@ class MdocHash {
     auto one = lc_.template vbit<8>(1);
     sha_.assert_message_hash(1, one, vw.nullifier_in_, nullifier_target,
                              &vw.nullifier_bw_);
+  }
+
+  // Asserts binding_hash = SHA-256(oa.v1[0..31]) where the first 32 bytes
+  // of the attribute value are hashed.  The full 64-byte SHA-256 block is
+  // constrained: 32 bytes value + 32 bytes deterministic padding.
+  void assert_binding(const OpenedAttribute& oa, const v256& binding_target,
+                      const Witness& vw) const {
+    // Assert witness bytes 0..31 match first attribute's value bytes.
+    // oa.v1[i] and binding_in_[i] use the same per-byte bit encoding.
+    for (size_t i = 0; i < 32; ++i) {
+      lc_.vassert_eq(vw.binding_in_[i], oa.v1[i]);
+    }
+    // Assert deterministic SHA-256 padding for 32-byte message
+    // byte 32: 0x80, bytes 33..55: 0x00, bytes 56..61: 0x00,
+    // byte 62: 0x01, byte 63: 0x00  (256 bits = 0x0100)
+    lc_.vassert_eq(vw.binding_in_[32], lc_.template vbit<8>(0x80));
+    for (size_t i = 33; i < 62; ++i) {
+      lc_.vassert_eq(vw.binding_in_[i], lc_.template vbit<8>(0x00));
+    }
+    lc_.vassert_eq(vw.binding_in_[62], lc_.template vbit<8>(0x01));
+    lc_.vassert_eq(vw.binding_in_[63], lc_.template vbit<8>(0x00));
+
+    // Verify SHA-256 hash of the block matches binding_target
+    auto one = lc_.template vbit<8>(1);
+    sha_.assert_message_hash(1, one, vw.binding_in_, binding_target,
+                             &vw.binding_bw_);
   }
 
   // Asserts that the key is equal to the value in big-endian order in buf_be.

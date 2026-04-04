@@ -21,8 +21,9 @@ extern "C" int longfellow_smoke_test() {
   const auto& test = mdoc_tests[0];
   RequestedAttribute attrs[1] = {age_over_18};
 
-  uint8_t contract_hash[8] = {0};  // zero contract hash for smoke test
+  uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
+  uint8_t binding_hash[32] = {0};
 
   uint8_t* proof = nullptr;
   size_t proof_len = 0;
@@ -36,6 +37,7 @@ extern "C" int longfellow_smoke_test() {
       contract_hash,
       &proof, &proof_len,
       nullifier_hash,
+      binding_hash,
       &kZkSpecs[0]);
 
   if (prove_ret != MDOC_PROVER_SUCCESS) {
@@ -52,6 +54,7 @@ extern "C" int longfellow_smoke_test() {
       (const char*)test.now,
       contract_hash,
       nullifier_hash,
+      binding_hash,
       proof, proof_len,
       test.doc_type,
       &kZkSpecs[0]);
@@ -76,6 +79,7 @@ extern "C" int longfellow_prove_verify_cached(
 
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
+  uint8_t binding_hash[32] = {0};
 
   uint8_t* proof = nullptr;
   size_t proof_len = 0;
@@ -89,6 +93,7 @@ extern "C" int longfellow_prove_verify_cached(
       contract_hash,
       &proof, &proof_len,
       nullifier_hash,
+      binding_hash,
       &kZkSpecs[0]);
 
   if (prove_ret != MDOC_PROVER_SUCCESS) return -2;
@@ -101,6 +106,7 @@ extern "C" int longfellow_prove_verify_cached(
       (const char*)test.now,
       contract_hash,
       nullifier_hash,
+      binding_hash,
       proof, proof_len,
       test.doc_type,
       &kZkSpecs[0]);

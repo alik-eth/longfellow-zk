@@ -651,12 +651,19 @@ class MdocHashWitness {
   FlatSHA256Witness::BlockWitness nullifier_bw_;
   uint8_t nullifier_hash_[32];
 
+  // Holder binding: SHA-256(first_attr_v1[0..31]), 1 block
+  uint8_t binding_block_[64];
+  FlatSHA256Witness::BlockWitness binding_bw_;
+  uint8_t binding_hash_[32];
+
   ParsedMdoc pm_;
 
   explicit MdocHashWitness(size_t num_attr, const EC& ec, const Field& Fn)
       : ec_(ec), fn_(Fn), num_attr_(num_attr) {
     memset(nullifier_block_, 0, 64);
     memset(nullifier_hash_, 0, 32);
+    memset(binding_block_, 0, 64);
+    memset(binding_hash_, 0, 32);
   }
 
   void fill_cbor_index(DenseFiller<Field>& df, const CborIndex& ind) const {
@@ -715,6 +722,38 @@ class MdocHashWitness {
     }
   }
 
+  // Compute binding_hash = SHA-256(first_attr_v1[0..31]).
+  // Must be called after compute_witness() (which fills attr_bytes_).
+  // The first attribute's CBOR value bytes are at the v1 position in the
+  // witness — we use the raw bytes from the first attribute's opening.
+  void compute_binding(const RequestedAttribute& first_attr) {
+    // The binding claim is the first 32 bytes of the attribute's CBOR value
+    // (same bytes that fill oa[0].v1[0..31] in the circuit).
+    // In v7 circuits, v1 is filled from the attribute value part of the
+    // OpenedAttribute: the first 32 bytes of attr go into attr[0..31],
+    // the next 64 bytes of value go into v1[0..63].
+    // We hash the value portion (v1[0..31]) = first 32 bytes of cbor_value.
+    uint8_t msg[32];
+    memset(msg, 0, 32);
+    size_t copy_len = first_attr.cbor_value_len < 32
+                          ? first_attr.cbor_value_len
+                          : 32;
+    memcpy(msg, first_attr.cbor_value, copy_len);
+
+    uint8_t nb;
+    FlatSHA256Witness::transform_and_witness_message(
+        32, msg, 1, nb, binding_block_, &binding_bw_);
+
+    // Extract hash from block witness h1
+    for (size_t i = 0; i < 8; ++i) {
+      uint32_t w = binding_bw_.h1[i];
+      binding_hash_[i * 4 + 0] = (w >> 24) & 0xff;
+      binding_hash_[i * 4 + 1] = (w >> 16) & 0xff;
+      binding_hash_[i * 4 + 2] = (w >> 8) & 0xff;
+      binding_hash_[i * 4 + 3] = w & 0xff;
+    }
+  }
+
   void fill_witness(DenseFiller<Field>& filler, size_t version = 7) const {
     // Fill sha of main mso.
     filler.push_back(numb_, 8, fn_);
@@ -757,6 +796,12 @@ class MdocHashWitness {
       filler.push_back(nullifier_block_[i], 8, fn_);
     }
     fill_sha(filler, nullifier_bw_);
+
+    // Binding witness: 64-byte padded block + 1 BlockWitness
+    for (size_t i = 0; i < 64; ++i) {
+      filler.push_back(binding_block_[i], 8, fn_);
+    }
+    fill_sha(filler, binding_bw_);
   }
 
   size_t max_shablocks(size_t version) const {
