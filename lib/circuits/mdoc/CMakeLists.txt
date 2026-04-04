@@ -38,6 +38,9 @@ target_link_libraries(mdoc_zk_test mdoc_static)
 proofs_add_testing_libraries(mdoc_zk_test)
 target_link_libraries(mdoc_zk_test crypto zstd)
 
+proofs_add_test(predicate_gadgets_test)
+target_link_libraries(predicate_gadgets_test mdoc)
+
 set(installable_libs mdoc_static)
 install(TARGETS ${installable_libs} DESTINATION lib)
 install(FILES mdoc_zk.h DESTINATION include)
