@@ -13,12 +13,12 @@
 # limitations under the License.
 
 add_library(mdoc mdoc_zk.cc mdoc_decompress.cc mdoc_generate_circuit.cc
-                 mdoc_circuit_id.cc zk_spec.cc)
+                 mdoc_circuit_id.cc zk_spec.cc mdoc_smoke_test.cc)
 target_link_libraries(mdoc flatsha ec algebra util zstd)
 
 add_library(mdoc_static STATIC
                         mdoc_zk.cc mdoc_decompress.cc mdoc_generate_circuit.cc
-                        mdoc_circuit_id.cc zk_spec.cc
+                        mdoc_circuit_id.cc zk_spec.cc mdoc_smoke_test.cc
     $<TARGET_OBJECTS:flatsha>
     $<TARGET_OBJECTS:ec>
     $<TARGET_OBJECTS:algebra>
