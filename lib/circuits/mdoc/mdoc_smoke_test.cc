@@ -53,3 +53,49 @@ extern "C" int longfellow_smoke_test() {
 
   return (verify_ret == MDOC_VERIFIER_SUCCESS) ? 0 : -3;
 }
+
+// Prove+verify with pre-generated circuit bytes (avoids circuit regeneration).
+// Returns: 0=success, -2=prove failed, -3=verify failed.
+// proof_out/proof_len_out: if non-null, receives the proof bytes (caller must free).
+extern "C" int longfellow_prove_verify_cached(
+    const uint8_t* circuit, size_t circuit_len,
+    uint8_t** proof_out, size_t* proof_len_out) {
+  using namespace proofs;
+  using namespace proofs::test;
+
+  const auto& test = mdoc_tests[0];
+  RequestedAttribute attrs[1] = {age_over_18};
+
+  uint8_t* proof = nullptr;
+  size_t proof_len = 0;
+  auto prove_ret = run_mdoc_prover(
+      circuit, circuit_len,
+      test.mdoc, test.mdoc_size,
+      test.pkx.as_pointer, test.pky.as_pointer,
+      test.transcript, test.transcript_size,
+      attrs, 1,
+      (const char*)test.now,
+      &proof, &proof_len,
+      &kZkSpecs[0]);
+
+  if (prove_ret != MDOC_PROVER_SUCCESS) return -2;
+
+  auto verify_ret = run_mdoc_verifier(
+      circuit, circuit_len,
+      test.pkx.as_pointer, test.pky.as_pointer,
+      test.transcript, test.transcript_size,
+      attrs, 1,
+      (const char*)test.now,
+      proof, proof_len,
+      test.doc_type,
+      &kZkSpecs[0]);
+
+  if (proof_out && proof_len_out) {
+    *proof_out = proof;
+    *proof_len_out = proof_len;
+  } else {
+    free(proof);
+  }
+
+  return (verify_ret == MDOC_VERIFIER_SUCCESS) ? 0 : -3;
+}
