@@ -503,8 +503,10 @@ MdocProverErrorCode fill_attribute(DenseFiller<Field>& filler,
     // For the value, the v7 circuit uses "<12> elementValue <cbor_value>"
     // as the comparison string.
     size_t vlen = attr.cbor_value_len + 12 + 1;
+    // Pack verification_type into bits 6-7 of vlen
+    size_t packed_vlen = vlen | (static_cast<size_t>(attr.verification_type & 0x3) << 6);
 
-    filler.push_back(vlen, 8, F);
+    filler.push_back(packed_vlen, 8, F);
   } else {
     // version < 7
     // Append the length of the elementIdentifier.

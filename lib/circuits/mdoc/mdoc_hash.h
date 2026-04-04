@@ -464,18 +464,83 @@ class MdocHash {
     std::copy(len.begin(), len.begin() + 8, tmp.begin());  // cast vind into v8.
     lc_.vassert_eq(tmp, oa.len);
 
-    // "elementValue" checks the full cbor key-value, because it is public.
+    // "elementValue" — verification type is packed in vlen bits 6-7.
+    // Bits 0-5: actual value length (max 63, sufficient for 56-byte limit)
+    // Bits 6-7: verification type (0=EQ, 1=LEQ, 2=GEQ, 3=NEQ)
+    //
+    // When type=0 (EQ): byte-for-byte equality (original behavior)
+    // When type=1 (LEQ): got_value <= want_value (lexicographic)
+    // When type=2 (GEQ): got_value >= want_value (lexicographic)
+    // When type=3 (NEQ): got_value != want_value
+
+    // Extract verification type (bits 6-7) and actual length (bits 0-5)
+    auto vtype_bit0 = oa.vlen[6];
+    auto vtype_bit1 = oa.vlen[7];
+    auto has_predicate = lc_.lor(vtype_bit0, vtype_bit1);
+
+    // Mask vlen to 6 bits: zero out bits 6-7 for length comparisons
+    v8 masked_vlen;
+    for (size_t i = 0; i < 6; ++i) masked_vlen[i] = oa.vlen[i];
+    masked_vlen[6] = lc_.bit(0);
+    masked_vlen[7] = lc_.bit(0);
+
     mux_offset(3, shift, len, sh);
     r_.shift(shift, MAX_BUF, got, max, buf, zz, 3);
+
+    // Byte-for-byte equality check on elementValue (same as original for EQ)
     for (size_t j = 0; j < MAX_EV; ++j) {
-      auto ll = lc_.vlt(j, oa.vlen);
+      auto ll = lc_.vlt(j, masked_vlen);
       for (size_t i = 0; i < 8; ++i) {
         auto same = lc_.eq(1, &got[j][i], &want_ev[j][i]);
-        lc_.assert_implies(ll, same);
+        // In EQ mode: require equality for all bytes
+        // In predicate mode: only require equality for CBOR prefix (first 13 bytes)
+        // The value bytes (j >= 13) are checked via Memcmp below
+        if (j < 13) {
+          lc_.assert_implies(ll, same);
+        } else {
+          // For value bytes: assert equality only when NOT in predicate mode
+          auto eq_required = lc_.lnot(has_predicate);
+          auto check = lc_.lor(lc_.lnot(ll), lc_.lor(eq_required, same));
+          // When ll=1 and eq_required=1: same must be 1
+          // When ll=1 and eq_required=0: always passes (predicate handles it)
+          // When ll=0: always passes
+          lc_.assert1(lc_.lor(lc_.lnot(ll),
+                              lc_.lor(lc_.lnot(eq_required), same)));
+        }
       }
     }
+
+    // For predicate modes, compare value bytes (after 13-byte CBOR prefix)
+    // using lexicographic Memcmp
+    constexpr size_t EV_PREFIX = 13;
+    constexpr size_t VAL_LEN = MAX_EV - EV_PREFIX;
+    v8 val_got[VAL_LEN], val_want[VAL_LEN];
+    for (size_t j = 0; j < VAL_LEN; ++j) {
+      val_got[j] = got[EV_PREFIX + j];
+      val_want[j] = want_ev[EV_PREFIX + j];
+    }
+
+    const Memcmp<LogicCircuit> VCMP(lc_);
+    auto is_leq = VCMP.leq(VAL_LEN, val_got, val_want);
+    auto is_geq = VCMP.leq(VAL_LEN, val_want, val_got);
+    auto val_eq = lc_.land(is_leq, is_geq);
+
+    // Type selection:
+    // type 1 (bit0=1, bit1=0): LEQ — assert is_leq
+    // type 2 (bit0=0, bit1=1): GEQ — assert is_geq
+    // type 3 (bit0=1, bit1=1): NEQ — assert NOT val_eq
+    auto is_type_leq = lc_.land(vtype_bit0, lc_.lnot(vtype_bit1));
+    auto is_type_geq = lc_.land(lc_.lnot(vtype_bit0), vtype_bit1);
+    auto is_type_neq = lc_.land(vtype_bit0, vtype_bit1);
+
+    // Each type implies its condition: type_X → condition_X
+    lc_.assert1(lc_.lor(lc_.lnot(is_type_leq), is_leq));
+    lc_.assert1(lc_.lor(lc_.lnot(is_type_geq), is_geq));
+    lc_.assert1(lc_.lor(lc_.lnot(is_type_neq), lc_.lnot(val_eq)));
+
+    // Assert extracted length matches (using masked vlen without type bits)
     std::copy(len.begin(), len.begin() + 8, tmp.begin());  // cast vind into v8.
-    lc_.vassert_eq(tmp, oa.vlen);
+    lc_.vassert_eq(tmp, masked_vlen);
   }
 
   void mux_offset(size_t slot, vind& shift, vind& len,
