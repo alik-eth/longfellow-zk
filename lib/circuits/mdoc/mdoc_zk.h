@@ -39,11 +39,24 @@ const size_t kLigeroNreqv7 = 132;  // ~109 bits statistical security
 /* This struct allows a verifier to express which attribute and value the prover
  * must claim.  The value should be passed as the raw bytes of the CBOR value.
  */
+// Verification types for attribute predicates.
+// EQ (0): attribute value must equal cbor_value (default, original behavior)
+// LEQ (1): attribute value <= cbor_value (lexicographic, e.g., birth_date <= cutoff)
+// GEQ (2): attribute value >= cbor_value (lexicographic)
+// NEQ (3): attribute value != cbor_value
+enum VerificationType {
+  VERIFY_EQ = 0,
+  VERIFY_LEQ = 1,
+  VERIFY_GEQ = 2,
+  VERIFY_NEQ = 3,
+};
+
 typedef struct {
   uint8_t namespace_id[64];
   uint8_t id[32];
   uint8_t cbor_value[64];
   size_t namespace_len, id_len, cbor_value_len;
+  uint8_t verification_type;  // VerificationType: 0=EQ, 1=LEQ, 2=GEQ, 3=NEQ
 } RequestedAttribute;
 
 // Return codes for the run_mdoc_prover method.
