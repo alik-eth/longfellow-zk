@@ -128,6 +128,10 @@ class MdocHash {
     std::vector<SaltedHash> salted_hashes_;
     size_t num_attr_;
 
+    // Nullifier witness: 1-block SHA-256 input (64 bytes) + block witness
+    v8 nullifier_in_[64];
+    ShaBlockWitness nullifier_bw_;
+
     explicit Witness(size_t num_attr) {
       num_attr_ = num_attr;
       attr_mso_.resize(num_attr);
@@ -171,6 +175,12 @@ class MdocHash {
         attr_ev_[ai].input(lc);
         salted_hashes_[ai].input(lc);
       }
+
+      // Nullifier witness
+      for (size_t i = 0; i < 64; ++i) {
+        nullifier_in_[i] = lc.template vinput<8>();
+      }
+      nullifier_bw_.input(lc);
     }
   };
 
@@ -178,7 +188,10 @@ class MdocHash {
       : lc_(lc), sha_(lc), r_(lc), cb_(lc) {}
 
   void assert_valid_hash_mdoc(OpenedAttribute oa[/* NUM_ATTR */],
-                              const v8 now[/*20*/], const v256& e,
+                              const v8 now[/*20*/],
+                              const v8 contract_hash[/*8*/],
+                              const v256& nullifier_target,
+                              const v256& e,
                               const v256& dpkx, const v256& dpky,
                               const Witness& vw) const {
     auto preimage = construct_signature_preimage(vw);
@@ -225,6 +238,9 @@ class MdocHash {
 
     assert_key(dpkx, &cmp_buf[kPkxInd]);
     assert_key(dpky, &cmp_buf[kPkyInd]);
+
+    // Nullifier: SHA-256(e || contract_hash) == nullifier_target
+    assert_nullifier(e, contract_hash, nullifier_target, vw);
 
     // Attributes parsing
     // valueDigests, ignore byte 13 \in {A1,A2} representing map size.
@@ -554,6 +570,38 @@ class MdocHash {
     lc_.vmux(sh.perm[2 * slot + 1], t[0], sh.l[2], sh.l[0]);
     lc_.vmux(sh.perm[2 * slot + 1], t[1], sh.l[3], sh.l[1]);
     lc_.vmux(sh.perm[2 * slot], len, t[1], t[0]);
+  }
+
+  // Asserts nullifier = SHA-256(e || contract_hash) where e is the 32-byte
+  // big-endian MSO hash and contract_hash is 8 bytes.  The full 64-byte
+  // SHA-256 block is constrained: 32 bytes e + 8 bytes contract_hash +
+  // 24 bytes deterministic padding (0x80 + zeros + 0x0140 length).
+  void assert_nullifier(const v256& e, const v8 contract_hash[/*8*/],
+                        const v256& nullifier_target,
+                        const Witness& vw) const {
+    // Assert witness bytes 0..31 match e (little-endian, matching to_bytes_field).
+    // e[j] = bit j%8 of e_bytes[j/8], where e_bytes is to_bytes_field output.
+    for (size_t j = 0; j < 256; ++j) {
+      lc_.assert_eq(vw.nullifier_in_[j / 8][j % 8], e[j]);
+    }
+    // Assert witness bytes 32..39 match contract_hash
+    for (size_t i = 0; i < 8; ++i) {
+      lc_.vassert_eq(vw.nullifier_in_[32 + i], contract_hash[i]);
+    }
+    // Assert deterministic SHA-256 padding for 40-byte message
+    // byte 40: 0x80, bytes 41..55: 0x00, bytes 56..61: 0x00,
+    // byte 62: 0x01, byte 63: 0x40  (320 bits = 0x0140)
+    lc_.vassert_eq(vw.nullifier_in_[40], lc_.template vbit<8>(0x80));
+    for (size_t i = 41; i < 62; ++i) {
+      lc_.vassert_eq(vw.nullifier_in_[i], lc_.template vbit<8>(0x00));
+    }
+    lc_.vassert_eq(vw.nullifier_in_[62], lc_.template vbit<8>(0x01));
+    lc_.vassert_eq(vw.nullifier_in_[63], lc_.template vbit<8>(0x40));
+
+    // Verify SHA-256 hash of the block matches nullifier_target
+    auto one = lc_.template vbit<8>(1);
+    sha_.assert_message_hash(1, one, vw.nullifier_in_, nullifier_target,
+                             &vw.nullifier_bw_);
   }
 
   // Asserts that the key is equal to the value in big-endian order in buf_be.

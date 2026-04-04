@@ -141,6 +141,13 @@ CircuitGenerationErrorCode generate_circuit(const ZkSpecStruct* zk_spec,
       now[i] = lc.template vinput<8>();
     }
 
+    // Nullifier public inputs: 8-byte contract hash + 256-bit target
+    v8 contract_hash[8];
+    for (size_t i = 0; i < 8; ++i) {
+      contract_hash[i] = lc.template vinput<8>();
+    }
+    v256 nullifier_target = lc.template vinput<256>();
+
     MACTag mac[7]; /* 3 macs + av */
     for (size_t i = 0; i < 7; ++i) {
       mac[i] = lc.eltw_input();
@@ -161,7 +168,8 @@ CircuitGenerationErrorCode generate_circuit(const ZkSpecStruct* zk_spec,
       macw[i].input(lc);
     }
 
-    mdoc_h.assert_valid_hash_mdoc(oa.data(), now, e, dpkx, dpky, *w);
+    mdoc_h.assert_valid_hash_mdoc(oa.data(), now, contract_hash,
+                                    nullifier_target, e, dpkx, dpky, *w);
 
     MACTag a_v = mac[6];
     mac_check.verify_mac(&mac[0], a_v, e, macw[0]);

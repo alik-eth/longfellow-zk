@@ -174,7 +174,10 @@ MdocProverErrorCode run_mdoc_prover(
     const uint8_t* transcript, size_t tr_len, /* session transcript */
     const RequestedAttribute* attrs, size_t attrs_len,
     const char* now, /* time formatted as "2023-11-02T09:00:00Z" */
-    uint8_t** prf, size_t* proof_len, const ZkSpecStruct* zk_spec_version);
+    const uint8_t* contract_hash,  /* 8 bytes, nullifier domain separator */
+    uint8_t** prf, size_t* proof_len,
+    uint8_t nullifier_hash_out[32], /* written: SHA-256(e || contract_hash) */
+    const ZkSpecStruct* zk_spec_version);
 
 // The run_mdoc2_verifier method accepts a byte representation of the circuit,
 // the public key of the issuer, the transcript, an array of RequestedAttribute
@@ -186,6 +189,8 @@ MdocVerifierErrorCode run_mdoc_verifier(
     const uint8_t* transcript, size_t tr_len, /* session transcript */
     const RequestedAttribute* attrs, size_t attrs_len,
     const char* now, /* time formatted as "2023-11-02T09:00:00Z" */
+    const uint8_t* contract_hash,  /* 8 bytes, nullifier domain separator */
+    const uint8_t nullifier_hash[32], /* expected nullifier */
     const uint8_t* zkproof, size_t proof_len, const char* docType,
     const ZkSpecStruct* zk_spec_version);
 

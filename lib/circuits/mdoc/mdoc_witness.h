@@ -646,10 +646,18 @@ class MdocHashWitness {
 
   FlatSHA256Witness::BlockWitness bw_[kMaxSHABlocks];
 
+  // Nullifier: SHA-256(e_bytes || contract_hash), 1 block
+  uint8_t nullifier_block_[64];
+  FlatSHA256Witness::BlockWitness nullifier_bw_;
+  uint8_t nullifier_hash_[32];
+
   ParsedMdoc pm_;
 
   explicit MdocHashWitness(size_t num_attr, const EC& ec, const Field& Fn)
-      : ec_(ec), fn_(Fn), num_attr_(num_attr) {}
+      : ec_(ec), fn_(Fn), num_attr_(num_attr) {
+    memset(nullifier_block_, 0, 64);
+    memset(nullifier_hash_, 0, 32);
+  }
 
   void fill_cbor_index(DenseFiller<Field>& df, const CborIndex& ind) const {
     df.push_back(ind.k, kCborIndexBits, fn_);
@@ -683,6 +691,27 @@ class MdocHashWitness {
     }
     for (size_t k = 0; k < 8; ++k) {
       filler.push_back(BPENC.mkpacked_v32(bw.h1[k]));
+    }
+  }
+
+  // Compute nullifier = SHA-256(e_bytes || contract_hash).
+  // Must be called after compute_witness() (which sets e_).
+  void compute_nullifier(const uint8_t contract_hash[8]) {
+    uint8_t msg[40];
+    ec_.f_.to_bytes_field(msg, e_);
+    memcpy(msg + 32, contract_hash, 8);
+
+    uint8_t nb;
+    FlatSHA256Witness::transform_and_witness_message(
+        40, msg, 1, nb, nullifier_block_, &nullifier_bw_);
+
+    // Extract hash from block witness h1 (big-endian uint32_t[8])
+    for (size_t i = 0; i < 8; ++i) {
+      uint32_t w = nullifier_bw_.h1[i];
+      nullifier_hash_[i * 4 + 0] = (w >> 24) & 0xff;
+      nullifier_hash_[i * 4 + 1] = (w >> 16) & 0xff;
+      nullifier_hash_[i * 4 + 2] = (w >> 8) & 0xff;
+      nullifier_hash_[i * 4 + 3] = w & 0xff;
     }
   }
 
@@ -722,6 +751,12 @@ class MdocHashWitness {
         fill_salted_attr(filler, attr_sh_[ai]);
       }
     }
+
+    // Nullifier witness: 64-byte padded block + 1 BlockWitness
+    for (size_t i = 0; i < 64; ++i) {
+      filler.push_back(nullifier_block_[i], 8, fn_);
+    }
+    fill_sha(filler, nullifier_bw_);
   }
 
   size_t max_shablocks(size_t version) const {

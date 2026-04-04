@@ -356,6 +356,13 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
       now[i] = LC.template vinput<8>();
     }
 
+    // Nullifier public inputs
+    v8 contract_hash[8];
+    for (size_t i = 0; i < 8; ++i) {
+      contract_hash[i] = LC.template vinput<8>();
+    }
+    v256 nullifier_target = LC.template vinput<256>();
+
     Q.private_input();
     v256 e = LC.template vinput<256>();
     v256 dpkx = LC.template vinput<256>();
@@ -364,7 +371,8 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
     typename MdocHash::Witness vwc(attrs.size());
     vwc.input(LC);
 
-    mdoc_hash.assert_valid_hash_mdoc(oa.data(), now, e, dpkx, dpky, vwc);
+    mdoc_hash.assert_valid_hash_mdoc(oa.data(), now, contract_hash,
+                                     nullifier_target, e, dpkx, dpky, vwc);
 
     CIRCUIT = Q.mkcircuit(/*nc=*/1);
     dump_info("mdoc hash and parse", Q);
@@ -383,6 +391,11 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
 
   check(ok == MDOC_PROVER_SUCCESS, "Could not compute hash witness");
 
+  // Compute nullifier with a test contract hash
+  uint8_t test_contract_hash[8] = {0x01, 0x02, 0x03, 0x04,
+                                   0x05, 0x06, 0x07, 0x08};
+  hw.compute_nullifier(test_contract_hash);
+
   log(INFO, "Witness done");
 
   // ========= Fill witness
@@ -399,6 +412,23 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
   }
   fill_bit_string(filler, mdoc_tests[t_ind].now, 20, 20, F);
   fill_bit_string(pub_filler, mdoc_tests[t_ind].now, 20, 20, F);
+
+  // Nullifier public inputs
+  fill_bit_string(filler, test_contract_hash, 8, 8, F);
+  fill_bit_string(pub_filler, test_contract_hash, 8, 8, F);
+  // nullifier_hash as v256
+  {
+    std::vector<typename Field::Elt> nv(256, F.zero());
+    for (size_t j = 0; j < 256; ++j) {
+      size_t byte_idx = (255 - j) / 8;
+      size_t bit_idx = j % 8;
+      nv[j] = (hw.nullifier_hash_[byte_idx] >> bit_idx) & 1
+                   ? F.one()
+                   : F.zero();
+    }
+    filler.push_back(nv);
+    pub_filler.push_back(nv);
+  }
 
   // Private inputs
   uint8_t buf[Fp256Base::kBytes];
