@@ -119,6 +119,11 @@ void test_proof_creation_and_verification(const ZkSpecStruct& zk_spec) {
 
   uint8_t* zkproof;
   size_t proof_len;
+  uint8_t contract_hash[8] = {0};
+  uint8_t nullifier_hash[32] = {0};
+  uint8_t binding_hash[32] = {0};
+  uint8_t escrow_digest[32] = {0};
+  uint8_t escrow_fields[8][32] = {{0}};
 
   {
     log(INFO, "starting prover");
@@ -126,7 +131,9 @@ void test_proof_creation_and_verification(const ZkSpecStruct& zk_spec) {
         (uint8_t*)circuit_bytes.data(), circuit_bytes.size(), test->mdoc,
         test->mdoc_size, test->pkx.as_pointer, test->pky.as_pointer,
         test->transcript, test->transcript_size, claims, zk_spec.num_attributes,
-        (const char*)test->now, &zkproof, &proof_len, &zk_spec);
+        (const char*)test->now, contract_hash, (const uint8_t*)escrow_fields,
+        &zkproof, &proof_len, nullifier_hash, binding_hash, escrow_digest,
+        &zk_spec);
     EXPECT_EQ(ret, MDOC_PROVER_SUCCESS);
   }
   {
@@ -135,7 +142,8 @@ void test_proof_creation_and_verification(const ZkSpecStruct& zk_spec) {
         (uint8_t*)circuit_bytes.data(), circuit_bytes.size(),
         test->pkx.as_pointer, test->pky.as_pointer, test->transcript,
         test->transcript_size, claims, zk_spec.num_attributes,
-        (const char*)test->now, zkproof, proof_len, test->doc_type, &zk_spec);
+        (const char*)test->now, contract_hash, nullifier_hash, binding_hash,
+        escrow_digest, zkproof, proof_len, test->doc_type, &zk_spec);
     EXPECT_EQ(ret, MDOC_VERIFIER_SUCCESS);
     free(zkproof);
   }

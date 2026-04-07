@@ -43,18 +43,18 @@ extern "C" {
 // }
 
 const ZkSpecStruct kZkSpecs[kNumZkSpecs] = {
-    // Circuits produced 2026-01-09
+    // Circuits produced 2026-04-07 (with escrow_digest)
     {"longfellow-libzk-v1",
-     "8d079211715200ff06c5109639245502bfe94aa869908d31176aae4016182121", 1, 7,
+     "0e97237126e750bdfffd0c5d3d9b5ef8b487dd907c3f869ce79de95b4c865df3", 1, 7,
      4151, 4096},
     {"longfellow-libzk-v1",
-     "6a5810683e62b6d7766ebd0d7ca72518a2b8325418142adcadb10d51dbbcd5ad", 2, 7,
+     "a7952193980a53e800c360b913984fbc036be5d5421155cf4e5fc364b014679f", 2, 7,
      4265, 4096},
     {"longfellow-libzk-v1",
-     "8ee4849ae1293ae6fe5f9082ce3e5e15c4f198f2998c682fa1b727237d6d252f", 3, 7,
+     "1a99813232f5e5b1ab32e28e96ceee5ad0138a9ce462c7f08d12739b2fcf9265", 3, 7,
      4307, 4096},
     {"longfellow-libzk-v1",
-     "5aebdaaafe17296a3ef3ca6c80c6e7505e09291897c39700410a365fb278e460", 4, 7,
+     "1c1cfc92b61da57c3d981c22a2539f72726230a152c91987024aa875e8463d2e", 4, 7,
      4415, 4096},
     // Circuits produced on 2025-10-10
     {"longfellow-libzk-v1",
