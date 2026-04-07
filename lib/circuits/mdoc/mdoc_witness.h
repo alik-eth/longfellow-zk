@@ -656,6 +656,11 @@ class MdocHashWitness {
   FlatSHA256Witness::BlockWitness binding_bw_;
   uint8_t binding_hash_[32];
 
+  // Identity escrow: SHA-256(escrow_fields[0..255]), 5 SHA-256 blocks
+  uint8_t escrow_block_[320];  // 256 data + 64 bytes padding
+  FlatSHA256Witness::BlockWitness escrow_bw_[5];
+  uint8_t escrow_digest_[32];
+
   ParsedMdoc pm_;
 
   explicit MdocHashWitness(size_t num_attr, const EC& ec, const Field& Fn)
@@ -664,6 +669,8 @@ class MdocHashWitness {
     memset(nullifier_hash_, 0, 32);
     memset(binding_block_, 0, 64);
     memset(binding_hash_, 0, 32);
+    memset(escrow_block_, 0, 320);
+    memset(escrow_digest_, 0, 32);
   }
 
   void fill_cbor_index(DenseFiller<Field>& df, const CborIndex& ind) const {
@@ -754,6 +761,30 @@ class MdocHashWitness {
     }
   }
 
+  // Compute escrow_digest = SHA-256(escrow_fields[0] || ... || escrow_fields[7]).
+  // Each field is 32 bytes, zero-padded. Total: 256 bytes = 5 SHA-256 blocks
+  // (including padding block).
+  void compute_escrow_digest(const uint8_t escrow_fields[8][32]) {
+    // Copy 8 × 32-byte fields into the first 256 bytes
+    for (size_t i = 0; i < 8; ++i) {
+      memcpy(escrow_block_ + i * 32, escrow_fields[i], 32);
+    }
+
+    uint8_t nb;
+    FlatSHA256Witness::transform_and_witness_message(
+        256, escrow_block_, 5, nb, escrow_block_, escrow_bw_);
+
+    // Extract hash from last block witness h1 (big-endian uint32_t[8])
+    size_t last = nb - 1;
+    for (size_t i = 0; i < 8; ++i) {
+      uint32_t w = escrow_bw_[last].h1[i];
+      escrow_digest_[i * 4 + 0] = (w >> 24) & 0xff;
+      escrow_digest_[i * 4 + 1] = (w >> 16) & 0xff;
+      escrow_digest_[i * 4 + 2] = (w >> 8) & 0xff;
+      escrow_digest_[i * 4 + 3] = w & 0xff;
+    }
+  }
+
   void fill_witness(DenseFiller<Field>& filler, size_t version = 7) const {
     // Fill sha of main mso.
     filler.push_back(numb_, 8, fn_);
@@ -802,6 +833,14 @@ class MdocHashWitness {
       filler.push_back(binding_block_[i], 8, fn_);
     }
     fill_sha(filler, binding_bw_);
+
+    // Escrow witness: 256-byte data + 5 BlockWitnesses
+    for (size_t i = 0; i < 256; ++i) {
+      filler.push_back(escrow_block_[i], 8, fn_);
+    }
+    for (size_t j = 0; j < 5; ++j) {
+      fill_sha(filler, escrow_bw_[j]);
+    }
   }
 
   size_t max_shablocks(size_t version) const {
