@@ -175,9 +175,11 @@ MdocProverErrorCode run_mdoc_prover(
     const RequestedAttribute* attrs, size_t attrs_len,
     const char* now, /* time formatted as "2023-11-02T09:00:00Z" */
     const uint8_t* contract_hash,  /* 8 bytes, nullifier domain separator */
+    const uint8_t* escrow_fields,  /* 8×32=256 bytes, zero-padded escrow fields */
     uint8_t** prf, size_t* proof_len,
     uint8_t nullifier_hash_out[32], /* written: SHA-256(e || contract_hash) */
     uint8_t binding_hash_out[32],   /* written: SHA-256(attr[0].v1[0..31]) */
+    uint8_t escrow_digest_out[32],  /* written: SHA-256(escrow_fields) */
     const ZkSpecStruct* zk_spec_version);
 
 // The run_mdoc2_verifier method accepts a byte representation of the circuit,
@@ -193,6 +195,7 @@ MdocVerifierErrorCode run_mdoc_verifier(
     const uint8_t* contract_hash,  /* 8 bytes, nullifier domain separator */
     const uint8_t nullifier_hash[32], /* expected nullifier */
     const uint8_t binding_hash[32],   /* expected binding hash */
+    const uint8_t escrow_digest[32],  /* expected escrow digest */
     const uint8_t* zkproof, size_t proof_len, const char* docType,
     const ZkSpecStruct* zk_spec_version);
 

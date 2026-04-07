@@ -24,6 +24,8 @@ extern "C" int longfellow_smoke_test() {
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
   uint8_t binding_hash[32] = {0};
+  uint8_t escrow_fields[256] = {0};
+  uint8_t escrow_digest[32] = {0};
 
   uint8_t* proof = nullptr;
   size_t proof_len = 0;
@@ -35,9 +37,11 @@ extern "C" int longfellow_smoke_test() {
       attrs, 1,
       (const char*)test.now,
       contract_hash,
+      escrow_fields,
       &proof, &proof_len,
       nullifier_hash,
       binding_hash,
+      escrow_digest,
       &kZkSpecs[0]);
 
   if (prove_ret != MDOC_PROVER_SUCCESS) {
@@ -55,6 +59,7 @@ extern "C" int longfellow_smoke_test() {
       contract_hash,
       nullifier_hash,
       binding_hash,
+      escrow_digest,
       proof, proof_len,
       test.doc_type,
       &kZkSpecs[0]);
@@ -80,6 +85,8 @@ extern "C" int longfellow_prove_verify_cached(
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
   uint8_t binding_hash[32] = {0};
+  uint8_t escrow_fields[256] = {0};
+  uint8_t escrow_digest[32] = {0};
 
   uint8_t* proof = nullptr;
   size_t proof_len = 0;
@@ -91,9 +98,11 @@ extern "C" int longfellow_prove_verify_cached(
       attrs, 1,
       (const char*)test.now,
       contract_hash,
+      escrow_fields,
       &proof, &proof_len,
       nullifier_hash,
       binding_hash,
+      escrow_digest,
       &kZkSpecs[0]);
 
   if (prove_ret != MDOC_PROVER_SUCCESS) return -2;
@@ -107,6 +116,7 @@ extern "C" int longfellow_prove_verify_cached(
       contract_hash,
       nullifier_hash,
       binding_hash,
+      escrow_digest,
       proof, proof_len,
       test.doc_type,
       &kZkSpecs[0]);

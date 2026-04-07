@@ -71,6 +71,8 @@ class MdocZKTest : public testing::Test {
     uint8_t contract_hash[8] = {0};
     uint8_t nullifier_hash[32] = {0};
     uint8_t binding_hash[32] = {0};
+    uint8_t escrow_fields[256] = {0};
+    uint8_t escrow_digest[32] = {0};
 
     log(INFO, "========== Test %s", test_name);
     {
@@ -79,8 +81,8 @@ class MdocZKTest : public testing::Test {
           circuit, circuit_len, test->mdoc, test->mdoc_size,
           test->pkx.as_pointer, test->pky.as_pointer, test->transcript,
           test->transcript_size, attrs, num_attrs, (const char*)test->now,
-          contract_hash, &zkproof, &proof_len, nullifier_hash, binding_hash,
-          &zk_spec);
+          contract_hash, escrow_fields, &zkproof, &proof_len, nullifier_hash,
+          binding_hash, escrow_digest, &zk_spec);
       EXPECT_EQ(ret, want_ret);
     }
 
@@ -90,7 +92,7 @@ class MdocZKTest : public testing::Test {
           circuit, circuit_len, test->pkx.as_pointer, test->pky.as_pointer,
           test->transcript, test->transcript_size, attrs, num_attrs,
           (const char*)test->now, contract_hash, nullifier_hash, binding_hash,
-          zkproof, proof_len, test->doc_type, &zk_spec);
+          escrow_digest, zkproof, proof_len, test->doc_type, &zk_spec);
       EXPECT_EQ(ret, MDOC_VERIFIER_SUCCESS);
     }
 
@@ -180,6 +182,8 @@ TEST_F(MdocZKTest, long_attribute) {
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
   uint8_t binding_hash[32] = {0};
+  uint8_t escrow_fields[256] = {0};
+  uint8_t escrow_digest[32] = {0};
   RequestedAttribute attrs[1] = {test::age_over_18};
   auto test = &mdoc_tests[0];
   {
@@ -188,8 +192,8 @@ TEST_F(MdocZKTest, long_attribute) {
         circuit1_, circuit_len1_, test->mdoc, test->mdoc_size,
         test->pkx.as_pointer, test->pky.as_pointer, test->transcript,
         test->transcript_size, attrs, 1, (const char*)test->now,
-        contract_hash, &zkproof, &proof_len, nullifier_hash, binding_hash,
-        &kZkSpecs[0]);
+        contract_hash, escrow_fields, &zkproof, &proof_len, nullifier_hash,
+        binding_hash, escrow_digest, &kZkSpecs[0]);
     EXPECT_EQ(ret, MDOC_PROVER_SUCCESS);
   }
 
@@ -212,7 +216,7 @@ TEST_F(MdocZKTest, long_attribute) {
       circuit1_, circuit_len1_, test->pkx.as_pointer, test->pky.as_pointer,
       test->transcript, test->transcript_size, long_attr, 1,
       (const char*)test->now, contract_hash, nullifier_hash, binding_hash,
-      zkproof, proof_len, test->doc_type, &kZkSpecs[0]);
+      escrow_digest, zkproof, proof_len, test->doc_type, &kZkSpecs[0]);
   EXPECT_EQ(ret, MDOC_VERIFIER_INVALID_CBOR);
   free(zkproof);
 }
@@ -327,6 +331,8 @@ TEST_F(MdocZKTest, bad_arguments) {
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
   uint8_t binding_hash[32] = {0};
+  uint8_t escrow_fields[256] = {0};
+  uint8_t escrow_digest[32] = {0};
   // ZStd encoding for "hello".
   uint8_t bad_circuit[50001] = {0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x05, 0x29,
                                 0x00, 0x00, 0x68, 0x65, 0x6c, 0x6c, 0x6f};
@@ -343,73 +349,86 @@ TEST_F(MdocZKTest, bad_arguments) {
   // Basic prover tests that pass in a null ptr.
   EXPECT_EQ(run_mdoc_prover(nullptr, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), nullptr, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc),
                             nullptr, pk, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             nullptr, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, nullptr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), nullptr, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), attrs, num_attrs, nullptr,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, nullptr, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, nullptr, &proof_len,
+                            nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, nullptr,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            nullptr, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, nullptr),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, nullptr),
             MDOC_PROVER_NULL_INPUT);
 
   // Invalid pk.
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk2,
                             pk, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_INVALID_INPUT);
 
   // Invalid circuit.
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), attrs, num_attrs, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_CIRCUIT_PARSING_FAILURE);
   EXPECT_EQ(
       run_mdoc_prover(bad_circuit, sizeof(bad_circuit), mdoc, sizeof(mdoc), pk,
                       pk, tr, sizeof(tr), attrs, num_attrs, now,
-                      contract_hash, (uint8_t**)&zkproof, &proof_len,
-                      nullifier_hash, binding_hash, &zk_spec_1),
+                      contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                      &proof_len, nullifier_hash, binding_hash,
+                      escrow_digest, &zk_spec_1),
       MDOC_PROVER_CIRCUIT_PARSING_FAILURE);
 
   // Invalid attributes, two different namespaces.
@@ -418,71 +437,79 @@ TEST_F(MdocZKTest, bad_arguments) {
 
   EXPECT_EQ(run_mdoc_prover(circuit, sizeof(circuit), mdoc, sizeof(mdoc), pk,
                             pk, tr, sizeof(tr), attrs2, 2, now,
-                            contract_hash, (uint8_t**)&zkproof, &proof_len,
-                            nullifier_hash, binding_hash, &zk_spec_1),
+                            contract_hash, escrow_fields, (uint8_t**)&zkproof,
+                            &proof_len, nullifier_hash, binding_hash,
+                            escrow_digest, &zk_spec_1),
             MDOC_PROVER_INVALID_INPUT);
   EXPECT_EQ(run_mdoc_verifier(circuit1_, circuit_len1_, pk, pk, tr, sizeof(tr),
                               attrs2, 2, now, contract_hash, nullifier_hash,
-                              binding_hash, zkproof, 100, kDefaultDocType,
-                              &zk_spec_1),
+                              binding_hash, escrow_digest, zkproof, 100,
+                              kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_INVALID_INPUT);
 
   // Basic verifier tests that pass in a null ptr.
   // Broken circuit.
   EXPECT_EQ(run_mdoc_verifier(nullptr, sizeof(circuit), pk, pk, tr, sizeof(tr),
                               attrs, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_verifier(circuit, 49999, pk, pk, tr, sizeof(tr), attrs,
                               num_attrs, now, contract_hash, nullifier_hash,
-                              binding_hash, zkproof, sizeof(zkproof), kDefaultDocType,
-                              &zk_spec_1),
+                              binding_hash, escrow_digest, zkproof,
+                              sizeof(zkproof), kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_ARGUMENTS_TOO_SMALL);
   EXPECT_EQ(run_mdoc_verifier(bad_circuit, sizeof(bad_circuit), pk, pk, tr,
                               sizeof(tr), attrs, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_CIRCUIT_PARSING_FAILURE);
 
   // Broken pk.
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), nullptr, pk, tr,
                               sizeof(tr), attrs, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, nullptr, tr,
                               sizeof(tr), attrs, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, pk2, tr, sizeof(tr),
                               attrs, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_INVALID_INPUT);
 
   // Broken transcript.
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, pk, nullptr,
                               sizeof(tr), attrs, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, pk, tr, 0, attrs,
                               num_attrs, now, contract_hash, nullifier_hash,
-                              binding_hash, zkproof, sizeof(zkproof), kDefaultDocType,
-                              &zk_spec_1),
+                              binding_hash, escrow_digest, zkproof,
+                              sizeof(zkproof), kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_ARGUMENTS_TOO_SMALL);
   // Broken attrs.
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, pk, tr, sizeof(tr),
                               nullptr, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, pk, tr, sizeof(tr),
                               attrs, 0, now, contract_hash, nullifier_hash,
-                              binding_hash, zkproof, sizeof(zkproof), kDefaultDocType,
-                              &zk_spec_1),
+                              binding_hash, escrow_digest, zkproof,
+                              sizeof(zkproof), kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_ARGUMENTS_TOO_SMALL);
 
   RequestedAttribute attrs_prefix[1] = {RequestedAttribute(
@@ -496,28 +523,30 @@ TEST_F(MdocZKTest, bad_arguments) {
        .cbor_value_len = 13})};
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, pk, tr, sizeof(tr),
                               attrs_prefix, 1, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_INVALID_CBOR);
 
   // Broken now.
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, pk, tr, sizeof(tr),
                               attrs, num_attrs, nullptr, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_NULL_INPUT);
 
   // Broken zkproof.
   EXPECT_EQ(run_mdoc_verifier(circuit, sizeof(circuit), pk, pk, tr, sizeof(tr),
                               attrs, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, nullptr,
-                              sizeof(zkproof),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              nullptr, sizeof(zkproof),
                               kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_NULL_INPUT);
   EXPECT_EQ(run_mdoc_verifier(circuit1_, circuit_len1_, pk, pk, tr, sizeof(tr),
                               attrs, num_attrs, now, contract_hash,
-                              nullifier_hash, binding_hash, zkproof, 100, kDefaultDocType,
-                              &zk_spec_1),
+                              nullifier_hash, binding_hash, escrow_digest,
+                              zkproof, 100, kDefaultDocType, &zk_spec_1),
             MDOC_VERIFIER_ARGUMENTS_TOO_SMALL);
 
   uint8_t id[32];
@@ -536,6 +565,8 @@ TEST_F(MdocZKTest, attr_mismatch) {
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
   uint8_t binding_hash[32] = {0};
+  uint8_t escrow_fields[256] = {0};
+  uint8_t escrow_digest[32] = {0};
   constexpr int num_attrs = 2;
   const ZkSpecStruct& zk_spec_2 = kZkSpecs[1];
   RequestedAttribute attrs[num_attrs] = {test::age_over_18, test::age_over_18};
@@ -546,8 +577,8 @@ TEST_F(MdocZKTest, attr_mismatch) {
         circuit2_, circuit_len2_, test->mdoc, test->mdoc_size,
         test->pkx.as_pointer, test->pky.as_pointer, test->transcript,
         test->transcript_size, attrs, num_attrs, (const char*)test->now,
-        contract_hash, &zkproof, &proof_len, nullifier_hash, binding_hash,
-        &zk_spec_2);
+        contract_hash, escrow_fields, &zkproof, &proof_len, nullifier_hash,
+        binding_hash, escrow_digest, &zk_spec_2);
     EXPECT_EQ(ret, MDOC_PROVER_SUCCESS);
   }
   {
@@ -555,7 +586,7 @@ TEST_F(MdocZKTest, attr_mismatch) {
         circuit2_, circuit_len2_, test->pkx.as_pointer, test->pky.as_pointer,
         test->transcript, test->transcript_size, attrs, num_attrs - 1,
         (const char*)test->now, contract_hash, nullifier_hash, binding_hash,
-        zkproof, proof_len, kDefaultDocType, &zk_spec_2);
+        escrow_digest, zkproof, proof_len, kDefaultDocType, &zk_spec_2);
     EXPECT_EQ(ret, MDOC_VERIFIER_ATTRIBUTE_NUMBER_MISMATCH);
   }
   free(zkproof);
@@ -570,6 +601,7 @@ TEST_F(MdocZKTest, bad_proofs) {
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
   uint8_t binding_hash[32] = {0};
+  uint8_t escrow_digest[32] = {0};
 
   constexpr size_t kMaxProofLen = 100000;
   uint8_t zkproof[kMaxProofLen];
@@ -580,7 +612,7 @@ TEST_F(MdocZKTest, bad_proofs) {
         circuit1_, circuit_len1_, test->pkx.as_pointer, test->pky.as_pointer,
         test->transcript, test->transcript_size, attrs, num_attrs,
         (const char*)test->now, contract_hash, nullifier_hash, binding_hash,
-        zkproof, proof_len, kDefaultDocType, &zk_spec_1);
+        escrow_digest, zkproof, proof_len, kDefaultDocType, &zk_spec_1);
     EXPECT_NE(ret, MDOC_VERIFIER_SUCCESS);
   }
 }
@@ -722,6 +754,8 @@ void BM_MdocProver(benchmark::State& state) {
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
   uint8_t binding_hash[32] = {0};
+  uint8_t escrow_fields[256] = {0};
+  uint8_t escrow_digest[32] = {0};
 
   for (auto _ : state) {
     uint8_t* zkproof;
@@ -730,8 +764,9 @@ void BM_MdocProver(benchmark::State& state) {
     MdocProverErrorCode ret = run_mdoc_prover(
         circuit, circuit_len, test->mdoc, test->mdoc_size, test->pkx.as_pointer,
         test->pky.as_pointer, test->transcript, test->transcript_size, attrs,
-        num_attrs, (const char*)test->now, contract_hash, &zkproof, &proof_len,
-        nullifier_hash, binding_hash, &zk_spec);
+        num_attrs, (const char*)test->now, contract_hash, escrow_fields,
+        &zkproof, &proof_len, nullifier_hash, binding_hash, escrow_digest,
+        &zk_spec);
     EXPECT_EQ(ret, MDOC_PROVER_SUCCESS);
     free(zkproof);
   }
@@ -758,12 +793,15 @@ void BM_MdocVerifier(benchmark::State& state) {
   uint8_t contract_hash[8] = {0};
   uint8_t nullifier_hash[32] = {0};
   uint8_t binding_hash[32] = {0};
+  uint8_t escrow_fields[256] = {0};
+  uint8_t escrow_digest[32] = {0};
 
   MdocProverErrorCode retp = run_mdoc_prover(
       circuit, circuit_len, test->mdoc, test->mdoc_size, test->pkx.as_pointer,
       test->pky.as_pointer, test->transcript, test->transcript_size, attrs,
-      num_attrs, (const char*)test->now, contract_hash, &zkproof, &proof_len,
-      nullifier_hash, binding_hash, &zk_spec);
+      num_attrs, (const char*)test->now, contract_hash, escrow_fields,
+      &zkproof, &proof_len, nullifier_hash, binding_hash, escrow_digest,
+      &zk_spec);
   EXPECT_EQ(retp, MDOC_PROVER_SUCCESS);
 
   for (auto _ : state) {
@@ -771,7 +809,7 @@ void BM_MdocVerifier(benchmark::State& state) {
         circuit, circuit_len, test->pkx.as_pointer, test->pky.as_pointer,
         test->transcript, test->transcript_size, attrs, num_attrs,
         (const char*)test->now, contract_hash, nullifier_hash, binding_hash,
-        zkproof, proof_len, test->doc_type, &zk_spec);
+        escrow_digest, zkproof, proof_len, test->doc_type, &zk_spec);
     EXPECT_EQ(retv, MDOC_VERIFIER_SUCCESS);
   }
 

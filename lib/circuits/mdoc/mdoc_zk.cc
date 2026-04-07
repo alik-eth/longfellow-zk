@@ -61,7 +61,7 @@ size_t getHashMacIndex(size_t numAttrs, size_t version) {
   // The length of the attribute field that is added in version 4.
   // Nullifier: 320 wires (8*8 contract_hash + 256 nullifier_target).
   // Binding: 256 wires (256 binding_target).
-  return numAttrs * 8 * (96 + (version < 7 ? 1 : 2)) + 160 + 320 + 256 + 1;
+  return numAttrs * 8 * (96 + (version < 7 ? 1 : 2)) + 160 + 320 + 256 + 256 + 1;
 }
 
 namespace proofs {
@@ -147,13 +147,14 @@ struct ProverState {
   mac_witness macs[3];
 };
 
-// Fills the hash witness with the attributes, time, nullifier, and binding inputs.
+// Fills the hash witness with the attributes, time, nullifier, binding, and escrow inputs.
 MdocProverErrorCode fill_attributes(DenseFiller<f_128>& hash_filler,
                                     const RequestedAttribute* attrs,
                                     size_t attrs_len, const uint8_t* now,
                                     const uint8_t* contract_hash,
                                     const uint8_t* nullifier_hash,
                                     const uint8_t* binding_hash,
+                                    const uint8_t* escrow_digest,
                                     const f_128& Fs, size_t version) {
   hash_filler.push_back(Fs.one());
   for (size_t ai = 0; ai < attrs_len; ++ai) {
@@ -188,6 +189,16 @@ MdocProverErrorCode fill_attributes(DenseFiller<f_128>& hash_filler,
     }
     hash_filler.push_back(bv);
   }
+  // Escrow digest target: escrow_digest as v256
+  {
+    std::vector<typename f_128::Elt> ev(256, Fs.zero());
+    for (size_t j = 0; j < 256; ++j) {
+      size_t byte_idx = (255 - j) / 8;
+      size_t bit_idx = j % 8;
+      ev[j] = (escrow_digest[byte_idx] >> bit_idx) & 1 ? Fs.one() : Fs.zero();
+    }
+    hash_filler.push_back(ev);
+  }
   return MDOC_PROVER_SUCCESS;
 }
 
@@ -210,11 +221,12 @@ bool fill_public_inputs(DenseFiller<Fp256Base>& sig_filler,
                         const uint8_t* contract_hash,
                         const uint8_t* nullifier_hash,
                         const uint8_t* binding_hash,
+                        const uint8_t* escrow_digest,
                         const uint8_t* docType,
                         size_t dt_len, const gf2k macs[], gf2k av,
                         const f_128& Fs, size_t version) {
   if (fill_attributes(hash_filler, attrs, attrs_len, now, contract_hash,
-                      nullifier_hash, binding_hash, Fs, version) !=
+                      nullifier_hash, binding_hash, escrow_digest, Fs, version) !=
       MDOC_PROVER_SUCCESS) {
     return false;
   }
@@ -249,6 +261,7 @@ MdocProverErrorCode fill_witness(
     size_t attrs_len, const uint8_t* now,
     const uint8_t* contract_hash, uint8_t* nullifier_hash_out,
     uint8_t* binding_hash_out,
+    const uint8_t escrow_fields[8][32], uint8_t* escrow_digest_out,
     ProverState& state,
     SecureRandomEngine& rng, const f_128& Fs, size_t version) {
   using MdocHW = MdocHashWitness<P256, f_128>;
@@ -262,7 +275,7 @@ MdocProverErrorCode fill_witness(
   uint8_t zero_hash[32] = {};
   MdocProverErrorCode err =
       fill_attributes(fill_s, attrs, attrs_len, now, contract_hash,
-                      zero_hash, zero_hash, Fs, version);
+                      zero_hash, zero_hash, zero_hash, Fs, version);
   if (err != MDOC_PROVER_SUCCESS) {
     return err;
   }
@@ -281,6 +294,8 @@ MdocProverErrorCode fill_witness(
   memcpy(nullifier_hash_out, hw->nullifier_hash_, 32);
   hw->compute_binding(attrs[0]);
   memcpy(binding_hash_out, hw->binding_hash_, 32);
+  hw->compute_escrow_digest(escrow_fields);
+  memcpy(escrow_digest_out, hw->escrow_digest_, 32);
 
   MdocProverErrorCode ok_s =
       sw->compute_witness(pkX, pkY, mdoc, mdoc_len, tr, tr_len);
@@ -394,6 +409,24 @@ void update_binding_in_dense(Dense<f_128>& W_hash, size_t start,
   }
 }
 
+// Returns the index of the escrow digest public input (after binding).
+size_t getEscrowDigestIndex(size_t numAttrs, size_t version) {
+  return getBindingIndex(numAttrs, version) + 256;
+}
+
+// Updates the escrow digest public input (v256) in the hash dense array.
+void update_escrow_digest_in_dense(Dense<f_128>& W_hash, size_t start,
+                                   const uint8_t escrow_digest[32],
+                                   const f_128& Fs) {
+  size_t idx = start;
+  for (size_t j = 0; j < 256; ++j) {
+    size_t byte_idx = (255 - j) / 8;
+    size_t bit_idx = j % 8;
+    W_hash.v_[idx++] =
+        (escrow_digest[byte_idx] >> bit_idx) & 1 ? Fs.one() : Fs.zero();
+  }
+}
+
 bool parsePk(const char* pkx, const char* pky, Elt& pkX, Elt& pkY) {
   auto maybe_x = p256_base.of_untrusted_string(pkx);
   auto maybe_y = p256_base.of_untrusted_string(pky);
@@ -491,15 +524,18 @@ MdocProverErrorCode run_mdoc_prover(
     const RequestedAttribute* attrs, size_t attrs_len,
     const char* now, /* time formatted as "2023-11-02T09:00:00Z" */
     const uint8_t* contract_hash, /* 8 bytes */
+    const uint8_t* escrow_fields, /* 8×32=256 bytes */
     uint8_t** prf, size_t* proof_len,
     uint8_t nullifier_hash_out[32],
     uint8_t binding_hash_out[32],
+    uint8_t escrow_digest_out[32],
     const ZkSpecStruct* zk_spec) {
   if (bcp == nullptr || mdoc == nullptr || pkx == nullptr || pky == nullptr ||
       transcript == nullptr || attrs == nullptr || now == nullptr ||
-      contract_hash == nullptr || prf == nullptr || proof_len == nullptr ||
+      contract_hash == nullptr || escrow_fields == nullptr ||
+      prf == nullptr || proof_len == nullptr ||
       nullifier_hash_out == nullptr || binding_hash_out == nullptr ||
-      zk_spec == nullptr) {
+      escrow_digest_out == nullptr || zk_spec == nullptr) {
     return MDOC_PROVER_NULL_INPUT;
   }
 
@@ -560,7 +596,8 @@ MdocProverErrorCode run_mdoc_prover(
   MdocProverErrorCode ok = fill_witness(
       sig_filler, hash_filler, mdoc, mdoc_len, pkX, pkY, transcript, tr_len,
       attrs, attrs_len, (const uint8_t*)now, contract_hash, nullifier_hash_out,
-      binding_hash_out, state, rng, Fs, zk_spec->version);
+      binding_hash_out, (const uint8_t (*)[32])escrow_fields, escrow_digest_out,
+      state, rng, Fs, zk_spec->version);
   if (ok != MDOC_PROVER_SUCCESS) {
     log(ERROR, "fill_witness failed");
     return ok;
@@ -573,6 +610,9 @@ MdocProverErrorCode run_mdoc_prover(
   update_binding_in_dense(W_hash,
                           getBindingIndex(attrs_len, zk_spec->version),
                           binding_hash_out, Fs);
+  update_escrow_digest_in_dense(W_hash,
+                                getEscrowDigestIndex(attrs_len, zk_spec->version),
+                                escrow_digest_out, Fs);
 
   // ========= Run prover ==============
   // Use the transcript from the session to select the random oracle.
@@ -651,12 +691,13 @@ MdocVerifierErrorCode run_mdoc_verifier(
     const uint8_t* contract_hash, /* 8 bytes */
     const uint8_t nullifier_hash[32],
     const uint8_t binding_hash[32],
+    const uint8_t escrow_digest[32],
     const uint8_t* zkproof, size_t proof_len, const char* docType,
     const ZkSpecStruct* zk_spec) {
   if (bcp == nullptr || pkx == nullptr || pky == nullptr ||
       transcript == nullptr || now == nullptr || attrs == nullptr ||
       contract_hash == nullptr || nullifier_hash == nullptr ||
-      binding_hash == nullptr ||
+      binding_hash == nullptr || escrow_digest == nullptr ||
       zkproof == nullptr || docType == nullptr || zk_spec == nullptr) {
     return MDOC_VERIFIER_NULL_INPUT;
   }
@@ -787,8 +828,8 @@ MdocVerifierErrorCode run_mdoc_verifier(
   if (!fill_public_inputs(sig_filler, hash_filler, pkX, pkY, transcript, tr_len,
                           attrs, attrs_len, (const uint8_t*)now,
                           contract_hash, nullifier_hash, binding_hash,
-                          (const uint8_t*)docType, dlen, macs, av, Fs,
-                          zk_spec->version)) {
+                          escrow_digest, (const uint8_t*)docType, dlen,
+                          macs, av, Fs, zk_spec->version)) {
     return MDOC_VERIFIER_GENERAL_FAILURE;
   }
 
