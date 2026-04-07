@@ -136,6 +136,10 @@ class MdocHash {
     v8 binding_in_[64];
     ShaBlockWitness binding_bw_;
 
+    // Identity escrow: SHA-256(escrow_fields[0..255]), 5 blocks (256 data + padding)
+    v8 escrow_in_[256];  // 8 × 32-byte fields concatenated
+    ShaBlockWitness escrow_bw_[5];  // 5 SHA-256 blocks
+
     explicit Witness(size_t num_attr) {
       num_attr_ = num_attr;
       attr_mso_.resize(num_attr);
@@ -191,6 +195,14 @@ class MdocHash {
         binding_in_[i] = lc.template vinput<8>();
       }
       binding_bw_.input(lc);
+
+      // Escrow witness: 256 bytes (8 × 32-byte fields) + 5 block witnesses
+      for (size_t i = 0; i < 256; ++i) {
+        escrow_in_[i] = lc.template vinput<8>();
+      }
+      for (size_t j = 0; j < 5; ++j) {
+        escrow_bw_[j].input(lc);
+      }
     }
   };
 
@@ -202,6 +214,7 @@ class MdocHash {
                               const v8 contract_hash[/*8*/],
                               const v256& nullifier_target,
                               const v256& binding_target,
+                              const v256& escrow_target,
                               const v256& e,
                               const v256& dpkx, const v256& dpky,
                               const Witness& vw) const {
@@ -255,6 +268,9 @@ class MdocHash {
 
     // Holder binding: SHA-256(oa[0].v1[0..31]) == binding_target
     assert_binding(oa[0], binding_target, vw);
+
+    // Identity escrow: SHA-256(escrow_fields[0..255]) == escrow_target
+    assert_escrow_digest(escrow_target, vw);
 
     // Attributes parsing
     // valueDigests, ignore byte 13 \in {A1,A2} representing map size.
@@ -642,6 +658,37 @@ class MdocHash {
     auto one = lc_.template vbit<8>(1);
     sha_.assert_message_hash(1, one, vw.binding_in_, binding_target,
                              &vw.binding_bw_);
+  }
+
+  // Asserts escrow_digest = SHA-256(escrow_fields[0..255]) where 256 bytes
+  // of credential field values (8 × 32 bytes, zero-padded) are hashed.
+  // The 256-byte message requires 5 SHA-256 blocks:
+  // blocks 0-3: 256 data bytes, block 4: SHA-256 padding.
+  // Padding: byte 256 = 0x80, bytes 257..317 = 0x00,
+  // bytes 318..319 = big-endian length 0x0800 (2048 bits).
+  void assert_escrow_digest(const v256& escrow_target,
+                            const Witness& vw) const {
+    // Build 5-block padded message (320 bytes) for SHA-256
+    v8 padded[320];
+
+    // First 256 bytes: escrow field data from witness
+    for (size_t i = 0; i < 256; ++i) {
+      padded[i] = vw.escrow_in_[i];
+    }
+
+    // SHA-256 padding for 256-byte (2048-bit) message
+    padded[256] = lc_.template vbit<8>(0x80);
+    for (size_t i = 257; i < 318; ++i) {
+      padded[i] = lc_.template vbit<8>(0x00);
+    }
+    // Big-endian length: 2048 = 0x0800
+    padded[318] = lc_.template vbit<8>(0x08);
+    padded[319] = lc_.template vbit<8>(0x00);
+
+    // Verify SHA-256(padded) == escrow_target using 5 blocks
+    auto five = lc_.template vbit<8>(5);
+    sha_.assert_message_hash(5, five, padded, escrow_target,
+                             vw.escrow_bw_);
   }
 
   // Asserts that the key is equal to the value in big-endian order in buf_be.
