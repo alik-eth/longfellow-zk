@@ -366,6 +366,9 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
     // Holder binding public input
     v256 binding_target = LC.template vinput<256>();
 
+    // Escrow target public input
+    v256 escrow_target = LC.template vinput<256>();
+
     Q.private_input();
     v256 e = LC.template vinput<256>();
     v256 dpkx = LC.template vinput<256>();
@@ -376,7 +379,7 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
 
     mdoc_hash.assert_valid_hash_mdoc(oa.data(), now, contract_hash,
                                      nullifier_target, binding_target,
-                                     e, dpkx, dpky, vwc);
+                                     escrow_target, e, dpkx, dpky, vwc);
 
     CIRCUIT = Q.mkcircuit(/*nc=*/1);
     dump_info("mdoc hash and parse", Q);
@@ -400,6 +403,8 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
                                    0x05, 0x06, 0x07, 0x08};
   hw.compute_nullifier(test_contract_hash);
   hw.compute_binding(attrs[0]);
+  uint8_t escrow_fields[8][32] = {{0}};
+  hw.compute_escrow_digest(escrow_fields);
 
   log(INFO, "Witness done");
 
@@ -446,6 +451,17 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
     }
     filler.push_back(bv);
     pub_filler.push_back(bv);
+  }
+  // Escrow digest as v256
+  {
+    std::vector<typename Field::Elt> ev(256, F.zero());
+    for (size_t j = 0; j < 256; ++j) {
+      size_t byte_idx = (255 - j) / 8;
+      size_t bit_idx = j % 8;
+      ev[j] = (hw.escrow_digest_[byte_idx] >> bit_idx) & 1 ? F.one() : F.zero();
+    }
+    filler.push_back(ev);
+    pub_filler.push_back(ev);
   }
 
   // Private inputs
