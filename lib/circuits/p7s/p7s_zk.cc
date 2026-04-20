@@ -1,6 +1,6 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
-// Phase 2a p7s circuit — blob protocol (schema v4).
+// Phase 2a p7s circuit — blob protocol (schema v5).
 //
 // Invariants enforced by the current circuit:
 //   (9)  context_hash == SHA-256(context_bytes)                 — Task 1b
@@ -9,6 +9,7 @@
 //   (5)  signed_content[nonce_offset..+64] == nonce_hex         — Task 21
 //        AND nonce_hex decodes to public.nonce (32 bytes)       — Task 21
 //   (6)  signed_content[ctx_offset..+ctx_len] == context_bytes  — Task 22
+//   (10) signed_content[decl_offset..+510] == kDeclarationPhrase — Task 23
 //
 // -----------------------------------------------------------------------------
 // Blob protocol — schema history
@@ -50,6 +51,16 @@
 //                                   + context_len <= 1024 (enforced with
 //                                   the conservative bound ≤ 1024 - 32 here,
 //                                   since the context can be at most 32 bytes).
+//
+//   v5 (Task 23): adds json_declaration_offset to the witness; public
+//                 blob unchanged. The declaration length is a compile-
+//                 time constant (`kDeclarationLen = 510`) and the
+//                 phrase itself (`kDeclarationPhrase`) is a circuit-side
+//                 literal — so there is no length or content wire, just
+//                 the locator offset into signed_content.
+//     Witness blob extends v4 with:
+//       u32  json_declaration_offset  relative to signed_content;
+//                                     + kDeclarationLen <= 1024.
 // -----------------------------------------------------------------------------
 
 #include "p7s_zk.h"
@@ -71,6 +82,7 @@
 #include "circuits/p7s/p7s_circuit.h"
 #include "circuits/p7s/p7s_hash.h"
 #include "circuits/p7s/sub/byte_range_eq.h"
+#include "circuits/p7s/sub/declaration_whitelist.h"
 #include "circuits/p7s/sub/hex_decode.h"
 #include "circuits/sha/flatsha256_witness.h"
 #include "gf2k/gf2_128.h"
@@ -104,9 +116,9 @@ using ShaBlockWitness = P7sHashC::ShaBlockWitness;
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seed. Bumped from "p7s-21" so proofs minted under the
-// Task-21 circuit cannot be misinterpreted as Task-22 proofs.
-constexpr char kTranscriptSeed[] = "p7s-22";
+// Transcript seed. Bumped from "p7s-22" so proofs minted under the
+// Task-22 circuit cannot be misinterpreted as Task-23 proofs.
+constexpr char kTranscriptSeed[] = "p7s-23";
 constexpr size_t kTranscriptSeedLen = sizeof(kTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
@@ -118,7 +130,7 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
               "kSignedContentLogN must equal log2(kMaxSignedContent)");
 
 // Blob schema version.
-constexpr uint32_t kBlobSchemaVersion = 4;
+constexpr uint32_t kBlobSchemaVersion = 5;
 
 // Build the Task-20 circuit.
 std::unique_ptr<Circuit<F>> build_circuit() {
@@ -195,6 +207,9 @@ std::unique_ptr<Circuit<F>> build_circuit() {
   // Invariant 6: json_context_offset (no length wire — derived from SHA).
   auto json_context_offset = lc.template vinput<kSignedContentLogN>();
 
+  // Invariant 10: json_declaration_offset (length is compile-time constant).
+  auto json_declaration_offset = lc.template vinput<kSignedContentLogN>();
+
   // ---- Constraints ----
 
   // Invariant 9.
@@ -239,6 +254,22 @@ std::unique_ptr<Circuit<F>> build_circuit() {
       kMaxSignedContent, signed_content.data(), zz, /*unroll=*/3);
 
   ph.assert_context_equals(context_in.data(), ctx_window.data(), ctx_len);
+
+  // Invariant 10: signed_content[decl_offset..+kDeclarationLen] equals
+  // kDeclarationPhrase (the sole v1 whitelist entry). The circuit side
+  // of the byte_range_eq call is a vector of constant v8 values built
+  // from the compile-time literal; the witness side is the Routing-
+  // extracted window of signed_content.
+  std::vector<typename LC::v8> decl_window(kDeclarationLen);
+  routing.template shift<typename LC::v8, kSignedContentLogN>(
+      json_declaration_offset, kDeclarationLen, decl_window.data(),
+      kMaxSignedContent, signed_content.data(), zz, /*unroll=*/3);
+
+  std::vector<typename LC::v8> decl_expected(kDeclarationLen);
+  for (size_t i = 0; i < kDeclarationLen; ++i) {
+    decl_expected[i] = lc.template vbit<8>(kDeclarationPhrase[i]);
+  }
+  breq.assert_eq(decl_window.data(), decl_expected.data(), kDeclarationLen);
 
   return Q.mkcircuit(/*nc=*/1);
 }
@@ -382,6 +413,15 @@ void push_invariant6_witness(DenseFiller<F>& filler,
   push_uint(filler, json_context_offset, kSignedContentLogN, Fs);
 }
 
+// Push invariant-10 private witness: only the json_declaration_offset wire.
+// The declaration length is a circuit-side compile-time constant and the
+// whitelist phrase itself is embedded as constant wires — no further
+// witness is needed.
+void push_invariant10_witness(DenseFiller<F>& filler,
+                              uint32_t json_declaration_offset, const F& Fs) {
+  push_uint(filler, json_declaration_offset, kSignedContentLogN, Fs);
+}
+
 // Read helpers for the little-endian blob format.
 bool read_u32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
   if (end - p < 4) return false;
@@ -404,6 +444,7 @@ struct ParsedWitness {
   uint32_t json_nonce_offset;
   uint8_t nonce_hex[kNonceHexLen];
   uint32_t json_context_offset;
+  uint32_t json_declaration_offset;
 };
 
 // Parsed public blob.
@@ -458,6 +499,11 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // in-circuit byte-eq masks padding positions, so offsets that leave
   // fewer than context_len usable bytes will be caught at prove time.
   if (out.json_context_offset > kMaxSignedContent - kContextMaxBytes) {
+    return false;
+  }
+
+  if (!read_u32(p, end, out.json_declaration_offset)) return false;
+  if (out.json_declaration_offset > kMaxSignedContent - kDeclarationLen) {
     return false;
   }
 
@@ -528,6 +574,7 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
                           wit.pk_hex, Fs);
   push_invariant5_witness(filler, wit.json_nonce_offset, wit.nonce_hex, Fs);
   push_invariant6_witness(filler, wit.json_context_offset, Fs);
+  push_invariant10_witness(filler, wit.json_declaration_offset, Fs);
 
   if (filler.size() != circuit.ninputs) {
     return P7S_INVALID_INPUT;
