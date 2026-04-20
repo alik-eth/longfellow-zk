@@ -101,6 +101,27 @@ constexpr size_t kSpkiXYLen = 32;        // per coordinate
 constexpr size_t kSpkiWindowLen =
     kSpkiPrefixLen + 1 + 2 * kSpkiXYLen;  // 26 + 1 + 64 = 91
 
+// ---- Invariant 2c (Task 31) — messageDigest binding bounds ----
+//
+// The CMS messageDigest attribute embedded in signed_attrs has a fixed
+// 17-byte DER prefix (Attribute SEQUENCE hdr + OID TLV + SET OF hdr +
+// OCTET STRING hdr) immediately preceding the 32-byte SHA-256 digest
+// value. The 32 bytes MUST byte-match `blob.message_digest[32]` (bound
+// by invariant 2b to SHA-256(signed_content)). This closes the
+// soundness gap where an attacker with honest (cert, signed_attrs,
+// sigs) could substitute a fake signed_content + fake message_digest
+// and still pass invariants 1 + 2a + 2b independently.
+//
+// Prefix literal (constant per RFC 5652 messageDigest attribute):
+//   30 2f              Attribute SEQUENCE hdr (l=47)
+//   06 09 2a 86 48 86 f7 0d 01 09 04   OID messageDigest (1.2.840.113549.1.9.4)
+//   31 22              SET OF AttributeValue hdr (l=34)
+//   04 20              OCTET STRING hdr (l=32)
+// 17 bytes total; the 32-byte digest value follows at window index 17.
+constexpr size_t kSignedAttrsMdPrefixLen = 17;
+constexpr size_t kSignedAttrsMdWindowLen =
+    kSignedAttrsMdPrefixLen + kMessageDigestLen;  // 17 + 32 = 49
+
 }  // namespace p7s
 }  // namespace proofs
 

@@ -1,6 +1,6 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
-// Phase 2a p7s circuit — blob protocol (schema v9).
+// Phase 2a p7s circuit — blob protocol (schema v10).
 //
 // Invariants enforced by the current circuit:
 //   (9)  context_hash == SHA-256(context_bytes)                 — Task 1b
@@ -21,6 +21,13 @@
 //        0x31 SET OF) under the user's holder public key (=
 //        invariant 4's pk_bytes). Digest `e2 = SHA-256(
 //        signedAttrs_rewritten)` is MAC-bound as a 2nd message.
+//   (2c) blob.message_digest byte-equals the 32-byte OCTET STRING — Task 31
+//        value embedded in signed_attrs at the messageDigest
+//        attribute. Together with invariant 2b, this binds the
+//        in-circuit hashed `signed_content` to the bytes the
+//        content signature actually attests to. Host-witnessed
+//        offset `signed_attrs_md_offset` + 17-byte CMS
+//        messageDigest DER anchor on-wire.
 //
 // -----------------------------------------------------------------------------
 // Blob protocol — schema history
@@ -114,6 +121,32 @@
 //                                   `e = SHA-256(cert_tbs)` (low+high)
 //       u8   hash_zk[...]           ZkProof<GF2_128>, self-delimited
 //       u8   sig_zk[...]            ZkProof<Fp256Base>, self-delimited
+//
+//   v10 (Task 31): messageDigest binding — invariant 2c. The 32-byte
+//                  OCTET STRING value of the CMS messageDigest
+//                  attribute (embedded inside signed_attrs) is asserted
+//                  to byte-equal blob.message_digest[32] (already bound
+//                  to SHA-256(signed_content) by invariant 2b). A new
+//                  host-witnessed u32 wire `signed_attrs_md_offset`
+//                  locates the messageDigest Attribute SEQUENCE tag
+//                  (0x30) within signed_attrs; the circuit asserts a
+//                  17-byte DER anchor at window[0..17] and the 32-byte
+//                  digest equality at window[17..49]. Anchor is NOT
+//                  unique within signed_attrs (the nested
+//                  contentTimestamp TSA token contains its own
+//                  messageDigest with the same 17-byte prefix), but
+//                  SHA-256 preimage resistance makes a dual-offset
+//                  attack infeasible — see §6.2 of
+//                  docs/superpowers/specs/handoff-31-messagedigest-binding.md.
+//     Witness blob extends v9 with:
+//       u32  signed_attrs_md_offset   offset of messageDigest Attribute
+//                                     SEQUENCE tag (0x30) WITHIN
+//                                     signed_attrs (= md_value_offset - 17).
+//                                     Host-witnessed — both DIIA
+//                                     fixtures measure 60 but DIIA's
+//                                     BER (non-canonical) ordering is
+//                                     an implementation choice.
+//     Public blob unchanged from v9. Transcript seed "p7s-31-hash".
 //
 //   v9 (Task 26): CMS content signature over signedAttrs — invariant 2a.
 //                 The hash circuit computes a SECOND SHA-256, this time
@@ -229,6 +262,20 @@ constexpr uint8_t kSpkiDiaP256Prefix[kSpkiPrefixLen] = {
                                                    //                unused=0)
 };
 
+// 17-byte CMS messageDigest attribute DER prefix (RFC 5652). Fixed for
+// all CMS SignedData whose messageDigest is SHA-256 (all modern CAdES
+// p7s): Attribute SEQUENCE hdr + OID messageDigest + SET OF hdr +
+// OCTET STRING hdr. The 32-byte SHA-256 value follows at window[17].
+// Mirrored in `crates/zk-eidas-p7s/src/parser.rs`'s
+// `CMS_MESSAGE_DIGEST_ATTR_PREFIX` and in parse_witness_blob below.
+constexpr uint8_t kSignedAttrsMdPrefix[kSignedAttrsMdPrefixLen] = {
+    0x30, 0x2f,                                    // Attribute SEQUENCE (l=47)
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7,      // OID messageDigest
+    0x0d, 0x01, 0x09, 0x04,                        // (1.2.840.113549.1.9.4)
+    0x31, 0x22,                                    // SET OF AttributeValue (l=34)
+    0x04, 0x20,                                    // OCTET STRING hdr (l=32)
+};
+
 // Hash-side MAC primitive. Uses the native `MACGF2` variant whose v128
 // IS an EltW (GF(2^128) is 128 bits wide natively).
 using MacBitPluckerH = BitPlucker<LC, kMacPluckerBits>;
@@ -264,16 +311,16 @@ static constexpr char kRootY[] =
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seed — bumped from "p7s-29-hash" to "p7s-26-hash" so proofs
-// minted under the v8 single-signature circuit cannot be misinterpreted
-// as v9 dual-signature (cert + content) proofs. A SINGLE Transcript
-// instance is used for hash commit, av sampling, and sig commit/prove;
-// both circuits share the same seed (mirrors mdoc, which uses one
-// transcript with circuit-specific processing keyed by the distinct
-// circuit structures themselves). The per-circuit seed below names the
-// hash-side convention; the sig side consumes the same Transcript
-// instance directly (no second seed — if that changes, bump both).
-constexpr char kHashTranscriptSeed[] = "p7s-26-hash";
+// Transcript seed — bumped from "p7s-26-hash" to "p7s-31-hash" so proofs
+// minted under v9 (no messageDigest binding) cannot be misinterpreted
+// as v10 proofs. A SINGLE Transcript instance is used for hash commit,
+// av sampling, and sig commit/prove; both circuits share the same seed
+// (mirrors mdoc, which uses one transcript with circuit-specific
+// processing keyed by the distinct circuit structures themselves). The
+// per-circuit seed below names the hash-side convention; the sig side
+// consumes the same Transcript instance directly (no second seed — if
+// that changes, bump both).
+constexpr char kHashTranscriptSeed[] = "p7s-31-hash";
 constexpr size_t kHashTranscriptSeedLen = sizeof(kHashTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
@@ -289,7 +336,7 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
               "kSignedContentLogN must equal log2(kMaxSignedContent)");
 
 // Blob schema version.
-constexpr uint32_t kBlobSchemaVersion = 9;
+constexpr uint32_t kBlobSchemaVersion = 10;
 
 // ===========================================================================
 // Hash-circuit public-input layout (v9). MAC positions are derived from
@@ -539,6 +586,14 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // here would need a holder-signed digest of their forged bytes —
   // unavailable without the private key.
   auto signed_attrs_numb = lc.template vinput<8>();
+  // Task 31 — offset of the messageDigest Attribute SEQUENCE (0x30)
+  // within signed_attrs. Host-witnessed (DIIA's BER ordering is an
+  // implementation choice; both fixtures happen to report 60 but a
+  // DIIA backend change would shift this — see handoff-31 §4.2).
+  // Bit-width matches kSignedAttrsMaxBytes so the offset covers
+  // [0, 2047]. Adjacent to signed_attrs_numb so "all signed_attrs
+  // metadata" lives in one place.
+  auto signed_attrs_md_offset = lc.template vinput<kSignedAttrsLenBits>();
   std::vector<typename LC::v8> signed_attrs(kSignedAttrsMaxBytes);
   for (size_t i = 0; i < kSignedAttrsMaxBytes; ++i) {
     signed_attrs[i] = lc.template vinput<8>();
@@ -658,6 +713,57 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   signed_attrs_hasher.assert_message_hash(
       signed_attrs_numb, signed_attrs.data(),
       e2_digest_v256_flatsha, signed_attrs_bw.data());
+
+  // Task 31 / invariant 2c — the 32-byte OCTET STRING value of the CMS
+  // messageDigest attribute embedded in signed_attrs byte-equals
+  // `message_digest[32]` (already bound to SHA-256(signed_content) by
+  // invariant 2b). Closes the soundness gap where an attacker with
+  // honest (cert, signed_attrs, sigs) could substitute a fake
+  // signed_content and pre-image `message_digest = SHA-256(fake)`; such
+  // a prover passes invariants 1 + 2a + 2b independently but fails
+  // here because `signed_attrs[md_offset+17..md_offset+49]` is
+  // `SHA-256(real)` ≠ `SHA-256(fake)`.
+  //
+  // Anchor soundness (dual-match caveat): the 17-byte DER prefix is
+  // NOT unique within signed_attrs — the nested
+  // id-smime-aa-ets-contentTimestamp attribute wraps a TSA token
+  // that contains its own messageDigest with the SAME 17-byte prefix
+  // (DIIA fixtures: offsets 60 AND 930). A prover could lie by
+  // witnessing the inner offset; the window[17..49] bytes there equal
+  // the TSA's digest = SHA-256(real_content) in an honest p7s (TSA
+  // timestamps the same content). So witnessing the inner offset
+  // succeeds iff the two 32-byte blobs coincidentally equal — which
+  // happens exactly when the p7s is honest. To attack, a malicious
+  // prover needs SHA-256(fake) to equal one of those two specific
+  // 32-byte blobs — a SHA-256 preimage attack on a chosen target, 2^256
+  // work. Do NOT "strengthen" the anchor to include bytes outside the
+  // 17-byte fixed prefix: any longer anchor would encode
+  // DIIA-specific attribute ordering and break when DIIA changes its
+  // BER layout (see handoff-31 §6.3). SHA-256 preimage resistance is
+  // the correct foundation here.
+  std::vector<typename LC::v8> sa_md_window(kSignedAttrsMdWindowLen);
+  routing.template shift<typename LC::v8, kSignedAttrsLenBits>(
+      signed_attrs_md_offset, kSignedAttrsMdWindowLen, sa_md_window.data(),
+      kSignedAttrsMaxBytes, signed_attrs.data(), zz, /*unroll=*/3);
+
+  // 17-byte CMS messageDigest DER prefix anchor. Window[0..17] MUST
+  // match kSignedAttrsMdPrefix (SEQUENCE hdr + OID + SET OF hdr +
+  // OCTET STRING hdr). The prefix anchor pins the window to a REAL
+  // CMS messageDigest attribute value — without it, a prover could
+  // point the shifter at any 49-byte region whose bytes 17..49 happen
+  // to equal message_digest. The dual-match (TSA-inner) scenario is
+  // addressed by the SHA-256 preimage argument above.
+  std::vector<typename LC::v8> sa_md_prefix_expected(kSignedAttrsMdPrefixLen);
+  for (size_t i = 0; i < kSignedAttrsMdPrefixLen; ++i) {
+    sa_md_prefix_expected[i] = lc.template vbit<8>(kSignedAttrsMdPrefix[i]);
+  }
+  breq.assert_eq(sa_md_window.data(), sa_md_prefix_expected.data(),
+                 kSignedAttrsMdPrefixLen);
+
+  // Load-bearing: the 32 bytes after the prefix equal blob.message_digest.
+  // This is the constraint that closes the soundness gap.
+  breq.assert_eq(&sa_md_window[kSignedAttrsMdPrefixLen],
+                 message_digest.data(), kMessageDigestLen);
 
   // Task 26 (merged with #30) — SPKI extraction from cert_tbs.
   // Route a 91-byte window starting at `cert_tbs_spki_offset`. The
@@ -1077,6 +1183,13 @@ struct ParsedWitness {
   // v9: signedAttrs (RAW witnessed bytes — first byte 0xA0) + the
   // CMS content signature's raw (r, s) scalars (DER-parsed in Rust).
   uint32_t signed_attrs_len;
+  // v10 (Task 31): offset of the messageDigest Attribute SEQUENCE tag
+  // (0x30) WITHIN signed_attrs. The 32-byte digest VALUE sits at
+  // `signed_attrs[signed_attrs_md_offset + 17 ..
+  //              signed_attrs_md_offset + 49]`. Host-witnessed
+  // (DIIA's BER ordering is non-canonical; both fixtures measure 60
+  // but future DIIA re-issuance could shift it).
+  uint32_t signed_attrs_md_offset;
   uint8_t signed_attrs[kSignedAttrsMaxBytes];
   uint8_t content_sig_r[32];
   uint8_t content_sig_s[32];
@@ -1088,8 +1201,16 @@ struct ParsedPublic {
   uint8_t nonce[kNonceBytes];
 };
 
+// If `skip_host_anchors` is true, the host-side DER-prefix assertions
+// (SPKI and messageDigest) are NOT enforced — a malformed witness can
+// still reach the circuit, where the in-circuit anchor constraints
+// are the last line of defense. Only the test-only FFI path
+// `p7s_prove_test_bypass_host_anchors` passes `true`; the production
+// `p7s_prove` entry always passes `false`. See crates/
+// zk-eidas-p7s/Cargo.toml's `test-bypass-host-anchors` feature.
 bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
-                        ParsedWitness& out) {
+                        ParsedWitness& out,
+                        bool skip_host_anchors = false) {
   if (blob == nullptr || blob_len == 0) return false;
   const uint8_t* p = blob;
   const uint8_t* end = blob + blob_len;
@@ -1159,12 +1280,19 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // Belt-and-suspenders: check the prefix host-side too, so a
   // malformed witness never reaches the circuit. Matches the parser
   // layer's own pre-check (see crates/zk-eidas-p7s/src/parser.rs).
-  if (std::memcmp(&out.cert_tbs[out.cert_tbs_spki_offset],
-                  kSpkiDiaP256Prefix, kSpkiPrefixLen) != 0) {
-    return false;
-  }
-  if (out.cert_tbs[out.cert_tbs_spki_offset + kSpkiPrefixLen] != 0x04) {
-    return false;
+  //
+  // Gated by `skip_host_anchors` so the test-only bypass FFI entry
+  // can exercise the in-circuit anchor as the sole enforcement layer
+  // — without this, the host pre-check always trips first and the
+  // circuit-side 26-byte assertion becomes an untested comment.
+  if (!skip_host_anchors) {
+    if (std::memcmp(&out.cert_tbs[out.cert_tbs_spki_offset],
+                    kSpkiDiaP256Prefix, kSpkiPrefixLen) != 0) {
+      return false;
+    }
+    if (out.cert_tbs[out.cert_tbs_spki_offset + kSpkiPrefixLen] != 0x04) {
+      return false;
+    }
   }
 
   // v8: raw (r, s) scalars from the cert signature — 32 big-endian
@@ -1182,6 +1310,16 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   if (out.signed_attrs_len > kSignedAttrsMaxBytes) return false;
   // Minimum SHA padding is 9 bytes.
   if (out.signed_attrs_len > kSignedAttrsMaxBytes - 9) return false;
+  // v10 (Task 31): messageDigest offset within signed_attrs. The
+  // 49-byte anchor+digest window must fit inside the real (non-padded)
+  // signed_attrs content — past the boundary, routing.shift zero-fills
+  // and the in-circuit prefix anchor would fail, but rejecting here
+  // yields a cleaner P7S_INVALID_INPUT.
+  if (!read_u32(p, end, out.signed_attrs_md_offset)) return false;
+  if (out.signed_attrs_md_offset + kSignedAttrsMdWindowLen >
+      out.signed_attrs_len) {
+    return false;
+  }
   if (end - p < static_cast<ptrdiff_t>(kSignedAttrsMaxBytes)) return false;
   std::memcpy(out.signed_attrs, p, kSignedAttrsMaxBytes);
   p += kSignedAttrsMaxBytes;
@@ -1191,6 +1329,20 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // P7S_PROVER_FAILURE, which is more useful for callers.
   if (out.signed_attrs_len == 0 || out.signed_attrs[0] != 0xA0) {
     return false;
+  }
+  // Belt-and-suspenders: check the 17-byte CMS messageDigest DER
+  // prefix at the witnessed offset. Matches the parser layer's own
+  // pre-check (see crates/zk-eidas-p7s/src/parser.rs) and the
+  // in-circuit assertion. The in-circuit anchor is the soundness
+  // bound; this host-side check is the debuggability bound (rejects
+  // malformed witnesses at parse time before they reach the prover).
+  //
+  // Gated by `skip_host_anchors`; see the SPKI anchor comment above.
+  if (!skip_host_anchors) {
+    if (std::memcmp(&out.signed_attrs[out.signed_attrs_md_offset],
+                    kSignedAttrsMdPrefix, kSignedAttrsMdPrefixLen) != 0) {
+      return false;
+    }
   }
 
   if (end - p < 32) return false;
@@ -1296,16 +1448,51 @@ void write_u32(std::vector<uint8_t>& buf, uint32_t x) {
 
 extern "C" {
 
+// Shared core — `skip_host_anchors` controls whether
+// parse_witness_blob's belt-and-suspenders DER anchor assertions fire.
+// Production callers use `false` (via `p7s_prove`); the test-only
+// `p7s_prove_test_bypass_host_anchors` entry uses `true` to exercise
+// the in-circuit anchors as the sole line of defense.
+static P7sErrorCode p7s_prove_impl(
+    const uint8_t* witness_blob, size_t witness_blob_len,
+    const uint8_t* public_blob, size_t public_blob_len,
+    uint8_t** proof_out, size_t* proof_len_out,
+    bool skip_host_anchors);
+
 P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
                        const uint8_t* public_blob, size_t public_blob_len,
                        uint8_t** proof_out, size_t* proof_len_out) {
+  return p7s_prove_impl(witness_blob, witness_blob_len, public_blob,
+                        public_blob_len, proof_out, proof_len_out,
+                        /*skip_host_anchors=*/false);
+}
+
+// Test-only FFI entry — skips host-side DER anchor assertions so the
+// in-circuit anchors can be exercised directly. Must NOT be called
+// from production; the Rust FFI wrapper only exposes this under the
+// `test-bypass-host-anchors` Cargo feature.
+P7sErrorCode p7s_prove_test_bypass_host_anchors(
+    const uint8_t* witness_blob, size_t witness_blob_len,
+    const uint8_t* public_blob, size_t public_blob_len,
+    uint8_t** proof_out, size_t* proof_len_out) {
+  return p7s_prove_impl(witness_blob, witness_blob_len, public_blob,
+                        public_blob_len, proof_out, proof_len_out,
+                        /*skip_host_anchors=*/true);
+}
+
+static P7sErrorCode p7s_prove_impl(
+    const uint8_t* witness_blob, size_t witness_blob_len,
+    const uint8_t* public_blob, size_t public_blob_len,
+    uint8_t** proof_out, size_t* proof_len_out,
+    bool skip_host_anchors) {
   using namespace proofs;
   using namespace proofs::p7s;
 
   if (proof_out == nullptr || proof_len_out == nullptr) return P7S_NULL_INPUT;
 
   ParsedWitness wit{};
-  if (!parse_witness_blob(witness_blob, witness_blob_len, wit)) {
+  if (!parse_witness_blob(witness_blob, witness_blob_len, wit,
+                          skip_host_anchors)) {
     return P7S_INVALID_INPUT;
   }
   ParsedPublic pub{};
@@ -1467,7 +1654,15 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   // cert_tbs above: push padded bytes, let the SHA gadget consume
   // them directly. No separate raw-byte witness; soundness comes
   // from the content-sig ECDSA.
+  //
+  // Fill order must match the circuit's wire-declaration order:
+  //   signed_attrs_numb (v8)
+  //   signed_attrs_md_offset (v<kSignedAttrsLenBits> = v11)  ← v10/#31
+  //   signed_attrs[kSignedAttrsMaxBytes] (padded bytes)
+  //   signed_attrs_bw[kSignedAttrsMaxBlocks] (per-block SHA witnesses)
+  //   e2_digest_bytes[32]
   push_v8(hash_filler, sa_sw.numb, Fs);
+  push_uint(hash_filler, wit.signed_attrs_md_offset, kSignedAttrsLenBits, Fs);
   push_sha_padded_bytes<kSignedAttrsMaxBlocks>(hash_filler, sa_sw, Fs);
   push_sha_block_witnesses<kSignedAttrsMaxBlocks>(hash_filler, sa_sw, Fs);
   for (size_t i = 0; i < kSignedAttrsDigestLen; ++i) {
