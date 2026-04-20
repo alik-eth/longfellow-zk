@@ -19,7 +19,7 @@ typedef enum {
 } P7sErrorCode;
 
 // ============================================================================
-// Phase 2a p7s circuit — blob protocol (schema v5).
+// Phase 2a p7s circuit — blob protocol (schema v6).
 //
 // Prove/verify take two byte buffers that the caller serializes:
 //   * `witness_blob`: private witness — circuit-dependent; schema below.
@@ -39,22 +39,36 @@ typedef enum {
 //                       (byte-length derived from SHA padding, no new public input)
 //   (23) invariant 10 — signed_content[decl_offset..+510] == kDeclarationPhrase
 //                       (N=1 compile-time whitelist, no new public input)
+//   (24) invariant 2b — message_digest == SHA-256(signed_content)
+//                       (signed_content length derived from SHA padding;
+//                        binding to signedAttrs byte range arrives in Task 26)
 //
-// Witness blob v5 layout (all little-endian):
-//   u32  version                                    = 5
+// Witness blob v6 layout (all little-endian):
+//   u32  version                                    = 6
 //   u32  context_len                                in [0, 32]
-//   u8   context[32]                                (padded with zeros)
-//   u32  signed_content_len                         in [0, 1024]
-//   u8   signed_content[1024]                       (padded with zeros)
+//   u8   context[32]                                raw bytes + zero pad;
+//                                                   filler SHA-pads
+//   u32  signed_content_len                         in [0, 1015]
+//   u8   signed_content[1024]                       raw bytes + zero pad;
+//                                                   filler SHA-pads
 //   u32  json_pk_offset                             relative to signed_content
 //   u8   pk_hex[130]                                ASCII lowercase hex
 //   u32  json_nonce_offset                          relative to signed_content
 //   u8   nonce_hex[64]                              ASCII lowercase hex
 //   u32  json_context_offset                        relative to signed_content
 //   u32  json_declaration_offset                    relative to signed_content
+//   u8   message_digest[32]                         prover-claimed
+//                                                   SHA-256(signed_content)
 //
-// Public blob v5 layout (unchanged from v3):
-//   u32  version                                    = 5
+// Note: `context_len` and `signed_content_len` are host-side filler
+// parameters — the C++ witness filler uses them to build SHA-256
+// Merkle-Damgård padded buffers that go into the circuit's `context_in`
+// and `signed_content` wires. The CIRCUIT itself does NOT see either
+// length as a wire; both lengths are derivable from the SHA padding
+// in-circuit (Task 22's discipline, applied to both fields).
+//
+// Public blob v6 layout (unchanged from v3):
+//   u32  version                                    = 6
 //   u8   context_hash[32]
 //   u8   pk[65]                                     decoded SEC1 uncompressed
 //   u8   nonce[32]                                  decoded freshness nonce

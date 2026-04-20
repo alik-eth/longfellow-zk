@@ -32,6 +32,10 @@ constexpr size_t kPkBytes = 65;
 constexpr size_t kNonceBytes = 32;
 constexpr size_t kNonceHexLen = 64;
 
+// messageDigest attribute inside CAdES signedAttrs — 32 bytes holding
+// SHA-256(signed_content). Bound by invariant 2b (Task 24).
+constexpr size_t kMessageDigestLen = 32;
+
 }  // namespace p7s
 }  // namespace proofs
 
