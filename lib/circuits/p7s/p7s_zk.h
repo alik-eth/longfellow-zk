@@ -19,23 +19,24 @@ typedef enum {
 } P7sErrorCode;
 
 // ============================================================================
-// Phase 2a Task 1a — trivially-satisfiable hello-world circuit.
+// Phase 2a Task 1b — invariant 9: context_hash == SHA-256(context_bytes).
 //
 // Public input:
-//   context_hash[32] : the 32-byte value the circuit makes public.
+//   context_hash[32] : the SHA-256 digest the prover claims.
 //
-// The circuit declares context_hash as a 256-bit public input and imposes
-// one identity constraint (context_hash == context_hash). This proves the
-// FFI + CMake + prove/verify loop end-to-end without relying on the more
-// delicate SHA-256 gadget, which lands in Task 1b.
+// Private witness (v1 constraint: context_len + 9 <= 64, i.e. ≤ 55 bytes):
+//   context_bytes[context_len] : the preimage.
 //
-// Proof bytes are opaque; the caller must free the buffer via p7s_free_proof.
+// The circuit asserts context_hash == SHA-256(context_bytes). Proof bytes
+// are opaque; the caller must free the buffer via p7s_free_proof.
 // ============================================================================
 
-// Prove: produce a proof for the public context_hash input.
+// Prove: produce a proof that SHA-256(context_bytes[0..context_len]) equals
+// the declared context_hash.
 extern P7sErrorCode p7s_prove(
     const uint8_t context_hash[32],
-    uint8_t** proof_out, size_t* proof_len_out);
+    uint8_t** proof_out, size_t* proof_len_out,
+    const uint8_t* context_bytes, size_t context_len);
 
 // Verify: return P7S_SUCCESS iff `proof` is valid for `context_hash`.
 extern P7sErrorCode p7s_verify(
