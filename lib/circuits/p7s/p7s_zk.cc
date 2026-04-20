@@ -1,6 +1,6 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
-// Phase 2a p7s circuit — blob protocol (schema v6).
+// Phase 2a p7s circuit — blob protocol (schema v7).
 //
 // Invariants enforced by the current circuit:
 //   (9)  context_hash == SHA-256(context_bytes)                 — Task 1b
@@ -11,6 +11,8 @@
 //   (6)  signed_content[ctx_offset..+ctx_len] == context_bytes  — Task 22
 //   (10) signed_content[decl_offset..+510] == kDeclarationPhrase — Task 23
 //   (2b) message_digest == SHA-256(signed_content)              — Task 24
+//  (25a) cross-field MAC binding of a non-zero sentinel          — Task 25
+//        (no real ECDSA in the sig circuit — that lands in Task 29)
 //
 // -----------------------------------------------------------------------------
 // Blob protocol — schema history
@@ -74,6 +76,25 @@
 //                 circuit-side length derivable from SHA padding).
 //     Witness blob extends v5 with:
 //       u8   message_digest[32]       prover-claimed SHA-256(signed_content)
+//
+//   v7 (Task 25a): no blob schema change — witness and public blobs
+//                  stay identical to v6. The split that happens here
+//                  is proof-format only: the single GF(2^128) circuit
+//                  gains a MAC-binding public input (2 mac values + 1
+//                  av, all GF(2^128) native), and a second circuit over
+//                  Fp256Base is introduced that carries the same MAC
+//                  primitive in the Fp256 field. The two circuits share
+//                  a transcript, and a non-zero sentinel is bound by
+//                  both MACs — forcing the prover's committed `ap` halves
+//                  and the verifier-sampled `av` to agree across the
+//                  field split. Task 29 (25b) replaces the sentinel with
+//                  `e = SHA-256(cert_tbs)` and adds real ECDSA over the
+//                  same plumbing; there is no additional blob churn.
+//     Extended proof-output format:
+//       u32  schema_version(= 7)
+//       u8   macs_b[32]           2 × GF(2^128) values (low+high halves)
+//       u8   hash_zk[...]         ZkProof<GF2_128>, self-delimited
+//       u8   sig_zk[...]          ZkProof<Fp256Base>, self-delimited
 // -----------------------------------------------------------------------------
 
 #include "p7s_zk.h"
@@ -86,18 +107,25 @@
 #include <mutex>
 #include <vector>
 
+#include "algebra/convolution.h"
+#include "algebra/fp2.h"
+#include "algebra/reed_solomon.h"
 #include "arrays/dense.h"
 #include "circuits/compiler/compiler.h"
 #include "circuits/logic/bit_plucker_encoder.h"
 #include "circuits/logic/compiler_backend.h"
 #include "circuits/logic/logic.h"
 #include "circuits/logic/routing.h"
+#include "circuits/mac/mac_reference.h"
+#include "circuits/mac/mac_witness.h"
 #include "circuits/p7s/p7s_circuit.h"
 #include "circuits/p7s/p7s_hash.h"
 #include "circuits/p7s/sub/byte_range_eq.h"
 #include "circuits/p7s/sub/declaration_whitelist.h"
 #include "circuits/p7s/sub/hex_decode.h"
+#include "circuits/p7s/sub/p7s_signature.h"
 #include "circuits/sha/flatsha256_witness.h"
+#include "ec/p256.h"
 #include "gf2k/gf2_128.h"
 #include "gf2k/lch14_reed_solomon.h"
 #include "proto/circuit.h"
@@ -113,14 +141,12 @@ namespace proofs {
 namespace p7s {
 namespace {
 
+// ========================= Hash circuit (GF(2^128)) =========================
 using F = GF2_128<>;
+using gf2k = F::Elt;
 using RSFactory = LCH14ReedSolomonFactory<F>;
 using CB = CompilerBackend<F>;
 using LC = Logic<F, CB>;
-// Two separate SHA-256 instantiations — one for the small-context hash
-// (invariant 9, 1 block) and one for the large signed_content hash
-// (invariant 2b, up to 16 blocks). Templating on kMaxBlocks keeps the
-// witness-array sizes statically typed so the two can't be confused.
 using ContextHash = P7sHash<LC, kContextMaxBlocks>;
 using SignedContentHash = P7sHash<LC, kSignedContentMaxBlocks>;
 using ByteRangeEqC = ByteRangeEq<LC>;
@@ -129,16 +155,51 @@ using RoutingC = Routing<LC>;
 using ContextShaBw = ContextHash::ShaBlockWitness;
 using SignedContentShaBw = SignedContentHash::ShaBlockWitness;
 
+// Hash-side MAC primitive. Uses the native `MACGF2` variant whose v128
+// IS an EltW (GF(2^128) is 128 bits wide natively).
+using MacBitPluckerH = BitPlucker<LC, kMacPluckerBits>;
+using MACH = MACGF2<CB, MacBitPluckerH>;
+using MACHWitness = typename MACH::Witness;
+
+// ========================= Sig circuit (Fp256Base) ==========================
+// Typedefs copied verbatim from mdoc_zk.cc:71-90 so the two circuits
+// can share an omega / FFT / Reed-Solomon stack. Do not invent
+// alternatives — the root-of-unity constants below are matched to
+// these typedefs and to the mdoc-side FFT setup.
+using Elt256 = Fp256Base::Elt;
+using f2_p256 = Fp2<Fp256Base>;
+using Elt256_2 = f2_p256::Elt;
+using FftExtConvolutionFactory_b = FFTExtConvolutionFactory<Fp256Base, f2_p256>;
+using RSFactory_b = ReedSolomonFactory<Fp256Base, FftExtConvolutionFactory_b>;
+using CB256 = CompilerBackend<Fp256Base>;
+using LC256 = Logic<Fp256Base, CB256>;
+using P7sSigCircuit = P7sSignature<LC256, Fp256Base>;
+using P7sSigWitness = typename P7sSigCircuit::Witness;
+
+// Root of unity for the f_p256^2 extension field (same as mdoc_zk.cc).
+static constexpr char kRootX[] =
+    "112649224146410281873500457609690258373018840430489408729223714171582664"
+    "680802";
+static constexpr char kRootY[] =
+    "84087994358540907695740461427818660560182168997182378749313018254450460212"
+    "908";
+
 // Ligero parameters — match zk_testing.h's kLigeroRate / kLigeroNreq so
-// Task-20 proofs have the same statistical-soundness margin as the
+// Task-25 proofs have the same statistical-soundness margin as the
 // reference regression tests.
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seed. Bumped from "p7s-23" so proofs minted under the
-// Task-23 circuit cannot be misinterpreted as Task-24 proofs.
-constexpr char kTranscriptSeed[] = "p7s-24";
-constexpr size_t kTranscriptSeedLen = sizeof(kTranscriptSeed) - 1;
+// Transcript seeds — bumped from "p7s-24" so proofs minted under the
+// Task-24 circuit cannot be misinterpreted as Task-25 proofs. Distinct
+// per-circuit, matching the mdoc convention of having circuit-specific
+// processing on a shared transcript (the SAME Transcript instance is
+// used for hash commit, av sampling, and sig commit/prove; the seeds
+// differ only at circuit-construction time).
+constexpr char kHashTranscriptSeed[] = "p7s-25-hash";
+constexpr size_t kHashTranscriptSeedLen = sizeof(kHashTranscriptSeed) - 1;
+constexpr char kSigTranscriptSeed[] = "p7s-25-sig";
+constexpr size_t kSigTranscriptSeedLen = sizeof(kSigTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
 constexpr size_t kContextPaddedBytes = kShaBlockBytes * kContextMaxBlocks;
@@ -153,10 +214,77 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
               "kSignedContentLogN must equal log2(kMaxSignedContent)");
 
 // Blob schema version.
-constexpr uint32_t kBlobSchemaVersion = 6;
+constexpr uint32_t kBlobSchemaVersion = 7;
 
-// Build the Task-20 circuit.
-std::unique_ptr<Circuit<F>> build_circuit() {
+// ===========================================================================
+// Hash-circuit public-input layout (v7). MAC positions are derived from
+// this layout so if any of these counts change, the MAC index updates
+// automatically (and the static_assert below keeps us honest).
+//
+//   [0]                              = const 1
+//   [1 .. 1 + 256)                   = context_hash v256
+//   [257 .. 257 + 520)               = pk_bytes (65 × v8)
+//   [777 .. 777 + 256)               = nonce_bytes (32 × v8)
+//   [1033]                           = mac[0] (EltW, GF(2^128) native)
+//   [1034]                           = mac[1] (EltW)
+//   [1035]                           = av     (EltW)
+//   npub_in_hash                     = 1036
+//
+// All of the above are `public`; the private witness starts at
+// npub_in_hash and is opaque to the MAC plumbing.
+constexpr size_t kHashPubConst = 1;
+constexpr size_t kHashPubContextHash = 256;
+constexpr size_t kHashPubPk = kPkBytes * 8;         // 520
+constexpr size_t kHashPubNonce = kNonceBytes * 8;   // 256
+constexpr size_t kHashPubPreMac =
+    kHashPubConst + kHashPubContextHash + kHashPubPk + kHashPubNonce;
+// Each hash-side MAC public input is 1 native EltW (GF2_128 is 128b
+// wide, and a v128 IS an EltW here). kTotalMacValues mac values +
+// 1 av = (kTotalMacValues + 1) EltW.
+constexpr size_t kHashMacInputWires = kTotalMacValues + 1;
+constexpr size_t kHashPubTotal = kHashPubPreMac + kHashMacInputWires;
+static_assert(kHashPubPreMac == 1033,
+              "layout drift — update kHashPubPreMac comment & index");
+static_assert(kHashPubTotal == 1036,
+              "layout drift — update npub_in_hash comment");
+
+// Index (in the DENSE Wit array) where the hash MAC region begins.
+// update_mac_in_dense writes (kTotalMacValues + 1) native EltW at this
+// position. Must match the circuit's declared public-input order —
+// anything else would let a malicious prover slot forged MACs into
+// positions the verifier doesn't bind.
+constexpr size_t kHashMacIndex = kHashPubPreMac;
+
+// ===========================================================================
+// Sig-circuit public-input layout (v7). The sig circuit is greenfield
+// in 25a — it carries only the MAC binding (no ECDSA wires yet; those
+// land in Task 29).
+//
+//   [0]                              = const 1 (auto-allocated wire 0)
+//   [1 .. 1 + 128)                   = mac[0] as v128 (128 bit wires)
+//   [129 .. 129 + 128)               = mac[1] as v128
+//   [257 .. 257 + 128)               = av as v128
+//   npub_in_sig                      = 385
+constexpr size_t kSigPubConst = 1;
+// Each sig-side MAC public input is a v128 = 128 bit wires (Fp256Base
+// isn't wide enough to hold a 128-bit GF(2^128) element as a single
+// field element, so it's bit-decomposed).
+constexpr size_t kSigMacBitsPerWire = 128;
+constexpr size_t kSigMacInputWires =
+    (kTotalMacValues + 1) * kSigMacBitsPerWire;  // 3 × 128 = 384
+constexpr size_t kSigPubTotal = kSigPubConst + kSigMacInputWires;
+static_assert(kSigPubTotal == 385,
+              "layout drift — update npub_in_sig comment");
+
+// Index (in the DENSE W_sig array) where the sig MAC region begins.
+// update_mac_in_dense writes 128 wires per MAC value (one field
+// element per bit).
+constexpr size_t kSigMacIndex = kSigPubConst;  // 1
+
+// ===========================================================================
+// Hash circuit builder — keeps every pre-v7 constraint intact and adds
+// the cross-field MAC binding at the end of the public-input section.
+std::unique_ptr<Circuit<F>> build_hash_circuit() {
   const F Fs;
 
   QuadCircuit<F> Q(Fs);
@@ -168,7 +296,7 @@ std::unique_ptr<Circuit<F>> build_circuit() {
   HexDecodeC hex_decode(lc);
   RoutingC routing(lc);
 
-  // ---- Public inputs ----
+  // ---- Public inputs (layout above) ----
   // Invariant 9 target (context_hash, bit-decomposed, 256 bits).
   auto context_hash = lc.template vinput<256>();
 
@@ -182,6 +310,16 @@ std::unique_ptr<Circuit<F>> build_circuit() {
   std::vector<typename LC::v8> nonce_bytes(kNonceBytes);
   for (size_t i = 0; i < kNonceBytes; ++i) {
     nonce_bytes[i] = lc.template vinput<8>();
+  }
+
+  // Task 25a MAC inputs (native GF(2^128) EltW for each value).
+  // In GF(2^128) a v128 is natively an EltW, so each MAC public input
+  // is a single wire (compare with the sig circuit, where the same
+  // 128-bit value fills 128 Fp256Base wires). Keep these in lockstep
+  // with kHashMacIndex / kHashMacInputWires above.
+  typename LC::EltW mac_pub[kHashMacInputWires];
+  for (size_t i = 0; i < kHashMacInputWires; ++i) {
+    mac_pub[i] = lc.eltw_input();
   }
 
   // ---- Private witness ----
@@ -198,7 +336,7 @@ std::unique_ptr<Circuit<F>> build_circuit() {
     context_bw[b].input(lc);
   }
 
-  // Invariant 4: full signed_content (now SHA-256 padded preimage),
+  // Invariant 4: full signed_content (SHA-256 padded preimage),
   // json_pk_offset, pk_hex, nibble witnesses.
   std::vector<typename LC::v8> signed_content(kMaxSignedContent);
   for (size_t i = 0; i < kMaxSignedContent; ++i) {
@@ -210,9 +348,6 @@ std::unique_ptr<Circuit<F>> build_circuit() {
   for (size_t i = 0; i < kPkHexLen; ++i) {
     pk_hex[i] = lc.template vinput<8>();
   }
-
-  // Prover-supplied nibble witnesses — one v8 per hex char (upper 4 bits
-  // get zero-asserted inside HexDecode::assert_decodes).
   std::vector<typename LC::v8> hi_lo_nibbles(kPkHexLen);
   for (size_t i = 0; i < kPkHexLen; ++i) {
     hi_lo_nibbles[i] = lc.template vinput<8>();
@@ -229,13 +364,11 @@ std::unique_ptr<Circuit<F>> build_circuit() {
     nonce_nibbles[i] = lc.template vinput<8>();
   }
 
-  // Invariant 6: json_context_offset (no length wire — derived from SHA).
+  // Invariant 6 / 10 locators.
   auto json_context_offset = lc.template vinput<kSignedContentLogN>();
-
-  // Invariant 10: json_declaration_offset (length is compile-time constant).
   auto json_declaration_offset = lc.template vinput<kSignedContentLogN>();
 
-  // Invariant 2b: signed_content_numb (SHA block count), message_digest.
+  // Invariant 2b: signed_content_numb, block witnesses, message_digest.
   auto signed_content_numb = lc.template vinput<8>();
   std::vector<SignedContentShaBw> signed_content_bw(kSignedContentMaxBlocks);
   for (size_t b = 0; b < kSignedContentMaxBlocks; ++b) {
@@ -246,14 +379,17 @@ std::unique_ptr<Circuit<F>> build_circuit() {
     message_digest[i] = lc.template vinput<8>();
   }
 
-  // ---- Constraints ----
+  // Task 25a MAC witness (prover's `ap` halves). 2 EltW per bound
+  // message; in 25a we bind one sentinel so this is 2 wires total.
+  MACHWitness mac_witness;
+  mac_witness.input(lc);
 
+  // ---- Constraints (unchanged from v6) ----
   // Invariant 9 — context hash.
   context_hasher.assert_message_hash(context_numb, context_in.data(),
                                      context_hash, context_bw.data());
 
-  // Invariant 4a: signed_content[pk_offset..+130] == pk_hex.
-  // Use the Routing shifter to extract the 130-byte window.
+  // Invariant 4a.
   std::vector<typename LC::v8> pk_window(kPkHexLen);
   const typename LC::v8 zz = lc.template vbit<8>(0);
   routing.template shift<typename LC::v8, kSignedContentLogN>(
@@ -261,66 +397,44 @@ std::unique_ptr<Circuit<F>> build_circuit() {
       signed_content.data(), zz, /*unroll=*/3);
   breq.assert_eq(pk_window.data(), pk_hex.data(), kPkHexLen);
 
-  // Invariant 4b: pk_hex decodes to public.pk.
+  // Invariant 4b.
   hex_decode.assert_decodes(pk_hex.data(), pk_bytes.data(),
                             hi_lo_nibbles.data(), kPkBytes);
 
-  // Invariant 5a: signed_content[nonce_offset..+64] == nonce_hex.
+  // Invariant 5a.
   std::vector<typename LC::v8> nonce_window(kNonceHexLen);
   routing.template shift<typename LC::v8, kSignedContentLogN>(
       json_nonce_offset, kNonceHexLen, nonce_window.data(), kMaxSignedContent,
       signed_content.data(), zz, /*unroll=*/3);
   breq.assert_eq(nonce_window.data(), nonce_hex.data(), kNonceHexLen);
 
-  // Invariant 5b: nonce_hex decodes to public.nonce.
+  // Invariant 5b.
   hex_decode.assert_decodes(nonce_hex.data(), nonce_bytes.data(),
                             nonce_nibbles.data(), kNonceBytes);
 
-  // Invariant 6: signed_content[ctx_offset..+ctx_len] == context_bytes[0..ctx_len].
-  // Context byte-length is derived from the SHA-256 padding (invariant 9)
-  // so there is no independent context_len wire that a prover could
-  // desynchronize from the hashed preimage.
+  // Invariant 6.
   auto ctx_len = context_hasher.template derive_byte_len<kContextLenBits>(
       context_in.data(), context_numb);
-
-  // Fixed-length (kContextMaxBytes) window out of signed_content; bytes
-  // past context_len are unconstrained (SHA padding on the context_in
-  // side won't match arbitrary signed_content bytes).
   std::vector<typename LC::v8> ctx_window(kContextMaxBytes);
   routing.template shift<typename LC::v8, kSignedContentLogN>(
       json_context_offset, kContextMaxBytes, ctx_window.data(),
       kMaxSignedContent, signed_content.data(), zz, /*unroll=*/3);
-
   assert_range_equals_masked<LC, kContextMaxBytes, kContextLenBits>(
       lc, context_in.data(), ctx_window.data(), ctx_len);
 
-  // Invariant 10: signed_content[decl_offset..+kDeclarationLen] equals
-  // kDeclarationPhrase (the sole v1 whitelist entry). The circuit side
-  // of the byte_range_eq call is a vector of constant v8 values built
-  // from the compile-time literal; the witness side is the Routing-
-  // extracted window of signed_content.
+  // Invariant 10.
   std::vector<typename LC::v8> decl_window(kDeclarationLen);
   routing.template shift<typename LC::v8, kSignedContentLogN>(
       json_declaration_offset, kDeclarationLen, decl_window.data(),
       kMaxSignedContent, signed_content.data(), zz, /*unroll=*/3);
-
   std::vector<typename LC::v8> decl_expected(kDeclarationLen);
   for (size_t i = 0; i < kDeclarationLen; ++i) {
     decl_expected[i] = lc.template vbit<8>(kDeclarationPhrase[i]);
   }
   breq.assert_eq(decl_window.data(), decl_expected.data(), kDeclarationLen);
 
-  // Invariant 2b: message_digest == SHA-256(signed_content).
-  // Treats `signed_content` as the SHA-256 Merkle-Damgård padded preimage
-  // (Rust serializes it that way). The in-circuit SHA primitive reuses
-  // the same FlatSHA256Circuit infrastructure as invariant 9, now
-  // instantiated with kSignedContentMaxBlocks = 16 instead of
-  // kContextMaxBlocks = 1.
+  // Invariant 2b — message_digest == SHA-256(signed_content).
   typename LC::v256 message_digest_v256;
-  // FlatSHA256Circuit::assert_hash reads the target as a bit-decomposed
-  // v256. Layout: bit j corresponds to bit (j % 8) of byte ((255 - j) / 8).
-  // Mirror that mapping so the message_digest[0..32] witness bytes line
-  // up with the SHA target the FlatSHA circuit unpacks.
   for (size_t j = 0; j < 256; ++j) {
     size_t byte_idx = (255 - j) / 8;
     size_t bit_idx = j % 8;
@@ -330,18 +444,106 @@ std::unique_ptr<Circuit<F>> build_circuit() {
       signed_content_numb, signed_content.data(), message_digest_v256,
       signed_content_bw.data());
 
+  // Task 25a — cross-field MAC binding to the compile-time sentinel.
+  // The sentinel is built as a constant v256 with LSB-first bit order
+  // within each byte, matching the interpretation used by
+  // MACReference::compute and by the sig-side of_bytes_field.
+  typename LC::v256 sentinel_v256;
+  for (size_t j = 0; j < 256; ++j) {
+    size_t byte_idx = j / 8;
+    size_t bit_idx = j % 8;
+    uint8_t bit = (kMacBindingSentinel[byte_idx] >> bit_idx) & 1u;
+    sentinel_v256[j] = lc.bit(bit);
+  }
+
+  MACH mac_check(lc);
+  typename LC::EltW mac_vals[kTotalMacValues];
+  for (size_t i = 0; i < kTotalMacValues; ++i) {
+    mac_vals[i] = mac_pub[i];
+  }
+  typename LC::EltW av_h = mac_pub[kTotalMacValues];
+  mac_check.verify_mac(mac_vals, av_h, sentinel_v256, mac_witness);
+
   return Q.mkcircuit(/*nc=*/1);
 }
 
-const Circuit<F>& get_circuit() {
+// Sig-circuit builder — greenfield in 25a. Declares the MAC public
+// inputs, a trivial `pk_one` constant (to mirror the mdoc pattern
+// where the first non-index-0 public input is a known-1 element),
+// and a terminal `assert0(konst(zero))` so the compiler produces
+// a non-empty constraint set.
+std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
+  QuadCircuit<Fp256Base> Q(p256_base);
+  const CB256 cbk(&Q);
+  const LC256 lc(&cbk, p256_base);
+
+  // ---- Public inputs (layout above) ----
+  // mac values + av as bit-decomposed v128 each.
+  typename LC256::v128 mac_pub[kTotalMacValues + 1];
+  for (size_t i = 0; i < kTotalMacValues + 1; ++i) {
+    mac_pub[i] = lc.template vinput<128>();
+  }
+
+  // ---- Private witness ----
+  Q.private_input();
+
+  P7sSigWitness sig_witness;
+  sig_witness.input(lc);
+
+  // ---- Constraints ----
+  // Sentinel as an Fp256Base field element. of_bytes_field treats the
+  // bytes as a little-endian integer less than the modulus; our
+  // sentinel's top byte is 0 (NUL padding) so it's well within bound.
+  // The returned Elt is already in Montgomery form (see
+  // `fp_generic.h:329-332`) so we pass it to konst() directly.
+  auto sentinel_opt = p256_base.of_bytes_field(kMacBindingSentinel);
+  check(sentinel_opt.has_value(),
+        "kMacBindingSentinel must fit in Fp256Base");
+  typename LC256::EltW sentinel_elt = lc.konst(sentinel_opt.value());
+
+  P7sSigCircuit sig_gadget(lc);
+  typename LC256::v128 mac_vals[kTotalMacValues]{};
+  for (size_t i = 0; i < kTotalMacValues; ++i) {
+    mac_vals[i] = mac_pub[i];
+  }
+  typename LC256::v128 av_s{};
+  av_s = mac_pub[kTotalMacValues];
+  // The MAC primitive range-checks the message bit-decomposition
+  // against `order`. We use n256_order (the curve order) to mirror
+  // mdoc; any 256-bit bound that exceeds our sentinel value would
+  // work, but matching mdoc keeps future merges tidy.
+  sig_gadget.assert_mac_binding(sentinel_elt, mac_vals, av_s, sig_witness,
+                                n256_order);
+
+  // Trivial terminal constraint: the compiler requires some assert to
+  // emit a constraint layer. assert0(zero) is tautological (always 0).
+  // Task 29 replaces this with the ECDSA verify_signature3 call.
+  lc.assert0(lc.konst(p256_base.zero()));
+
+  return Q.mkcircuit(/*nc=*/1);
+}
+
+const Circuit<F>& get_hash_circuit() {
   static std::mutex m;
   static std::unique_ptr<Circuit<F>> c;
   std::lock_guard<std::mutex> lock(m);
   if (!c) {
-    c = build_circuit();
+    c = build_hash_circuit();
   }
   return *c;
 }
+
+const Circuit<Fp256Base>& get_sig_circuit() {
+  static std::mutex m;
+  static std::unique_ptr<Circuit<Fp256Base>> c;
+  std::lock_guard<std::mutex> lock(m);
+  if (!c) {
+    c = build_sig_circuit();
+  }
+  return *c;
+}
+
+// ========================== Witness-fill helpers ===========================
 
 // Push an 8-bit value as 8 wires, LSB-first.
 void push_v8(DenseFiller<F>& filler, uint8_t x, const F& Fs) {
@@ -366,8 +568,6 @@ void push_target(DenseFiller<F>& filler, const uint8_t context_hash[32],
   }
 }
 
-// Push the decoded pk as 65 v8 values (LSB-first bits within each byte),
-// matching the `lc.vinput<8>()` layout.
 void push_pk_public(DenseFiller<F>& filler, const uint8_t pk[kPkBytes],
                     const F& Fs) {
   for (size_t i = 0; i < kPkBytes; ++i) {
@@ -375,7 +575,6 @@ void push_pk_public(DenseFiller<F>& filler, const uint8_t pk[kPkBytes],
   }
 }
 
-// Push the decoded nonce as 32 v8 values.
 void push_nonce_public(DenseFiller<F>& filler,
                        const uint8_t nonce[kNonceBytes], const F& Fs) {
   for (size_t i = 0; i < kNonceBytes; ++i) {
@@ -383,9 +582,27 @@ void push_nonce_public(DenseFiller<F>& filler,
   }
 }
 
-// Compute SHA-256 Merkle-Damgård padding off-circuit for a raw message.
-// Returns numb (the block count) and fills padded_in (64*kMaxBlocks bytes)
-// and bw (per-block FlatSHA intermediate witnesses).
+// Push the MAC public-input region in the HASH circuit as native
+// EltW wires (GF(2^128) is 128 bits wide → 1 EltW per v128).
+// The values we push here are placeholders (Fs.zero()) that
+// update_hash_macs overwrites in the DENSE array after commit.
+void push_hash_mac_placeholders(DenseFiller<F>& filler, const F& Fs) {
+  for (size_t i = 0; i < kHashMacInputWires; ++i) {
+    filler.push_back(Fs.zero());
+  }
+}
+
+// Push the MAC public-input region in the SIG circuit as v128
+// bit-wires. Each v128 = 128 Fp256Base wires (one per bit, LSB-first
+// in the EltW interpretation). Placeholder zeros here; overwritten by
+// update_sig_macs after commit.
+void push_sig_mac_placeholders(DenseFiller<Fp256Base>& filler) {
+  for (size_t i = 0; i < kSigMacInputWires; ++i) {
+    filler.push_back(p256_base.zero());
+  }
+}
+
+// SHA witness helpers.
 template <size_t kMaxBlocks>
 struct ShaWitness {
   uint8_t numb = 0;
@@ -400,7 +617,6 @@ void compute_sha_witness(const uint8_t* raw_bytes, size_t raw_len,
       raw_len, raw_bytes, kMaxBlocks, out.numb, out.padded_in, out.bw);
 }
 
-// Push only the padded SHA preimage bytes.
 template <size_t kMaxBlocks>
 void push_sha_padded_bytes(DenseFiller<F>& filler,
                            const ShaWitness<kMaxBlocks>& sw, const F& Fs) {
@@ -409,7 +625,6 @@ void push_sha_padded_bytes(DenseFiller<F>& filler,
   }
 }
 
-// Push per-block SHA intermediate witnesses (no numb, no padded bytes).
 template <size_t kMaxBlocks>
 void push_sha_block_witnesses(DenseFiller<F>& filler,
                               const ShaWitness<kMaxBlocks>& sw, const F& Fs) {
@@ -432,9 +647,6 @@ void push_sha_block_witnesses(DenseFiller<F>& filler,
   }
 }
 
-// Decode a single lowercase-or-digit hex char to its nibble value. Any
-// non-hex char is mapped to 0 so the HexDecode circuit can reject at
-// constraint time rather than at witness-fill time.
 uint8_t nibble_of(uint8_t c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -442,25 +654,17 @@ uint8_t nibble_of(uint8_t c) {
   return 0;
 }
 
-// Push invariant-4 private witness: json_pk_offset (10 bits), pk_hex (130
-// bytes), pk nibble witnesses. The signed_content bytes are NOT pushed
-// here — they're pushed separately as the SHA-padded preimage for
-// invariant 2b and reused by invariants 4/5/6/10 via Routing::shift.
 void push_invariant4_witness(DenseFiller<F>& filler, uint32_t json_pk_offset,
                              const uint8_t pk_hex[kPkHexLen], const F& Fs) {
   push_uint(filler, json_pk_offset, kSignedContentLogN, Fs);
   for (size_t i = 0; i < kPkHexLen; ++i) {
     push_v8(filler, pk_hex[i], Fs);
   }
-  // Nibble witnesses derived from pk_hex: one v8 per hex char carrying the
-  // decoded nibble in the low 4 bits and zero in the upper 4.
   for (size_t i = 0; i < kPkHexLen; ++i) {
     push_v8(filler, nibble_of(pk_hex[i]), Fs);
   }
 }
 
-// Push invariant-5 private witness: json_nonce_offset (10 bits),
-// nonce_hex (64 bytes), nonce nibble witnesses.
 void push_invariant5_witness(DenseFiller<F>& filler,
                              uint32_t json_nonce_offset,
                              const uint8_t nonce_hex[kNonceHexLen],
@@ -474,24 +678,67 @@ void push_invariant5_witness(DenseFiller<F>& filler,
   }
 }
 
-// Push invariant-6 private witness: only the json_context_offset wire.
-// The context length is derived from the SHA padding in-circuit, so
-// there is no separate length to feed here.
 void push_invariant6_witness(DenseFiller<F>& filler,
                              uint32_t json_context_offset, const F& Fs) {
   push_uint(filler, json_context_offset, kSignedContentLogN, Fs);
 }
 
-// Push invariant-10 private witness: only the json_declaration_offset wire.
-// The declaration length is a circuit-side compile-time constant and the
-// whitelist phrase itself is embedded as constant wires — no further
-// witness is needed.
 void push_invariant10_witness(DenseFiller<F>& filler,
                               uint32_t json_declaration_offset, const F& Fs) {
   push_uint(filler, json_declaration_offset, kSignedContentLogN, Fs);
 }
 
-// Read helpers for the little-endian blob format.
+// ========================== MAC plumbing ===================================
+
+// Sample av from the (shared) transcript. Called exactly once, AFTER
+// both circuits have committed and BEFORE either circuit proves.
+gf2k generate_mac_key(Transcript& t) {
+  F gf;
+  uint8_t buf[F::kBytes];
+  t.bytes(buf, F::kBytes);
+  return gf.of_bytes_field(buf).value();
+}
+
+// Write a single gf2k value into a specific position of both dense
+// arrays. On the sig side, each gf2k fills 128 field-element wires
+// (one per bit, as one() / zero()). On the hash side, each gf2k fills
+// exactly 1 native EltW wire.
+void update_mac_in_dense(Dense<Fp256Base>& W_sig, Dense<F>& W_hash,
+                         size_t& si, size_t& hi, const gf2k mac) {
+  for (size_t j = 0; j < F::kBits; ++j) {
+    W_sig.v_[si++] = mac[j] ? p256_base.one() : p256_base.zero();
+  }
+  W_hash.v_[hi++] = mac;
+}
+
+// Write all MAC values + av into both dense arrays at the known
+// index positions. The caller MUST have:
+//   1. committed both circuits BEFORE calling this
+//   2. sampled av AFTER commit and BEFORE calling this
+//   3. computed the macs using the sampled av BEFORE calling this
+// Any other ordering produces a silent-pass soundness bug (see the
+// "Interleaving order" section of docs/superpowers/specs/
+// handoff-25a-dual-circuit.md section 5).
+void update_macs(Dense<Fp256Base>& W_sig, Dense<F>& W_hash,
+                 const gf2k macs[kTotalMacValues], gf2k av) {
+  size_t si = kSigMacIndex;
+  size_t hi = kHashMacIndex;
+  for (size_t mi = 0; mi < kTotalMacValues; ++mi) {
+    update_mac_in_dense(W_sig, W_hash, si, hi, macs[mi]);
+  }
+  update_mac_in_dense(W_sig, W_hash, si, hi, av);
+  // Runtime guard: the write window must end EXACTLY at the end of
+  // the public-input section in each circuit. A mismatch means the
+  // circuit layout drifted away from kHashMacIndex / kSigMacIndex —
+  // catch it here rather than producing a silently-wrong proof.
+  check(si == kSigMacIndex + kSigMacInputWires,
+        "sig MAC write went past expected boundary");
+  check(hi == kHashMacIndex + kHashMacInputWires,
+        "hash MAC write went past expected boundary");
+}
+
+// ========================== Blob parsing ==================================
+
 bool read_u32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
   if (end - p < 4) return false;
   out = static_cast<uint32_t>(p[0]) |
@@ -502,7 +749,6 @@ bool read_u32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
   return true;
 }
 
-// Parsed witness blob (zero-padded to fixed array sizes).
 struct ParsedWitness {
   uint32_t context_len;
   uint8_t context[kContextMaxBytes];
@@ -517,7 +763,6 @@ struct ParsedWitness {
   uint8_t message_digest[kMessageDigestLen];
 };
 
-// Parsed public blob.
 struct ParsedPublic {
   uint8_t context_hash[32];
   uint8_t pk[kPkBytes];
@@ -546,10 +791,6 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   p += kMaxSignedContent;
 
   if (!read_u32(p, end, out.json_pk_offset)) return false;
-  // `json_pk_offset + kPkHexLen <= kMaxSignedContent` ensures the shifted
-  // window stays within the buffer. (The Routing shifter would zero-default
-  // out-of-range reads, but we refuse obviously nonsensical offsets up
-  // front so the pk_hex witness can't mask them.)
   if (out.json_pk_offset > kMaxSignedContent - kPkHexLen) return false;
 
   if (end - p < static_cast<ptrdiff_t>(kPkHexLen)) return false;
@@ -564,10 +805,6 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   p += kNonceHexLen;
 
   if (!read_u32(p, end, out.json_context_offset)) return false;
-  // Context may be 0..32 bytes, so the strictest bound is
-  // json_context_offset + kContextMaxBytes <= kMaxSignedContent. The
-  // in-circuit byte-eq masks padding positions, so offsets that leave
-  // fewer than context_len usable bytes will be caught at prove time.
   if (out.json_context_offset > kMaxSignedContent - kContextMaxBytes) {
     return false;
   }
@@ -610,6 +847,53 @@ bool parse_public_blob(const uint8_t* blob, size_t blob_len,
   return true;
 }
 
+// ========================== Public-input fillers ===========================
+
+// Fill the HASH circuit's public inputs in the canonical order. When
+// `fill_mac_placeholders` is true (prove path), the MAC region is
+// zero-filled and later overwritten via update_macs. When false
+// (verify path), the caller has already seeded the MAC region from
+// the parsed proof bytes via push_hash_mac_values.
+void fill_hash_public_inputs(DenseFiller<F>& filler, const ParsedPublic& pub,
+                             const F& Fs) {
+  filler.push_back(Fs.one());
+  push_target(filler, pub.context_hash, Fs);
+  push_pk_public(filler, pub.pk, Fs);
+  push_nonce_public(filler, pub.nonce, Fs);
+}
+
+void push_hash_mac_values(DenseFiller<F>& filler,
+                          const gf2k macs[kTotalMacValues], gf2k av) {
+  for (size_t i = 0; i < kTotalMacValues; ++i) {
+    filler.push_back(macs[i]);
+  }
+  filler.push_back(av);
+}
+
+void push_sig_mac_values(DenseFiller<Fp256Base>& filler,
+                         const gf2k macs[kTotalMacValues], gf2k av) {
+  // One Fp256Base wire per bit, LSB-first — matches the circuit's
+  // v128 bit ordering and update_mac_in_dense's write pattern.
+  for (size_t i = 0; i < kTotalMacValues; ++i) {
+    for (size_t j = 0; j < F::kBits; ++j) {
+      filler.push_back(macs[i][j] ? p256_base.one() : p256_base.zero());
+    }
+  }
+  for (size_t j = 0; j < F::kBits; ++j) {
+    filler.push_back(av[j] ? p256_base.one() : p256_base.zero());
+  }
+}
+
+// =========================== Proof serialization ===========================
+
+// Little-endian u32 write into a byte vector.
+void write_u32(std::vector<uint8_t>& buf, uint32_t x) {
+  buf.push_back(static_cast<uint8_t>(x & 0xFF));
+  buf.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
+  buf.push_back(static_cast<uint8_t>((x >> 16) & 0xFF));
+  buf.push_back(static_cast<uint8_t>((x >> 24) & 0xFF));
+}
+
 }  // namespace
 }  // namespace p7s
 }  // namespace proofs
@@ -634,74 +918,133 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   }
 
   const F Fs;
-  const RSFactory rsf(Fs);
-  const Circuit<F>& circuit = get_circuit();
+  const RSFactory rsf_h(Fs);
+  const Circuit<F>& c_hash = get_hash_circuit();
+  const Circuit<Fp256Base>& c_sig = get_sig_circuit();
 
-  // Compute SHA-256 witnesses for both hashed messages (context for
-  // invariant 9, signed_content for invariant 2b) off-circuit. The
-  // padded preimages fill the context_in[] and signed_content[]
-  // circuit wires; numb + per-block intermediates follow their
-  // respective in-circuit SHA primitives.
+  // Sanity-check that the circuits we built actually match the
+  // layout constants — if the circuit grew/shrank without someone
+  // bumping kHashPubTotal / kSigPubTotal, we'd write MACs at the
+  // wrong offset. Runtime check here is cheap and catches the
+  // class of bugs that are otherwise only detectable at verify
+  // time (silent pass if the layout coincidentally cancels out).
+  if (c_hash.npub_in != kHashPubTotal) return P7S_INVALID_INPUT;
+  if (c_sig.npub_in != kSigPubTotal) return P7S_INVALID_INPUT;
+
+  // Compute SHA witnesses off-circuit.
   ShaWitness<kContextMaxBlocks> ctx_sw;
   compute_sha_witness<kContextMaxBlocks>(wit.context, wit.context_len, ctx_sw);
   ShaWitness<kSignedContentMaxBlocks> sc_sw;
   compute_sha_witness<kSignedContentMaxBlocks>(wit.signed_content,
                                                wit.signed_content_len, sc_sw);
 
-  Dense<F> W(1, circuit.ninputs);
-  DenseFiller<F> filler(W);
-
-  // Constant-1 wire + public inputs.
-  filler.push_back(Fs.one());
-  push_target(filler, pub.context_hash, Fs);
-  push_pk_public(filler, pub.pk, Fs);
-  push_nonce_public(filler, pub.nonce, Fs);
-
-  // Invariant 9 SHA witness: context_numb + padded context bytes +
-  // per-block intermediates.
-  push_v8(filler, ctx_sw.numb, Fs);
-  push_sha_padded_bytes<kContextMaxBlocks>(filler, ctx_sw, Fs);
-  push_sha_block_witnesses<kContextMaxBlocks>(filler, ctx_sw, Fs);
-
-  // Invariant 4: signed_content (SHA-padded preimage, shared with
-  // invariant 2b) + pk locator + pk hex + pk nibble witnesses.
-  push_sha_padded_bytes<kSignedContentMaxBlocks>(filler, sc_sw, Fs);
-  push_invariant4_witness(filler, wit.json_pk_offset, wit.pk_hex, Fs);
-
-  // Invariants 5 / 6 / 10 locators and auxiliary witnesses.
-  push_invariant5_witness(filler, wit.json_nonce_offset, wit.nonce_hex, Fs);
-  push_invariant6_witness(filler, wit.json_context_offset, Fs);
-  push_invariant10_witness(filler, wit.json_declaration_offset, Fs);
-
-  // Invariant 2b: signed_content_numb + per-block SHA intermediates +
-  // prover-claimed message_digest.
-  push_v8(filler, sc_sw.numb, Fs);
-  push_sha_block_witnesses<kSignedContentMaxBlocks>(filler, sc_sw, Fs);
-  for (size_t i = 0; i < kMessageDigestLen; ++i) {
-    push_v8(filler, wit.message_digest[i], Fs);
-  }
-
-  if (filler.size() != circuit.ninputs) {
-    return P7S_INVALID_INPUT;
-  }
-
-  ZkProof<F> zkp(circuit, kRate, kNreq);
-  Transcript tp(reinterpret_cast<const uint8_t*>(kTranscriptSeed),
-                kTranscriptSeedLen);
+  // Sample the prover's half of the MAC key BEFORE commit so it
+  // becomes part of the committed witness. `ap` is 2 gf2k values
+  // (low + high halves of the bound sentinel).
   SecureRandomEngine rng;
-  ZkProver<F, RSFactory> prover(circuit, Fs, rsf);
-  prover.commit(zkp, W, tp, rng);
-  if (!prover.prove(zkp, W, tp)) {
-    return P7S_PROVER_FAILURE;
-  }
+  MACReference<F> mac_ref;
+  gf2k ap[kTotalMacValues];
+  mac_ref.sample(ap, kTotalMacValues, &rng);
 
+  // ===== Fill HASH witness (W_hash over GF(2^128)) =====
+  Dense<F> W_hash(1, c_hash.ninputs);
+  DenseFiller<F> hash_filler(W_hash);
+
+  // Public section.
+  fill_hash_public_inputs(hash_filler, pub, Fs);
+  push_hash_mac_placeholders(hash_filler, Fs);
+
+  // Private section.
+  push_v8(hash_filler, ctx_sw.numb, Fs);
+  push_sha_padded_bytes<kContextMaxBlocks>(hash_filler, ctx_sw, Fs);
+  push_sha_block_witnesses<kContextMaxBlocks>(hash_filler, ctx_sw, Fs);
+  push_sha_padded_bytes<kSignedContentMaxBlocks>(hash_filler, sc_sw, Fs);
+  push_invariant4_witness(hash_filler, wit.json_pk_offset, wit.pk_hex, Fs);
+  push_invariant5_witness(hash_filler, wit.json_nonce_offset, wit.nonce_hex, Fs);
+  push_invariant6_witness(hash_filler, wit.json_context_offset, Fs);
+  push_invariant10_witness(hash_filler, wit.json_declaration_offset, Fs);
+  push_v8(hash_filler, sc_sw.numb, Fs);
+  push_sha_block_witnesses<kSignedContentMaxBlocks>(hash_filler, sc_sw, Fs);
+  for (size_t i = 0; i < kMessageDigestLen; ++i) {
+    push_v8(hash_filler, wit.message_digest[i], Fs);
+  }
+  // Task 25a: prover's committed `ap` halves (2 native EltW).
+  for (size_t i = 0; i < kTotalMacValues; ++i) {
+    hash_filler.push_back(ap[i]);
+  }
+  if (hash_filler.size() != c_hash.ninputs) return P7S_INVALID_INPUT;
+
+  // ===== Fill SIG witness (W_sig over Fp256Base) =====
+  Dense<Fp256Base> W_sig(1, c_sig.ninputs);
+  DenseFiller<Fp256Base> sig_filler(W_sig);
+
+  // Public section.
+  sig_filler.push_back(p256_base.one());
+  push_sig_mac_placeholders(sig_filler);
+
+  // Private section: MAC witness (prover's ap halves encoded via
+  // BitPluckerEncoder + the message bit-decomposition).
+  {
+    MacWitness<Fp256Base> mw(p256_base, Fs);
+    mw.compute_witness(ap, const_cast<uint8_t*>(kMacBindingSentinel));
+    mw.fill_witness(sig_filler);
+  }
+  if (sig_filler.size() != c_sig.ninputs) return P7S_INVALID_INPUT;
+
+  // ===== Shared transcript + commit phase =====
+  // One Transcript instance threads both circuits; the per-circuit
+  // seeds are distinct compile-time constants. Construction order:
+  //   Transcript tp(kHashSeed, ...) — keeps the hash commit first
+  //   (mirrors mdoc), then sig commit on the same tp, then av
+  //   sampling, then both proves.
+  Transcript tp(reinterpret_cast<const uint8_t*>(kHashTranscriptSeed),
+                kHashTranscriptSeedLen);
+
+  // Sig-circuit FFT / Reed-Solomon stack (copied from mdoc_zk.cc).
+  const f2_p256 p256_2(p256_base);
+  const Elt256_2 omega = p256_2.of_string(kRootX, kRootY);
+  const FftExtConvolutionFactory_b fft_b(p256_base, p256_2, omega, 1ull << 31);
+  const RSFactory_b rsf_s(fft_b, p256_base);
+
+  ZkProof<F> h_zk(c_hash, kRate, kNreq);
+  ZkProof<Fp256Base> sig_zk(c_sig, kRate, kNreq);
+  ZkProver<F, RSFactory> hash_p(c_hash, Fs, rsf_h);
+  ZkProver<Fp256Base, RSFactory_b> sig_p(c_sig, p256_base, rsf_s);
+
+  // Commit both circuits BEFORE sampling av. The Dense arrays still
+  // have zero placeholders in their MAC slots — that's the whole
+  // point of the av-sampled-after-commit protocol.
+  hash_p.commit(h_zk, W_hash, tp, rng);
+  sig_p.commit(sig_zk, W_sig, tp, rng);
+
+  // Sample av from the post-commit transcript state and compute the
+  // MAC values over the sentinel.
+  gf2k av = generate_mac_key(tp);
+  gf2k macs[kTotalMacValues];
+  mac_ref.compute(macs, av, ap, const_cast<uint8_t*>(kMacBindingSentinel));
+
+  // Write the MAC values + av into both dense arrays' MAC slots.
+  // DOES NOT touch the committed snapshot — commit() captured the
+  // Dense as-is; these writes only affect the subsequent prove().
+  update_macs(W_sig, W_hash, macs, av);
+
+  if (!hash_p.prove(h_zk, W_hash, tp)) return P7S_PROVER_FAILURE;
+  if (!sig_p.prove(sig_zk, W_sig, tp)) return P7S_PROVER_FAILURE;
+
+  // ===== Serialize [schema(4)][macs_b(32)][hash_zk][sig_zk] =====
   std::vector<uint8_t> buf;
-  zkp.write(buf, Fs);
+  buf.reserve(4 + kTotalMacValues * F::kBytes + h_zk.size() + sig_zk.size());
+  write_u32(buf, kBlobSchemaVersion);
+  for (size_t i = 0; i < kTotalMacValues; ++i) {
+    size_t pos = buf.size();
+    buf.resize(pos + F::kBytes);
+    Fs.to_bytes_field(buf.data() + pos, macs[i]);
+  }
+  h_zk.write(buf, Fs);
+  sig_zk.write(buf, p256_base);
 
   uint8_t* out = static_cast<uint8_t*>(malloc(buf.size()));
-  if (!out) {
-    return P7S_MEMORY_FAILURE;
-  }
+  if (!out) return P7S_MEMORY_FAILURE;
   memcpy(out, buf.data(), buf.size());
   *proof_out = out;
   *proof_len_out = buf.size();
@@ -722,34 +1065,72 @@ P7sErrorCode p7s_verify(const uint8_t* public_blob, size_t public_blob_len,
   }
 
   const F Fs;
-  const RSFactory rsf(Fs);
-  const Circuit<F>& circuit = get_circuit();
+  const RSFactory rsf_h(Fs);
+  const Circuit<F>& c_hash = get_hash_circuit();
+  const Circuit<Fp256Base>& c_sig = get_sig_circuit();
 
-  ZkProof<F> zkp(circuit, kRate, kNreq);
+  if (c_hash.npub_in != kHashPubTotal) return P7S_VERIFIER_FAILURE;
+  if (c_sig.npub_in != kSigPubTotal) return P7S_VERIFIER_FAILURE;
+
+  // Parse proof bytes in order: schema(4) | macs_b(32) | hash_zk | sig_zk
   const std::vector<uint8_t> zbuf(proof, proof + proof_len);
   ReadBuffer rb(zbuf);
-  if (!zkp.read(rb, Fs)) {
-    return P7S_VERIFIER_FAILURE;
-  }
-  if (rb.remaining() != 0) {
-    return P7S_VERIFIER_FAILURE;
+  if (rb.remaining() < 4) return P7S_VERIFIER_FAILURE;
+  const uint8_t* sver = rb.next(4);
+  uint32_t schema = static_cast<uint32_t>(sver[0]) |
+                    (static_cast<uint32_t>(sver[1]) << 8) |
+                    (static_cast<uint32_t>(sver[2]) << 16) |
+                    (static_cast<uint32_t>(sver[3]) << 24);
+  if (schema != kBlobSchemaVersion) return P7S_VERIFIER_FAILURE;
+
+  if (rb.remaining() < kTotalMacValues * F::kBytes) return P7S_VERIFIER_FAILURE;
+  gf2k macs[kTotalMacValues];
+  for (size_t i = 0; i < kTotalMacValues; ++i) {
+    const uint8_t* mb = rb.next(F::kBytes);
+    auto m = Fs.of_bytes_field(mb);
+    if (!m.has_value()) return P7S_VERIFIER_FAILURE;
+    macs[i] = m.value();
   }
 
-  Dense<F> pub_w(1, circuit.npub_in);
-  DenseFiller<F> filler(pub_w);
-  filler.push_back(Fs.one());
-  push_target(filler, pub.context_hash, Fs);
-  push_pk_public(filler, pub.pk, Fs);
-  push_nonce_public(filler, pub.nonce, Fs);
-  if (filler.size() != circuit.npub_in) {
-    return P7S_INVALID_INPUT;
-  }
+  ZkProof<F> pr_hash(c_hash, kRate, kNreq);
+  ZkProof<Fp256Base> pr_sig(c_sig, kRate, kNreq);
+  if (!pr_hash.read(rb, Fs)) return P7S_VERIFIER_FAILURE;
+  if (!pr_sig.read(rb, p256_base)) return P7S_VERIFIER_FAILURE;
+  if (rb.remaining() != 0) return P7S_VERIFIER_FAILURE;
 
-  ZkVerifier<F, RSFactory> verifier(circuit, rsf, kRate, kNreq, Fs);
-  Transcript tv(reinterpret_cast<const uint8_t*>(kTranscriptSeed),
-                kTranscriptSeedLen);
-  verifier.recv_commitment(zkp, tv);
-  return verifier.verify(zkp, pub_w, tv) ? P7S_SUCCESS : P7S_VERIFIER_FAILURE;
+  // Shared transcript — same seed as the prover.
+  const f2_p256 p256_2(p256_base);
+  const Elt256_2 omega = p256_2.of_string(kRootX, kRootY);
+  const FftExtConvolutionFactory_b fft_b(p256_base, p256_2, omega, 1ull << 31);
+  const RSFactory_b rsf_s(fft_b, p256_base);
+
+  Transcript tv(reinterpret_cast<const uint8_t*>(kHashTranscriptSeed),
+                kHashTranscriptSeedLen);
+  ZkVerifier<F, RSFactory> hash_v(c_hash, rsf_h, kRate, kNreq, Fs);
+  ZkVerifier<Fp256Base, RSFactory_b> sig_v(c_sig, rsf_s, kRate, kNreq,
+                                           p256_base);
+
+  // Same commit → av → verify interleaving as the prover.
+  hash_v.recv_commitment(pr_hash, tv);
+  sig_v.recv_commitment(pr_sig, tv);
+  gf2k av = generate_mac_key(tv);
+
+  // Build public-input Dense arrays with the parsed MAC values.
+  Dense<F> pub_hash(1, c_hash.npub_in);
+  DenseFiller<F> hash_filler(pub_hash);
+  fill_hash_public_inputs(hash_filler, pub, Fs);
+  push_hash_mac_values(hash_filler, macs, av);
+  if (hash_filler.size() != c_hash.npub_in) return P7S_VERIFIER_FAILURE;
+
+  Dense<Fp256Base> pub_sig(1, c_sig.npub_in);
+  DenseFiller<Fp256Base> sig_filler(pub_sig);
+  sig_filler.push_back(p256_base.one());
+  push_sig_mac_values(sig_filler, macs, av);
+  if (sig_filler.size() != c_sig.npub_in) return P7S_VERIFIER_FAILURE;
+
+  bool ok_h = hash_v.verify(pr_hash, pub_hash, tv);
+  bool ok_s = sig_v.verify(pr_sig, pub_sig, tv);
+  return (ok_h && ok_s) ? P7S_SUCCESS : P7S_VERIFIER_FAILURE;
 }
 
 void p7s_free_proof(uint8_t* proof) { free(proof); }

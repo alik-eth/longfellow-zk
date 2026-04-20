@@ -19,7 +19,7 @@ typedef enum {
 } P7sErrorCode;
 
 // ============================================================================
-// Phase 2a p7s circuit — blob protocol (schema v6).
+// Phase 2a p7s circuit — blob protocol (schema v7).
 //
 // Prove/verify take two byte buffers that the caller serializes:
 //   * `witness_blob`: private witness — circuit-dependent; schema below.
@@ -42,9 +42,18 @@ typedef enum {
 //   (24) invariant 2b — message_digest == SHA-256(signed_content)
 //                       (signed_content length derived from SHA padding;
 //                        binding to signedAttrs byte range arrives in Task 26)
+//   (25a) dual-circuit MAC plumbing — a sig-circuit over Fp256Base is
+//                       introduced alongside the existing hash-circuit
+//                       over GF(2^128), linked via a MAC gadget bound
+//                       to a non-zero sentinel (no real ECDSA yet;
+//                       Task 29 / 25b swaps the sentinel for
+//                       `e = SHA-256(cert_tbs)` and adds ECDSA).
 //
-// Witness blob v6 layout (all little-endian):
-//   u32  version                                    = 6
+// Witness/public blob layouts are UNCHANGED from v6 — the dual-circuit
+// split is a proof-format-only change:
+//
+// Witness blob v7 layout (same as v6, all little-endian):
+//   u32  version                                    = 7
 //   u32  context_len                                in [0, 32]
 //   u8   context[32]                                raw bytes + zero pad;
 //                                                   filler SHA-pads
@@ -60,18 +69,23 @@ typedef enum {
 //   u8   message_digest[32]                         prover-claimed
 //                                                   SHA-256(signed_content)
 //
-// Note: `context_len` and `signed_content_len` are host-side filler
-// parameters — the C++ witness filler uses them to build SHA-256
-// Merkle-Damgård padded buffers that go into the circuit's `context_in`
-// and `signed_content` wires. The CIRCUIT itself does NOT see either
-// length as a wire; both lengths are derivable from the SHA padding
-// in-circuit (Task 22's discipline, applied to both fields).
-//
-// Public blob v6 layout (unchanged from v3):
-//   u32  version                                    = 6
+// Public blob v7 layout (unchanged from v3/v4/v5/v6):
+//   u32  version                                    = 7
 //   u8   context_hash[32]
 //   u8   pk[65]                                     decoded SEC1 uncompressed
 //   u8   nonce[32]                                  decoded freshness nonce
+//
+// Extended proof-output format (v7):
+//   u32  schema_version                             = 7 (LE)
+//   u8   macs_b[32]                                 2 × GF(2^128) MAC values
+//                                                   (low+high halves of the
+//                                                    bound sentinel)
+//   u8   hash_zk[...]                               ZkProof<GF2_128>,
+//                                                   self-delimited by
+//                                                   ZkProof::read
+//   u8   sig_zk[...]                                ZkProof<Fp256Base>,
+//                                                   self-delimited by
+//                                                   ZkProof::read
 //
 // Proof bytes are opaque; the caller must free the buffer via
 // p7s_free_proof.

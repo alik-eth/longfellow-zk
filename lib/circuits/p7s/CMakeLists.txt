@@ -5,6 +5,7 @@ add_library(p7s_static STATIC
   p7s_zk.cc
   sub/byte_range_eq.cc
   sub/declaration_whitelist.cc
+  sub/p7s_signature.cc
   sub/signedattrs_rewrite.cc
   $<TARGET_OBJECTS:flatsha>
   $<TARGET_OBJECTS:ec>
