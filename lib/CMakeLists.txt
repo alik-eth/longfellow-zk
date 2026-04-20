@@ -70,6 +70,7 @@ add_subdirectory(circuits/ecdsa)
 add_subdirectory(circuits/logic)
 add_subdirectory(circuits/mac)
 add_subdirectory(circuits/mdoc)
+add_subdirectory(circuits/p7s)
 add_subdirectory(circuits/sha)
 
 # experiments and tests, not used in production, may be buggy
