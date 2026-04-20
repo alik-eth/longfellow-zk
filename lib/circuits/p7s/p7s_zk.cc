@@ -190,16 +190,14 @@ static constexpr char kRootY[] =
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seeds — bumped from "p7s-24" so proofs minted under the
-// Task-24 circuit cannot be misinterpreted as Task-25 proofs. Distinct
-// per-circuit, matching the mdoc convention of having circuit-specific
-// processing on a shared transcript (the SAME Transcript instance is
-// used for hash commit, av sampling, and sig commit/prove; the seeds
-// differ only at circuit-construction time).
+// Transcript seed — bumped from "p7s-24" so proofs minted under the
+// Task-24 single-circuit cannot be misinterpreted as Task-25 proofs.
+// A SINGLE Transcript instance is used for hash commit, av sampling,
+// and sig commit/prove; both circuits share the same seed (mirrors
+// mdoc, which uses one transcript with circuit-specific processing
+// keyed by the distinct circuit structures themselves).
 constexpr char kHashTranscriptSeed[] = "p7s-25-hash";
 constexpr size_t kHashTranscriptSeedLen = sizeof(kHashTranscriptSeed) - 1;
-constexpr char kSigTranscriptSeed[] = "p7s-25-sig";
-constexpr size_t kSigTranscriptSeedLen = sizeof(kSigTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
 constexpr size_t kContextPaddedBytes = kShaBlockBytes * kContextMaxBlocks;
@@ -849,11 +847,11 @@ bool parse_public_blob(const uint8_t* blob, size_t blob_len,
 
 // ========================== Public-input fillers ===========================
 
-// Fill the HASH circuit's public inputs in the canonical order. When
-// `fill_mac_placeholders` is true (prove path), the MAC region is
-// zero-filled and later overwritten via update_macs. When false
-// (verify path), the caller has already seeded the MAC region from
-// the parsed proof bytes via push_hash_mac_values.
+// Fill the pre-MAC public-input section of the HASH circuit. Callers
+// must subsequently invoke either push_hash_mac_placeholders (prove
+// path — zero-fills the MAC slots; update_macs overwrites them after
+// commit) or push_hash_mac_values (verify path — seeds the MAC region
+// directly from the parsed proof bytes).
 void fill_hash_public_inputs(DenseFiller<F>& filler, const ParsedPublic& pub,
                              const F& Fs) {
   filler.push_back(Fs.one());
