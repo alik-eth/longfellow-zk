@@ -1,6 +1,6 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
-// Phase 2a p7s circuit — blob protocol (schema v3).
+// Phase 2a p7s circuit — blob protocol (schema v4).
 //
 // Invariants enforced by the current circuit:
 //   (9)  context_hash == SHA-256(context_bytes)                 — Task 1b
@@ -8,6 +8,7 @@
 //        AND pk_hex decodes to public.pk (65 bytes)             — Task 20
 //   (5)  signed_content[nonce_offset..+64] == nonce_hex         — Task 21
 //        AND nonce_hex decodes to public.nonce (32 bytes)       — Task 21
+//   (6)  signed_content[ctx_offset..+ctx_len] == context_bytes  — Task 22
 //
 // -----------------------------------------------------------------------------
 // Blob protocol — schema history
@@ -38,6 +39,17 @@
 //
 //     Public blob extends v2 with:
 //       u8   nonce[32]              decoded freshness nonce
+//
+//   v4 (Task 22): adds json_context_offset to the witness; public blob
+//                 unchanged. Context byte-length is derived in-circuit
+//                 from the SHA padding via FlatSHA256Circuit::find_len —
+//                 no independent context_len wire, which forecloses any
+//                 length-inconsistency attack between SHA and byte-eq.
+//     Witness blob extends v3 with:
+//       u32  json_context_offset    relative to signed_content;
+//                                   + context_len <= 1024 (enforced with
+//                                   the conservative bound ≤ 1024 - 32 here,
+//                                   since the context can be at most 32 bytes).
 // -----------------------------------------------------------------------------
 
 #include "p7s_zk.h"
@@ -92,9 +104,9 @@ using ShaBlockWitness = P7sHashC::ShaBlockWitness;
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seed. Bumped from "p7s-20" so proofs minted under the
-// Task-20 circuit cannot be misinterpreted as Task-21 proofs.
-constexpr char kTranscriptSeed[] = "p7s-21";
+// Transcript seed. Bumped from "p7s-21" so proofs minted under the
+// Task-21 circuit cannot be misinterpreted as Task-22 proofs.
+constexpr char kTranscriptSeed[] = "p7s-22";
 constexpr size_t kTranscriptSeedLen = sizeof(kTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
@@ -106,7 +118,7 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
               "kSignedContentLogN must equal log2(kMaxSignedContent)");
 
 // Blob schema version.
-constexpr uint32_t kBlobSchemaVersion = 3;
+constexpr uint32_t kBlobSchemaVersion = 4;
 
 // Build the Task-20 circuit.
 std::unique_ptr<Circuit<F>> build_circuit() {
@@ -180,6 +192,9 @@ std::unique_ptr<Circuit<F>> build_circuit() {
     nonce_nibbles[i] = lc.template vinput<8>();
   }
 
+  // Invariant 6: json_context_offset (no length wire — derived from SHA).
+  auto json_context_offset = lc.template vinput<kSignedContentLogN>();
+
   // ---- Constraints ----
 
   // Invariant 9.
@@ -208,6 +223,22 @@ std::unique_ptr<Circuit<F>> build_circuit() {
   // Invariant 5b: nonce_hex decodes to public.nonce.
   hex_decode.assert_decodes(nonce_hex.data(), nonce_bytes.data(),
                             nonce_nibbles.data(), kNonceBytes);
+
+  // Invariant 6: signed_content[ctx_offset..+ctx_len] == context_bytes[0..ctx_len].
+  // Context byte-length is derived from the SHA-256 padding (invariant 9)
+  // so there is no independent context_len wire that a prover could
+  // desynchronize from the hashed preimage.
+  auto ctx_len = ph.derive_context_byte_len(context_in.data(), numb);
+
+  // Fixed-length (kContextMaxBytes) window out of signed_content; bytes
+  // past context_len are unconstrained (SHA padding on the context_in
+  // side won't match arbitrary signed_content bytes).
+  std::vector<typename LC::v8> ctx_window(kContextMaxBytes);
+  routing.template shift<typename LC::v8, kSignedContentLogN>(
+      json_context_offset, kContextMaxBytes, ctx_window.data(),
+      kMaxSignedContent, signed_content.data(), zz, /*unroll=*/3);
+
+  ph.assert_context_equals(context_in.data(), ctx_window.data(), ctx_len);
 
   return Q.mkcircuit(/*nc=*/1);
 }
@@ -343,6 +374,14 @@ void push_invariant5_witness(DenseFiller<F>& filler,
   }
 }
 
+// Push invariant-6 private witness: only the json_context_offset wire.
+// The context length is derived from the SHA padding in-circuit, so
+// there is no separate length to feed here.
+void push_invariant6_witness(DenseFiller<F>& filler,
+                             uint32_t json_context_offset, const F& Fs) {
+  push_uint(filler, json_context_offset, kSignedContentLogN, Fs);
+}
+
 // Read helpers for the little-endian blob format.
 bool read_u32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
   if (end - p < 4) return false;
@@ -364,6 +403,7 @@ struct ParsedWitness {
   uint8_t pk_hex[kPkHexLen];
   uint32_t json_nonce_offset;
   uint8_t nonce_hex[kNonceHexLen];
+  uint32_t json_context_offset;
 };
 
 // Parsed public blob.
@@ -411,6 +451,15 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   if (end - p < static_cast<ptrdiff_t>(kNonceHexLen)) return false;
   std::memcpy(out.nonce_hex, p, kNonceHexLen);
   p += kNonceHexLen;
+
+  if (!read_u32(p, end, out.json_context_offset)) return false;
+  // Context may be 0..32 bytes, so the strictest bound is
+  // json_context_offset + kContextMaxBytes <= kMaxSignedContent. The
+  // in-circuit byte-eq masks padding positions, so offsets that leave
+  // fewer than context_len usable bytes will be caught at prove time.
+  if (out.json_context_offset > kMaxSignedContent - kContextMaxBytes) {
+    return false;
+  }
 
   if (p != end) return false;
   return true;
@@ -478,6 +527,7 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   push_invariant4_witness(filler, wit.signed_content, wit.json_pk_offset,
                           wit.pk_hex, Fs);
   push_invariant5_witness(filler, wit.json_nonce_offset, wit.nonce_hex, Fs);
+  push_invariant6_witness(filler, wit.json_context_offset, Fs);
 
   if (filler.size() != circuit.ninputs) {
     return P7S_INVALID_INPUT;

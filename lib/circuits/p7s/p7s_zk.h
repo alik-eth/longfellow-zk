@@ -19,7 +19,7 @@ typedef enum {
 } P7sErrorCode;
 
 // ============================================================================
-// Phase 2a p7s circuit — blob protocol (schema v3).
+// Phase 2a p7s circuit — blob protocol (schema v4).
 //
 // Prove/verify take two byte buffers that the caller serializes:
 //   * `witness_blob`: private witness — circuit-dependent; schema below.
@@ -35,9 +35,11 @@ typedef enum {
 //                       AND pk_hex decodes to public.pk (65 bytes)
 //   (21) invariant 5  — signed_content[nonce_offset..+64] == nonce_hex
 //                       AND nonce_hex decodes to public.nonce (32 bytes)
+//   (22) invariant 6  — signed_content[ctx_offset..+ctx_len] == context_bytes
+//                       (byte-length derived from SHA padding, no new public input)
 //
-// Witness blob v3 layout (all little-endian):
-//   u32  version                                    = 3
+// Witness blob v4 layout (all little-endian):
+//   u32  version                                    = 4
 //   u32  context_len                                in [0, 32]
 //   u8   context[32]                                (padded with zeros)
 //   u32  signed_content_len                         in [0, 1024]
@@ -46,9 +48,10 @@ typedef enum {
 //   u8   pk_hex[130]                                ASCII lowercase hex
 //   u32  json_nonce_offset                          relative to signed_content
 //   u8   nonce_hex[64]                              ASCII lowercase hex
+//   u32  json_context_offset                        relative to signed_content
 //
-// Public blob v3 layout:
-//   u32  version                                    = 3
+// Public blob v4 layout (unchanged from v3):
+//   u32  version                                    = 4
 //   u8   context_hash[32]
 //   u8   pk[65]                                     decoded SEC1 uncompressed
 //   u8   nonce[32]                                  decoded freshness nonce
