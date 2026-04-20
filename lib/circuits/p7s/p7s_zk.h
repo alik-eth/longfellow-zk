@@ -19,7 +19,7 @@ typedef enum {
 } P7sErrorCode;
 
 // ============================================================================
-// Phase 2a p7s circuit — blob protocol (schema v7).
+// Phase 2a p7s circuit — blob protocol (schema v8).
 //
 // Prove/verify take two byte buffers that the caller serializes:
 //   * `witness_blob`: private witness — circuit-dependent; schema below.
@@ -45,41 +45,47 @@ typedef enum {
 //   (25a) dual-circuit MAC plumbing — a sig-circuit over Fp256Base is
 //                       introduced alongside the existing hash-circuit
 //                       over GF(2^128), linked via a MAC gadget bound
-//                       to a non-zero sentinel (no real ECDSA yet;
-//                       Task 29 / 25b swaps the sentinel for
-//                       `e = SHA-256(cert_tbs)` and adds ECDSA).
+//                       to a non-zero sentinel.
+//   (29)  invariant 1 — DIIA signer-cert ECDSA signature verifies over
+//                       `cert_tbs` under the hardcoded DIIA QTSP 2311
+//                       root public key. Sentinel is gone; the MAC
+//                       now binds `e = SHA-256(cert_tbs)` across the
+//                       two fields.
 //
-// Witness/public blob layouts are UNCHANGED from v6 — the dual-circuit
-// split is a proof-format-only change:
-//
-// Witness blob v7 layout (same as v6, all little-endian):
-//   u32  version                                    = 7
+// Witness blob v8 layout (extends v7 with cert_tbs witness):
+//   u32  version                                    = 8
 //   u32  context_len                                in [0, 32]
-//   u8   context[32]                                raw bytes + zero pad;
-//                                                   filler SHA-pads
+//   u8   context[32]                                raw bytes + zero pad
 //   u32  signed_content_len                         in [0, 1015]
-//   u8   signed_content[1024]                       raw bytes + zero pad;
-//                                                   filler SHA-pads
+//   u8   signed_content[1024]                       raw bytes + zero pad
 //   u32  json_pk_offset                             relative to signed_content
 //   u8   pk_hex[130]                                ASCII lowercase hex
 //   u32  json_nonce_offset                          relative to signed_content
 //   u8   nonce_hex[64]                              ASCII lowercase hex
 //   u32  json_context_offset                        relative to signed_content
 //   u32  json_declaration_offset                    relative to signed_content
-//   u8   message_digest[32]                         prover-claimed
-//                                                   SHA-256(signed_content)
+//   u8   message_digest[32]                         SHA-256(signed_content)
+//   u32  cert_tbs_len                               in [0, 2039]
+//   u8   cert_tbs[2048]                             raw bytes + zero pad;
+//                                                   filler SHA-pads
 //
-// Public blob v7 layout (unchanged from v3/v4/v5/v6):
-//   u32  version                                    = 7
+// Public blob v8 layout (unchanged from v3/v4/v5/v6/v7):
+//   u32  version                                    = 8
 //   u8   context_hash[32]
 //   u8   pk[65]                                     decoded SEC1 uncompressed
 //   u8   nonce[32]                                  decoded freshness nonce
 //
-// Extended proof-output format (v7):
-//   u32  schema_version                             = 7 (LE)
+// Note: the DIIA QTSP 2311 root public key is a COMPILE-TIME CONSTANT
+// baked into sub/p7s_signature.h — it is NOT part of the public blob.
+// A Rust-side `root_pk` field can still appear in the caller's
+// `PublicInputs` struct for type-system reasons, but the serialized
+// public blob does not carry those bytes.
+//
+// Extended proof-output format (v8):
+//   u32  schema_version                             = 8 (LE)
 //   u8   macs_b[32]                                 2 × GF(2^128) MAC values
-//                                                   (low+high halves of the
-//                                                    bound sentinel)
+//                                                   (low+high halves of
+//                                                    e = SHA-256(cert_tbs))
 //   u8   hash_zk[...]                               ZkProof<GF2_128>,
 //                                                   self-delimited by
 //                                                   ZkProof::read

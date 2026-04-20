@@ -1,21 +1,22 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
+//
+// Task 29 (25b): the 25a compile-time sentinel is GONE — the MAC-bound
+// value is now `e = SHA-256(cert_tbs)`, computed in the hash circuit
+// and derived on the sig side from the same 32 digest bytes. There is
+// nothing left to define in this translation unit; the class
+// `P7sSignature` lives entirely in the header, and the DIIA root pubkey
+// is a compile-time string constant wired directly via
+// `p256_base.of_string(kDiiaRootPkX_decimal)` at circuit-build time.
+//
+// The file is kept (rather than deleted) so the CMakeLists.txt entry
+// added in 25a continues to resolve, and so future invariant-2a work
+// has a place to put sig-side witness helpers alongside the header
+// without re-touching build files.
 
 #include "circuits/p7s/sub/p7s_signature.h"
 
 namespace proofs {
 namespace p7s {
-
-// 29 ASCII bytes "p7s-25a-mac-plumbing-sentinel" + 3 NUL padding = 32 bytes.
-// Leading byte 'p' (0x70) guarantees the MSB interpretation is non-zero,
-// which is required by the MAC primitive's unforgeability argument
-// (see `circuits/mac/mac_circuit.h:48-55`). The tag is chosen to be
-// recognizable in hex dumps and distinct from any real payload.
-const unsigned char kMacBindingSentinel[kMacMessageBytes] = {
-    'p', '7', 's', '-', '2', '5', 'a', '-',
-    'm', 'a', 'c', '-', 'p', 'l', 'u', 'm',
-    'b', 'i', 'n', 'g', '-', 's', 'e', 'n',
-    't', 'i', 'n', 'e', 'l', 0, 0, 0,
-};
-
+// (intentionally empty — see comment above)
 }  // namespace p7s
 }  // namespace proofs

@@ -36,6 +36,22 @@ constexpr size_t kNonceHexLen = 64;
 // SHA-256(signed_content). Bound by invariant 2b (Task 24).
 constexpr size_t kMessageDigestLen = 32;
 
+// ---- Invariant 1 (Task 29) — cert TBS + cert signature bounds ----
+//
+// The signer cert's TBSCertificate (the portion the DIIA root signs
+// over) is bounded by kCertTbsMaxBlocks SHA-256 blocks. 32 blocks ×
+// 64 bytes/block = 2048 bytes; minus the 9-byte MD padding floor that
+// leaves 2039 bytes of raw TBS headroom. Current DIIA QTSP certs are
+// ~1203 bytes TBS, so 32 blocks is comfortable (the fixture test
+// verifies the exact offset).
+constexpr size_t kCertTbsMaxBlocks = 32;
+constexpr size_t kCertTbsMaxBytes = kCertTbsMaxBlocks * 64;  // 2048
+constexpr size_t kCertTbsLenBits = 11;  // log2(2048)
+
+// SHA-256 digest length — same as kMessageDigestLen but aliased for
+// invariant 1's cert_tbs digest to keep call sites self-documenting.
+constexpr size_t kCertTbsDigestLen = 32;
+
 }  // namespace p7s
 }  // namespace proofs
 
