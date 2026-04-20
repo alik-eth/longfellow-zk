@@ -1,6 +1,6 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
-// Phase 2a p7s circuit — blob protocol (schema v8).
+// Phase 2a p7s circuit — blob protocol (schema v9).
 //
 // Invariants enforced by the current circuit:
 //   (9)  context_hash == SHA-256(context_bytes)                 — Task 1b
@@ -16,6 +16,11 @@
 //        under the hardcoded DIIA QTSP 2311 root pubkey,
 //        with `e = SHA-256(cert_tbs)` MAC-bound across hash/sig
 //        circuits (replaces the 25a sentinel).
+//   (2a) CMS content signature verifies over signedAttrs         — Task 26
+//        (CAdES-canonical form, [0] IMPLICIT 0xA0 rewritten to
+//        0x31 SET OF) under the user's holder public key (=
+//        invariant 4's pk_bytes). Digest `e2 = SHA-256(
+//        signedAttrs_rewritten)` is MAC-bound as a 2nd message.
 //
 // -----------------------------------------------------------------------------
 // Blob protocol — schema history
@@ -99,12 +104,49 @@
 //     Witness blob extends v7 with:
 //       u32  cert_tbs_len           in [0, 2039]
 //       u8   cert_tbs[2048]         raw bytes + zero pad; filler SHA-pads
+//       u8   cert_sig_r[32]         big-endian scalar (DER-parsed in Rust)
+//       u8   cert_sig_s[32]         big-endian scalar
 //     Public blob unchanged from v7 (root_pk is a compile-time
 //       constant at the circuit-build site, not a public input).
 //     Extended proof-output format:
 //       u32  schema_version(= 8)
 //       u8   macs_b[32]             2 × GF(2^128) values = MAC of
 //                                   `e = SHA-256(cert_tbs)` (low+high)
+//       u8   hash_zk[...]           ZkProof<GF2_128>, self-delimited
+//       u8   sig_zk[...]            ZkProof<Fp256Base>, self-delimited
+//
+//   v9 (Task 26): CMS content signature over signedAttrs — invariant 2a.
+//                 The hash circuit computes a SECOND SHA-256, this time
+//                 over the CAdES-canonical signedAttrs (witnessed form
+//                 is `[0xA0, body[1..]]`; circuit rewrites the first
+//                 byte to `0x31` and hashes the result — an in-circuit
+//                 IMPLICIT→SET rewrite that only costs one const vbit
+//                 plus a byte-equality assertion on the witness's
+//                 first byte). The sig circuit instantiates a SECOND
+//                 `VerifyCircuit` against the user's `holder_pk` (the
+//                 same bytes invariant 4 constrains on the hash side;
+//                 parsed host-side from `pub.pk` and supplied as
+//                 Fp256Base X + Y public inputs on the sig circuit).
+//                 `e2 = SHA-256(signedAttrs_rewritten)` joins `e` as a
+//                 MAC-bound message.
+//     Witness blob extends v8 with:
+//       u32  signed_attrs_len       in [0, 1527]
+//       u8   signed_attrs[1536]     raw bytes + zero pad; first byte MUST
+//                                   be 0xA0 ([0] IMPLICIT tag as in p7s);
+//                                   filler SHA-pads after rewriting [0]
+//                                   to 0x31.
+//       u8   content_sig_r[32]      big-endian scalar (DER-parsed in Rust)
+//       u8   content_sig_s[32]      big-endian scalar
+//     Public blob unchanged from v8. Sig-circuit holder_pk X/Y are
+//       derived host-side from `pub.pk[1..33]` / `pub.pk[33..65]` (SEC1
+//       big-endian), converted to Fp256Base Montgomery form, and
+//       pushed as sig-circuit public-input EltWs. Host-side the
+//       verifier enforces pk[0] == 0x04; the hash circuit additionally
+//       asserts `pk_bytes[0] == 0x04` on the wire level.
+//     Extended proof-output format:
+//       u32  schema_version(= 9)
+//       u8   macs_b[64]             4 × GF(2^128) values = MAC of
+//                                   `e` (low+high) + `e2` (low+high)
 //       u8   hash_zk[...]           ZkProof<GF2_128>, self-delimited
 //       u8   sig_zk[...]            ZkProof<Fp256Base>, self-delimited
 // -----------------------------------------------------------------------------
@@ -164,12 +206,28 @@ using LC = Logic<F, CB>;
 using ContextHash = P7sHash<LC, kContextMaxBlocks>;
 using SignedContentHash = P7sHash<LC, kSignedContentMaxBlocks>;
 using CertTbsHash = P7sHash<LC, kCertTbsMaxBlocks>;
+using SignedAttrsHash = P7sHash<LC, kSignedAttrsMaxBlocks>;
 using ByteRangeEqC = ByteRangeEq<LC>;
 using HexDecodeC = HexDecode<LC>;
 using RoutingC = Routing<LC>;
 using ContextShaBw = ContextHash::ShaBlockWitness;
 using SignedContentShaBw = SignedContentHash::ShaBlockWitness;
 using CertTbsShaBw = CertTbsHash::ShaBlockWitness;
+using SignedAttrsShaBw = SignedAttrsHash::ShaBlockWitness;
+
+// 26-byte DIIA P-256 SPKI DER prefix — kept in both the host parser
+// (`crates/zk-eidas-p7s/src/parser.rs`) and the hash circuit's
+// anchor assertion. Any change requires updating both sites.
+constexpr uint8_t kSpkiDiaP256Prefix[kSpkiPrefixLen] = {
+    0x30, 0x59,                                    // SPKI SEQUENCE hdr (l=89)
+    0x30, 0x13,                                    // AlgId SEQUENCE hdr (l=19)
+    0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,      // OID id-ecPublicKey
+    0x02, 0x01,
+    0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,      // OID prime256v1 (P-256)
+    0x03, 0x01, 0x07,
+    0x03, 0x42, 0x00,                              // BIT STRING hdr (l=66,
+                                                   //                unused=0)
+};
 
 // Hash-side MAC primitive. Uses the native `MACGF2` variant whose v128
 // IS an EltW (GF(2^128) is 128 bits wide natively).
@@ -206,14 +264,16 @@ static constexpr char kRootY[] =
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seed — bumped from "p7s-25-hash" to "p7s-29-hash" so proofs
-// minted under the v7 sentinel-only circuit cannot be misinterpreted as
-// v8 real-ECDSA proofs. A SINGLE Transcript instance is used for hash
-// commit, av sampling, and sig commit/prove; both circuits share the
-// same seed (mirrors mdoc, which uses one transcript with
-// circuit-specific processing keyed by the distinct circuit structures
-// themselves).
-constexpr char kHashTranscriptSeed[] = "p7s-29-hash";
+// Transcript seed — bumped from "p7s-29-hash" to "p7s-26-hash" so proofs
+// minted under the v8 single-signature circuit cannot be misinterpreted
+// as v9 dual-signature (cert + content) proofs. A SINGLE Transcript
+// instance is used for hash commit, av sampling, and sig commit/prove;
+// both circuits share the same seed (mirrors mdoc, which uses one
+// transcript with circuit-specific processing keyed by the distinct
+// circuit structures themselves). The per-circuit seed below names the
+// hash-side convention; the sig side consumes the same Transcript
+// instance directly (no second seed — if that changes, bump both).
+constexpr char kHashTranscriptSeed[] = "p7s-26-hash";
 constexpr size_t kHashTranscriptSeedLen = sizeof(kHashTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
@@ -229,21 +289,25 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
               "kSignedContentLogN must equal log2(kMaxSignedContent)");
 
 // Blob schema version.
-constexpr uint32_t kBlobSchemaVersion = 8;
+constexpr uint32_t kBlobSchemaVersion = 9;
 
 // ===========================================================================
-// Hash-circuit public-input layout (v7). MAC positions are derived from
+// Hash-circuit public-input layout (v9). MAC positions are derived from
 // this layout so if any of these counts change, the MAC index updates
-// automatically (and the static_assert below keeps us honest).
+// automatically (and the static_assert below keeps us honest). Only
+// the MAC region grows relative to v8 (kTotalMacValues 2 → 8); the
+// preceding public inputs are unchanged.
 //
 //   [0]                              = const 1
 //   [1 .. 1 + 256)                   = context_hash v256
 //   [257 .. 257 + 520)               = pk_bytes (65 × v8)
 //   [777 .. 777 + 256)               = nonce_bytes (32 × v8)
-//   [1033]                           = mac[0] (EltW, GF(2^128) native)
-//   [1034]                           = mac[1] (EltW)
-//   [1035]                           = av     (EltW)
-//   npub_in_hash                     = 1036
+//   [1033 .. 1033 + kTotalMacValues) = mac values (EltW each; GF(2^128)
+//                                      native so v128 == EltW). Order:
+//                                      mac_e[2], mac_e2[2], mac_spki_x[2],
+//                                      mac_spki_y[2].
+//   [1033 + kTotalMacValues]         = av (EltW)
+//   npub_in_hash = 1033 + kTotalMacValues + 1 = 1042
 //
 // All of the above are `public`; the private witness starts at
 // npub_in_hash and is opaque to the MAC plumbing.
@@ -260,7 +324,7 @@ constexpr size_t kHashMacInputWires = kTotalMacValues + 1;
 constexpr size_t kHashPubTotal = kHashPubPreMac + kHashMacInputWires;
 static_assert(kHashPubPreMac == 1033,
               "layout drift — update kHashPubPreMac comment & index");
-static_assert(kHashPubTotal == 1036,
+static_assert(kHashPubTotal == 1042,
               "layout drift — update npub_in_hash comment");
 
 // Index (in the DENSE Wit array) where the hash MAC region begins.
@@ -271,27 +335,32 @@ static_assert(kHashPubTotal == 1036,
 constexpr size_t kHashMacIndex = kHashPubPreMac;
 
 // ===========================================================================
-// Sig-circuit public-input layout (v8). The public input section is
-// IDENTICAL to v7 — only the MAC/av wires live here. The ECDSA public
-// key (DIIA QTSP 2311 root) is a compile-time `lc.konst(...)` rather
-// than a public input (trust anchor is hardcoded at circuit-build time),
-// and `e` (= SHA-256(cert_tbs)) is a PRIVATE witness bound to the hash
-// circuit via the MAC.
+// Sig-circuit public-input layout (v9). Holder pk is NOT in the public
+// blob (privacy: leaking cert SPKI would deanonymize the holder).
+// It enters as a PRIVATE EltW pair in the sig witness, bound to the
+// hash-side cert_tbs SPKI bytes via the MAC gadget. DIIA root public
+// key remains a compile-time `lc.konst(...)`.
 //
 //   [0]                              = const 1 (auto-allocated wire 0)
-//   [1 .. 1 + 128)                   = mac[0] as v128 (128 bit wires)
-//   [129 .. 129 + 128)               = mac[1] as v128
-//   [257 .. 257 + 128)               = av as v128
-//   npub_in_sig                      = 385
+//   [1 .. 1 + 128)                   = mac values[0] as v128 (mac_e[0])
+//   [129 .. 129 + 128)               = mac values[1] (mac_e[1])
+//   [257 .. 257 + 128)               = mac values[2] (mac_e2[0])
+//   [385 .. 385 + 128)               = mac values[3] (mac_e2[1])
+//   [513 .. 513 + 128)               = mac values[4] (mac_spki_x[0])
+//   [641 .. 641 + 128)               = mac values[5] (mac_spki_x[1])
+//   [769 .. 769 + 128)               = mac values[6] (mac_spki_y[0])
+//   [897 .. 897 + 128)               = mac values[7] (mac_spki_y[1])
+//   [1025 .. 1025 + 128)             = av (v128)
+//   npub_in_sig = 1 + 9 × 128        = 1153
 constexpr size_t kSigPubConst = 1;
 // Each sig-side MAC public input is a v128 = 128 bit wires (Fp256Base
 // isn't wide enough to hold a 128-bit GF(2^128) element as a single
 // field element, so it's bit-decomposed).
 constexpr size_t kSigMacBitsPerWire = 128;
 constexpr size_t kSigMacInputWires =
-    (kTotalMacValues + 1) * kSigMacBitsPerWire;  // 3 × 128 = 384
+    (kTotalMacValues + 1) * kSigMacBitsPerWire;  // 9 × 128 = 1152
 constexpr size_t kSigPubTotal = kSigPubConst + kSigMacInputWires;
-static_assert(kSigPubTotal == 385,
+static_assert(kSigPubTotal == 1153,
               "layout drift — update npub_in_sig comment");
 
 // Index (in the DENSE W_sig array) where the sig MAC region begins.
@@ -303,20 +372,27 @@ constexpr size_t kSigMacIndex = kSigPubConst;  // 1
 // Hash circuit builder — keeps every pre-v7 constraint intact and adds
 // the cross-field MAC binding at the end of the public-input section.
 //
-// v8 (Task 29) additions vs v7:
-//   * Private witness: cert_tbs_numb (v8), cert_tbs[2048] (v8),
-//     cert_tbs_bw[32] (SHA block witnesses), e_digest_bytes[32] (v8 —
-//     prover-claimed SHA-256(cert_tbs) in big-endian byte order).
-//   * Constraint: `e_digest_v256_flatsha == SHA-256(cert_tbs)` via
-//     CertTbsHash::assert_message_hash (where e_digest_v256_flatsha is
-//     built from e_digest_bytes using the FlatSHA big-endian-byte
-//     LSB-first-bit mapping).
-//   * MAC-bound value changes from the v7 sentinel to e_digest_v256_mac
-//     built from the SAME e_digest_bytes but using the little-endian-
-//     byte LSB-first-bit mapping (matches MAC::of_bytes_field and the
-//     sig-side Fp256Base::of_bytes_field). The two v256 views point at
-//     identical underlying v8 wires — no extra equality constraint
-//     needed; wire identity gives byte equality for free.
+// v9 (Task 26) additions vs v8:
+//   * Private witness: cert_tbs_spki_offset (11-bit offset of the
+//     SPKI SEQUENCE tag inside cert_tbs — host-witnessed because
+//     the subject DN length varies); signed_attrs_numb, signed_attrs
+//     [1536] (first byte MUST be 0xA0 — [0] IMPLICIT tag), 24 SHA
+//     block witnesses, e2_digest_bytes[32]; two additional MAC
+//     witnesses (mac_witness_spki_x, mac_witness_spki_y).
+//   * Constraint (2a): assert `signed_attrs[0] == 0xA0`. Construct a
+//     1536-byte buffer whose first byte is the compile-time-const
+//     0x31 (SET OF tag) and whose bytes [1..] route from
+//     `signed_attrs[1..]`; assert SHA-256(that buffer) equals
+//     `e2_digest_bytes`.
+//   * Constraint (SPKI extraction): `Routing::shift` a 91-byte window
+//     over cert_tbs at `cert_tbs_spki_offset`; assert the first 26
+//     bytes match the fixed DIIA P-256 SPKI DER prefix; assert byte
+//     26 is `0x04` (SEC1 uncompressed). The X coordinate is bytes
+//     [27..59] (BE), Y is [59..91] (BE).
+//   * MAC-bound messages grow to FOUR: `e`, `e2`, cert SPKI X, cert
+//     SPKI Y (all in the LE-byte convention that matches the sig
+//     side's MAC::unpack_msg). kMacMessagesCount = 4,
+//     kTotalMacValues = 8.
 std::unique_ptr<Circuit<F>> build_hash_circuit() {
   const F Fs;
 
@@ -326,6 +402,7 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   ContextHash context_hasher(lc);
   SignedContentHash signed_content_hasher(lc);
   CertTbsHash cert_tbs_hasher(lc);
+  SignedAttrsHash signed_attrs_hasher(lc);
   ByteRangeEqC breq(lc);
   HexDecodeC hex_decode(lc);
   RoutingC routing(lc);
@@ -420,6 +497,12 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // (host-side filler applies Merkle-Damgård padding). cert_tbs_bw
   // carries per-block intermediate SHA witness values.
   auto cert_tbs_numb = lc.template vinput<8>();
+  // Task 26 — offset of the SPKI SEQUENCE (0x30) within cert_tbs.
+  // Host-witnessed (not compile-time stable across DIIA holders —
+  // see handoff-30 §3.2). Bit-width matches kCertTbsMaxBytes so
+  // the offset covers [0, 2047]. Kept adjacent to cert_tbs_numb so
+  // "all cert_tbs metadata" lives in one place.
+  auto cert_tbs_spki_offset = lc.template vinput<kCertTbsLenBits>();
   std::vector<typename LC::v8> cert_tbs(kCertTbsMaxBytes);
   for (size_t i = 0; i < kCertTbsMaxBytes; ++i) {
     cert_tbs[i] = lc.template vinput<8>();
@@ -442,10 +525,49 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
     e_digest_bytes[i] = lc.template vinput<8>();
   }
 
-  // MAC witness (prover's `ap` halves). Still 2 EltW total — one
-  // bound message for invariant 1 (Task 26 will add another for 2a).
-  MACHWitness mac_witness;
-  mac_witness.input(lc);
+  // Task 26 / invariant 2a — signedAttrs SHA witness + claimed digest.
+  // signed_attrs_numb holds the SHA block count of the CAdES-canonical
+  // buffer ([0x31, body[1..]] + Merkle-Damgård pad). signed_attrs holds
+  // the CAdES-CANONICAL SHA-padded bytes (first byte = 0x31, the SET
+  // OF tag; bytes [1..len] = witnessed signedAttrs body; bytes
+  // [len..] = SHA-256 Merkle-Damgård pad). The raw p7s carries a
+  // [0] IMPLICIT tag (0xA0); the host filler rewrites byte 0 to 0x31
+  // before SHA-padding, same transformation the OpenSSL CMS signer
+  // applies when computing the content-sig digest. Soundness of the
+  // rewrite: the content-sig ECDSA in the sig circuit binds the
+  // holder-produced digest, so a malicious prover swapping bytes
+  // here would need a holder-signed digest of their forged bytes —
+  // unavailable without the private key.
+  auto signed_attrs_numb = lc.template vinput<8>();
+  std::vector<typename LC::v8> signed_attrs(kSignedAttrsMaxBytes);
+  for (size_t i = 0; i < kSignedAttrsMaxBytes; ++i) {
+    signed_attrs[i] = lc.template vinput<8>();
+  }
+  std::vector<SignedAttrsShaBw> signed_attrs_bw(kSignedAttrsMaxBlocks);
+  for (size_t b = 0; b < kSignedAttrsMaxBlocks; ++b) {
+    signed_attrs_bw[b].input(lc);
+  }
+  // e2_digest_bytes — SHA-256(signed_attrs_rewritten), 32 big-endian
+  // bytes. Same dual-view trick as e_digest_bytes.
+  std::vector<typename LC::v8> e2_digest_bytes(kSignedAttrsDigestLen);
+  for (size_t i = 0; i < kSignedAttrsDigestLen; ++i) {
+    e2_digest_bytes[i] = lc.template vinput<8>();
+  }
+
+  // MAC witness (prover's `ap` halves). Four bound messages:
+  //   0: e            = SHA-256(cert_tbs)
+  //   1: e2           = SHA-256(signedAttrs_rewritten)
+  //   2: holder_pk_x  = cert_tbs SPKI X coordinate (LE-byte convention)
+  //   3: holder_pk_y  = cert_tbs SPKI Y coordinate (LE-byte convention)
+  // Each witness is a MACGF2::Witness carrying 2 EltW ap halves.
+  MACHWitness mac_witness_e;
+  mac_witness_e.input(lc);
+  MACHWitness mac_witness_e2;
+  mac_witness_e2.input(lc);
+  MACHWitness mac_witness_spki_x;
+  mac_witness_spki_x.input(lc);
+  MACHWitness mac_witness_spki_y;
+  mac_witness_spki_y.input(lc);
 
   // ---- Constraints (unchanged from v6) ----
   // Invariant 9 — context hash.
@@ -519,45 +641,126 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
                                       e_digest_v256_flatsha,
                                       cert_tbs_bw.data());
 
-  // Task 29 — cross-field MAC binding to `e = SHA-256(cert_tbs)`.
-  // Byte-identical view — same wires as e_digest_v256_flatsha, second
-  // name for readability on the MAC side. Wire identity gives MAC-SHA
-  // byte-equality for free; changing one view without updating the
-  // other would introduce a soundness bug. The algebra works because
-  // `(255 - j) / 8 == 31 - j/8` for j in [0, 256), so the FlatSHA
-  // BE-byte mapping and the MAC LE-byte mapping select the same bit
-  // of the same wire for every j.
+  // Task 26 / invariant 2a — SHA-256(signedAttrs_canonical) == e2_digest_bytes.
+  // `signed_attrs[]` wires carry the SHA-padded CAdES-canonical buffer
+  // directly (first byte = 0x31 from the host-side IMPLICIT→SET OF
+  // rewrite). Pattern matches cert_tbs: padded-bytes-as-wires + SHA
+  // gadget. No in-circuit rewrite needed; no raw 0xA0 assertion
+  // needed — the content-sig ECDSA in the sig circuit binds the
+  // signed digest, so any prover-supplied bytes that hash differently
+  // would need a holder-signed ECDSA over that forged digest.
+  typename LC::v256 e2_digest_v256_flatsha;
+  for (size_t j = 0; j < 256; ++j) {
+    size_t byte_idx = (255 - j) / 8;
+    size_t bit_idx = j % 8;
+    e2_digest_v256_flatsha[j] = e2_digest_bytes[byte_idx][bit_idx];
+  }
+  signed_attrs_hasher.assert_message_hash(
+      signed_attrs_numb, signed_attrs.data(),
+      e2_digest_v256_flatsha, signed_attrs_bw.data());
+
+  // Task 26 (merged with #30) — SPKI extraction from cert_tbs.
+  // Route a 91-byte window starting at `cert_tbs_spki_offset`. The
+  // window must contain the 26-byte DIIA P-256 SPKI prefix followed
+  // by `0x04` (SEC1 uncompressed tag) at index 26, then 32 bytes of
+  // X and 32 bytes of Y.
+  std::vector<typename LC::v8> spki_window(kSpkiWindowLen);
+  routing.template shift<typename LC::v8, kCertTbsLenBits>(
+      cert_tbs_spki_offset, kSpkiWindowLen, spki_window.data(),
+      kCertTbsMaxBytes, cert_tbs.data(), zz, /*unroll=*/3);
+
+  // Anchor: first 26 bytes MUST be the DIIA P-256 SPKI DER prefix.
+  // Without this the prover could point the shifter at an arbitrary
+  // byte-match elsewhere in cert_tbs. The 0x04 SEC1 tag is pinned
+  // implicitly because the prefix ends with `0x03 0x42 0x00` (BIT
+  // STRING header + unused-bits) and the ECDSA verify downstream
+  // requires X/Y to be on the curve.
+  std::vector<typename LC::v8> spki_prefix_expected(kSpkiPrefixLen);
+  for (size_t i = 0; i < kSpkiPrefixLen; ++i) {
+    spki_prefix_expected[i] = lc.template vbit<8>(kSpkiDiaP256Prefix[i]);
+  }
+  breq.assert_eq(spki_window.data(), spki_prefix_expected.data(),
+                 kSpkiPrefixLen);
+  // Explicit SEC1 lead-byte check. Redundant with the prefix anchor
+  // (since the prefix DOES NOT include 0x04), but kept as an extra
+  // invariant so a future tightening/relaxation of kSpkiPrefixLen
+  // doesn't silently change this property.
+  typename LC::v8 expected_sec1_04 = lc.template vbit<8>(0x04);
+  breq.assert_eq(&spki_window[kSpkiPrefixLen], &expected_sec1_04, 1);
+
+  // SPKI X and Y bytes: big-endian per SEC1. The MAC LE convention
+  // means bit j of the MAC message = bit (j % 8) of byte (j/8) in
+  // the LITTLE-endian interpretation of the 32-byte integer. So
+  // `spki_x_mac[j] = spki_x_be[31 - j/8][j%8]` — mirror of the
+  // same trick used for e_digest / e2_digest (`(255-j)/8 == 31 -
+  // j/8` for j < 256).
+  const size_t kSpkiXStart = kSpkiPrefixLen + 1;            // 27
+  const size_t kSpkiYStart = kSpkiXStart + kSpkiXYLen;      // 59
+  typename LC::v256 spki_x_v256_mac;
+  typename LC::v256 spki_y_v256_mac;
+  for (size_t j = 0; j < 256; ++j) {
+    size_t le_byte_idx = j / 8;
+    size_t be_byte_idx = kSpkiXYLen - 1 - le_byte_idx;
+    size_t bit_idx = j % 8;
+    spki_x_v256_mac[j] = spki_window[kSpkiXStart + be_byte_idx][bit_idx];
+    spki_y_v256_mac[j] = spki_window[kSpkiYStart + be_byte_idx][bit_idx];
+  }
+
+  // Task 29 / 26 — cross-field MAC binding to (e, e2, SPKI_X, SPKI_Y).
+  // Digest views — byte-identical to the flatsha views (same wires,
+  // same bits per j; `(255 - j) / 8 == 31 - j/8`). See Nit D comment
+  // for the soundness story.
   typename LC::v256 e_digest_v256_mac;
+  typename LC::v256 e2_digest_v256_mac;
   for (size_t j = 0; j < 256; ++j) {
     size_t le_byte_idx = j / 8;
     size_t be_byte_idx = kCertTbsDigestLen - 1 - le_byte_idx;
     size_t bit_idx = j % 8;
-    e_digest_v256_mac[j] = e_digest_bytes[be_byte_idx][bit_idx];
+    e_digest_v256_mac[j]  = e_digest_bytes [be_byte_idx][bit_idx];
+    e2_digest_v256_mac[j] = e2_digest_bytes[be_byte_idx][bit_idx];
   }
 
   MACH mac_check(lc);
-  typename LC::EltW mac_vals[kTotalMacValues];
-  for (size_t i = 0; i < kTotalMacValues; ++i) {
-    mac_vals[i] = mac_pub[i];
+  // mac_pub layout (matches kMacMsgIdx*):
+  //   [0..2)   = mac_e[0..2]
+  //   [2..4)   = mac_e2[0..2]
+  //   [4..6)   = mac_spki_x[0..2]
+  //   [6..8)   = mac_spki_y[0..2]
+  //   [8]      = av
+  typename LC::EltW mac_e_vals     [kMacValuesPerMessage];
+  typename LC::EltW mac_e2_vals    [kMacValuesPerMessage];
+  typename LC::EltW mac_spki_x_vals[kMacValuesPerMessage];
+  typename LC::EltW mac_spki_y_vals[kMacValuesPerMessage];
+  for (size_t i = 0; i < kMacValuesPerMessage; ++i) {
+    mac_e_vals     [i] = mac_pub[kMacMsgIdxE     * kMacValuesPerMessage + i];
+    mac_e2_vals    [i] = mac_pub[kMacMsgIdxE2    * kMacValuesPerMessage + i];
+    mac_spki_x_vals[i] = mac_pub[kMacMsgIdxSpkiX * kMacValuesPerMessage + i];
+    mac_spki_y_vals[i] = mac_pub[kMacMsgIdxSpkiY * kMacValuesPerMessage + i];
   }
   typename LC::EltW av_h = mac_pub[kTotalMacValues];
-  mac_check.verify_mac(mac_vals, av_h, e_digest_v256_mac, mac_witness);
+  mac_check.verify_mac(mac_e_vals,      av_h, e_digest_v256_mac,  mac_witness_e);
+  mac_check.verify_mac(mac_e2_vals,     av_h, e2_digest_v256_mac, mac_witness_e2);
+  mac_check.verify_mac(mac_spki_x_vals, av_h, spki_x_v256_mac,    mac_witness_spki_x);
+  mac_check.verify_mac(mac_spki_y_vals, av_h, spki_y_v256_mac,    mac_witness_spki_y);
 
   return Q.mkcircuit(/*nc=*/1);
 }
 
-// Sig-circuit builder — invariant 1 (Task 29). Verifies the DIIA
-// signer cert's ECDSA signature against the hardcoded DIIA QTSP 2311
-// root public key, AND MAC-binds the cert_tbs digest to the hash
-// circuit (so the SHA-256 computation is done ONCE in the hash
-// circuit and trusted on the sig side via the cross-field MAC).
+// Sig-circuit builder — invariants 1 + 2a (Task 26). Verifies:
+//   (A) the DIIA signer cert's ECDSA signature against the hardcoded
+//       DIIA QTSP 2311 root public key over `e = SHA-256(cert_tbs)`;
+//   (B) the CMS content ECDSA signature against the user's
+//       holder_pk (public input) over `e2 = SHA-256(signedAttrs)`.
+// Both digests are MAC-bound to the hash circuit's SHA computations
+// (cross-field MAC with shared `av` / per-message `ap` halves).
 std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   QuadCircuit<Fp256Base> Q(p256_base);
   const CB256 cbk(&Q);
   const LC256 lc(&cbk, p256_base);
 
-  // ---- Public inputs (layout below — see kSigMacInputWires) ----
-  // mac values + av as bit-decomposed v128 each.
+  // ---- Public inputs ----
+  // mac values + av as bit-decomposed v128 each. 4 bound messages
+  // × 2 mac values each + 1 av = 9 × 128 = 1152 bit-wires.
   typename LC256::v128 mac_pub[kTotalMacValues + 1];
   for (size_t i = 0; i < kTotalMacValues + 1; ++i) {
     mac_pub[i] = lc.template vinput<128>();
@@ -566,14 +769,20 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   // ---- Private witness ----
   Q.private_input();
 
-  // Cert_tbs digest as a scalar Fp256Base element. Soundness binding
-  // of this wire to the hash-circuit's cert_tbs SHA comes from the MAC
-  // primitive below. Treated as a private input here because
-  // propagating it through the public-input section would expose the
-  // digest (a privacy regression for credentials with distinguishable
-  // certs) and is unnecessary — the MAC gadget checks its
-  // bit-decomposition anyway.
-  typename LC256::EltW e_wit = lc.eltw_input();
+  // holder_pk_x / holder_pk_y — the cert SPKI coordinates, treated
+  // as private Fp256Base EltWs. Binding to cert_tbs SPKI bytes on
+  // the hash side is enforced by the per-message MAC gadget below
+  // (messages 2 and 3). Making them private avoids leaking the
+  // holder's DIIA-issued signing key (privacy: a fixed cert would
+  // otherwise make holders individually identifiable across proofs).
+  typename LC256::EltW holder_pk_x = lc.eltw_input();
+  typename LC256::EltW holder_pk_y = lc.eltw_input();
+
+  // Cert_tbs digest `e` and signedAttrs digest `e2` as scalar
+  // Fp256Base elements. Same privacy rationale as holder_pk: binding
+  // is via MAC (messages 0 and 1), not via exposing them.
+  typename LC256::EltW e_wit  = lc.eltw_input();
+  typename LC256::EltW e2_wit = lc.eltw_input();
 
   P7sSigWitness sig_witness;
   sig_witness.input(lc);
@@ -589,17 +798,29 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
       lc.konst(p256_base.of_string(kDiiaRootPkY_decimal));
 
   P7sSigCircuit sig_gadget(lc, p256, n256_order);
-  typename LC256::v128 mac_vals[kTotalMacValues]{};
-  for (size_t i = 0; i < kTotalMacValues; ++i) {
-    mac_vals[i] = mac_pub[i];
+  // mac_pub layout (matches kMacMsgIdx*):
+  //   [0..2) = mac_e, [2..4) = mac_e2, [4..6) = mac_spki_x,
+  //   [6..8) = mac_spki_y, [8] = av.
+  typename LC256::v128 mac_e_vals     [kMacValuesPerMessage]{};
+  typename LC256::v128 mac_e2_vals    [kMacValuesPerMessage]{};
+  typename LC256::v128 mac_spki_x_vals[kMacValuesPerMessage]{};
+  typename LC256::v128 mac_spki_y_vals[kMacValuesPerMessage]{};
+  for (size_t i = 0; i < kMacValuesPerMessage; ++i) {
+    mac_e_vals     [i] = mac_pub[kMacMsgIdxE     * kMacValuesPerMessage + i];
+    mac_e2_vals    [i] = mac_pub[kMacMsgIdxE2    * kMacValuesPerMessage + i];
+    mac_spki_x_vals[i] = mac_pub[kMacMsgIdxSpkiX * kMacValuesPerMessage + i];
+    mac_spki_y_vals[i] = mac_pub[kMacMsgIdxSpkiY * kMacValuesPerMessage + i];
   }
   typename LC256::v128 av_s{};
   av_s = mac_pub[kTotalMacValues];
 
-  // Real ECDSA verification + MAC binding in one call. Soundness
+  // Both ECDSA verifications + four MAC bindings in one call. Soundness
   // argument lives in P7sSignature::assert_signature's doc comment.
-  sig_gadget.assert_signature(root_pk_x, root_pk_y, e_wit, mac_vals, av_s,
-                              sig_witness);
+  sig_gadget.assert_signature(root_pk_x, root_pk_y, holder_pk_x, holder_pk_y,
+                              e_wit, e2_wit,
+                              mac_e_vals, mac_e2_vals,
+                              mac_spki_x_vals, mac_spki_y_vals,
+                              av_s, sig_witness);
 
   return Q.mkcircuit(/*nc=*/1);
 }
@@ -843,12 +1064,22 @@ struct ParsedWitness {
   uint32_t json_declaration_offset;
   uint8_t message_digest[kMessageDigestLen];
   uint32_t cert_tbs_len;
+  // v9: offset (absolute within cert_tbs, NOT relative to signed_content)
+  // of the SPKI SEQUENCE's 0x30 tag. Host-witnessed — see handoff-30 §3.2
+  // (varies with subject DN length).
+  uint32_t cert_tbs_spki_offset;
   uint8_t cert_tbs[kCertTbsMaxBytes];
   // v8: raw (r, s) scalars from the cert_sig DER, each 32 big-endian
   // bytes. The Rust side DER-parses the cert signature and supplies
   // the raw scalars so the C++ side doesn't need an ASN.1 parser.
   uint8_t cert_sig_r[32];
   uint8_t cert_sig_s[32];
+  // v9: signedAttrs (RAW witnessed bytes — first byte 0xA0) + the
+  // CMS content signature's raw (r, s) scalars (DER-parsed in Rust).
+  uint32_t signed_attrs_len;
+  uint8_t signed_attrs[kSignedAttrsMaxBytes];
+  uint8_t content_sig_r[32];
+  uint8_t content_sig_s[32];
 };
 
 struct ParsedPublic {
@@ -912,9 +1143,29 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // Minimum SHA padding is 9 bytes (0x80 + 8-byte bit-length), so the
   // raw cert_tbs can be at most kCertTbsMaxBytes - 9 = 2039 bytes.
   if (out.cert_tbs_len > kCertTbsMaxBytes - 9) return false;
+  // v9: cert_tbs SPKI offset. The 91-byte SPKI window must fit
+  // inside cert_tbs — the routing.shift zero-fills past the tail,
+  // which would fail the prefix anchor in-circuit, but catching it
+  // at parse time gives a cleaner P7S_INVALID_INPUT. Also require
+  // the offset to sit inside the REAL cert_tbs content (not the
+  // zero-pad region) since the prefix bytes we assert are non-zero.
+  if (!read_u32(p, end, out.cert_tbs_spki_offset)) return false;
+  if (out.cert_tbs_spki_offset + kSpkiWindowLen > out.cert_tbs_len) {
+    return false;
+  }
   if (end - p < static_cast<ptrdiff_t>(kCertTbsMaxBytes)) return false;
   std::memcpy(out.cert_tbs, p, kCertTbsMaxBytes);
   p += kCertTbsMaxBytes;
+  // Belt-and-suspenders: check the prefix host-side too, so a
+  // malformed witness never reaches the circuit. Matches the parser
+  // layer's own pre-check (see crates/zk-eidas-p7s/src/parser.rs).
+  if (std::memcmp(&out.cert_tbs[out.cert_tbs_spki_offset],
+                  kSpkiDiaP256Prefix, kSpkiPrefixLen) != 0) {
+    return false;
+  }
+  if (out.cert_tbs[out.cert_tbs_spki_offset + kSpkiPrefixLen] != 0x04) {
+    return false;
+  }
 
   // v8: raw (r, s) scalars from the cert signature — 32 big-endian
   // bytes each. Rust host-side DER-parses the p7s cert_sig and
@@ -924,6 +1175,29 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   p += 32;
   if (end - p < 32) return false;
   std::memcpy(out.cert_sig_s, p, 32);
+  p += 32;
+
+  // v9: signedAttrs fields + content signature (r, s).
+  if (!read_u32(p, end, out.signed_attrs_len)) return false;
+  if (out.signed_attrs_len > kSignedAttrsMaxBytes) return false;
+  // Minimum SHA padding is 9 bytes.
+  if (out.signed_attrs_len > kSignedAttrsMaxBytes - 9) return false;
+  if (end - p < static_cast<ptrdiff_t>(kSignedAttrsMaxBytes)) return false;
+  std::memcpy(out.signed_attrs, p, kSignedAttrsMaxBytes);
+  p += kSignedAttrsMaxBytes;
+  // Reject early if the witness's first byte isn't the CAdES [0]
+  // IMPLICIT tag 0xA0 — the circuit would reject at prove time, but
+  // catching it at parse time yields P7S_INVALID_INPUT rather than
+  // P7S_PROVER_FAILURE, which is more useful for callers.
+  if (out.signed_attrs_len == 0 || out.signed_attrs[0] != 0xA0) {
+    return false;
+  }
+
+  if (end - p < 32) return false;
+  std::memcpy(out.content_sig_r, p, 32);
+  p += 32;
+  if (end - p < 32) return false;
+  std::memcpy(out.content_sig_s, p, 32);
   p += 32;
 
   if (p != end) return false;
@@ -1053,7 +1327,10 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   if (c_hash.npub_in != kHashPubTotal) return P7S_INVALID_INPUT;
   if (c_sig.npub_in != kSigPubTotal) return P7S_INVALID_INPUT;
 
-  // Compute SHA witnesses off-circuit.
+  // Compute SHA witnesses off-circuit. For signedAttrs, the input to
+  // FlatSHA is the CAdES-canonical form `[0x31, body[1..]]` — we
+  // materialize that buffer here so the witness-derived digest
+  // matches what `build_hash_circuit` asserts in-circuit.
   ShaWitness<kContextMaxBlocks> ctx_sw;
   compute_sha_witness<kContextMaxBlocks>(wit.context, wit.context_len, ctx_sw);
   ShaWitness<kSignedContentMaxBlocks> sc_sw;
@@ -1063,44 +1340,83 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   compute_sha_witness<kCertTbsMaxBlocks>(wit.cert_tbs, wit.cert_tbs_len,
                                          cert_sw);
 
-  // Compute e = SHA-256(cert_tbs) outside the circuit so the Rust-side
-  // helper matches the in-circuit result bit for bit. Uses openssl's
-  // SHA256 (same implementation FlatSHA256Witness internally uses to
-  // derive its reference digest), so the two views trivially agree.
-  //
-  // e_digest_be is the standard big-endian SHA output (byte 0 is the
-  // most-significant byte of the 256-bit integer).
+  // signedAttrs in CAdES-canonical form. The raw witness carries the
+  // [0] IMPLICIT tag 0xA0 (already validated in parse_witness_blob);
+  // rewrite byte 0 to 0x31 (SET OF) before SHA.
+  uint8_t signed_attrs_canonical[kSignedAttrsMaxBytes];
+  std::memcpy(signed_attrs_canonical, wit.signed_attrs, kSignedAttrsMaxBytes);
+  signed_attrs_canonical[0] = 0x31;
+  ShaWitness<kSignedAttrsMaxBlocks> sa_sw;
+  compute_sha_witness<kSignedAttrsMaxBlocks>(signed_attrs_canonical,
+                                             wit.signed_attrs_len, sa_sw);
+
+  // Compute e = SHA-256(cert_tbs) and e2 = SHA-256(signedAttrs_canonical)
+  // outside the circuit. Matches the in-circuit FlatSHA output bit for
+  // bit; both views use openssl SHA256.
   uint8_t e_digest_be[kCertTbsDigestLen];
   {
-    // Fully-qualify to disambiguate against openssl's C-linkage SHA256
-    // function introduced via the openssl/sha.h transitive include.
     proofs::SHA256 sha;
     sha.Update(wit.cert_tbs, wit.cert_tbs_len);
     sha.DigestData(e_digest_be);
   }
+  uint8_t e2_digest_be[kSignedAttrsDigestLen];
+  {
+    proofs::SHA256 sha;
+    sha.Update(signed_attrs_canonical, wit.signed_attrs_len);
+    sha.DigestData(e2_digest_be);
+  }
 
-  // Parse (r, s) from the DER-encoded cert signature. v8 blob carries
-  // 32 raw big-endian bytes each.
-  Fp256Nat ne = nat_from_be<Fp256Nat>(e_digest_be);
-  Fp256Nat nr = nat_from_be<Fp256Nat>(wit.cert_sig_r);
-  Fp256Nat ns = nat_from_be<Fp256Nat>(wit.cert_sig_s);
+  // Parse (r, s) from the DER-encoded cert signature and the CMS
+  // content signature. v9 blob carries 32 raw big-endian bytes each.
+  Fp256Nat ne  = nat_from_be<Fp256Nat>(e_digest_be);
+  Fp256Nat ne2 = nat_from_be<Fp256Nat>(e2_digest_be);
+  Fp256Nat nr  = nat_from_be<Fp256Nat>(wit.cert_sig_r);
+  Fp256Nat ns  = nat_from_be<Fp256Nat>(wit.cert_sig_s);
+  Fp256Nat nr2 = nat_from_be<Fp256Nat>(wit.content_sig_r);
+  Fp256Nat ns2 = nat_from_be<Fp256Nat>(wit.content_sig_s);
 
-  // Build the sig-side ECDSA witness. A failure here means the
-  // prover supplied (r, s) that don't verify under the hardcoded DIIA
-  // root — either a malicious prover or a fixture mismatch.
+  // DIIA root — compile-time constant, same as #29.
   Fp256Base::Elt root_pkX = p256_base.of_string(kDiiaRootPkX_decimal);
   Fp256Base::Elt root_pkY = p256_base.of_string(kDiiaRootPkY_decimal);
-  VerifyWitness3<P256, Fp256Scalar> ecdsa_wit(p256_scalar, p256);
-  if (!ecdsa_wit.compute_witness(root_pkX, root_pkY, ne, nr, ns)) {
+
+  // Holder pk from the cert_tbs SPKI, NOT the JSON public blob.
+  // The parser and parse_witness_blob already anchor-checked the
+  // 26-byte DIIA SPKI prefix at `cert_tbs_spki_offset`, and the
+  // in-circuit SPKI extraction does the same on-wire; these offsets
+  // are therefore trusted here.
+  const size_t kSpkiXAbs =
+      wit.cert_tbs_spki_offset + kSpkiPrefixLen + 1;  // skip prefix + 0x04
+  const size_t kSpkiYAbs = kSpkiXAbs + kSpkiXYLen;
+  uint8_t spki_x_be[kSpkiXYLen];
+  uint8_t spki_y_be[kSpkiXYLen];
+  std::memcpy(spki_x_be, &wit.cert_tbs[kSpkiXAbs], kSpkiXYLen);
+  std::memcpy(spki_y_be, &wit.cert_tbs[kSpkiYAbs], kSpkiXYLen);
+  Fp256Nat nhxnat = nat_from_be<Fp256Nat>(spki_x_be);
+  Fp256Nat nhynat = nat_from_be<Fp256Nat>(spki_y_be);
+  Fp256Base::Elt holder_pkX = p256_base.to_montgomery(nhxnat);
+  Fp256Base::Elt holder_pkY = p256_base.to_montgomery(nhynat);
+
+  // Build BOTH sig-side ECDSA witnesses. Failures here mean the
+  // prover supplied (r, s) that don't verify under the respective
+  // public key — malicious prover or fixture mismatch.
+  VerifyWitness3<P256, Fp256Scalar> ecdsa_cert_wit(p256_scalar, p256);
+  if (!ecdsa_cert_wit.compute_witness(root_pkX, root_pkY, ne, nr, ns)) {
     return P7S_INVALID_INPUT;
   }
-  // Fp256Base::Elt of e in Montgomery form, used as the MAC-bound
-  // EltW on the sig side (after `.eltw_input()` wire declaration).
-  Fp256Base::Elt e_elt = p256_base.to_montgomery(ne);
+  VerifyWitness3<P256, Fp256Scalar> ecdsa_content_wit(p256_scalar, p256);
+  if (!ecdsa_content_wit.compute_witness(holder_pkX, holder_pkY, ne2, nr2,
+                                         ns2)) {
+    return P7S_INVALID_INPUT;
+  }
 
-  // Sample the prover's half of the MAC key BEFORE commit so it
-  // becomes part of the committed witness. `ap` is 2 gf2k values
-  // (low + high halves of `e = SHA-256(cert_tbs)`).
+  // Fp256Base::Elt of e, e2 in Montgomery form — the MAC-bound
+  // EltWs on the sig side (after `.eltw_input()` wire declarations).
+  Fp256Base::Elt e_elt  = p256_base.to_montgomery(ne);
+  Fp256Base::Elt e2_elt = p256_base.to_montgomery(ne2);
+
+  // Sample the prover's halves of the MAC key BEFORE commit so they
+  // become part of the committed witness. kTotalMacValues = 4 = 2
+  // messages × 2 halves/message.
   SecureRandomEngine rng;
   MACReference<F> mac_ref;
   gf2k ap[kTotalMacValues];
@@ -1130,16 +1446,38 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   }
 
   // Task 29: cert_tbs SHA-256 witness + prover-claimed digest.
-  // Same pattern as context / signed_content: numb, padded bytes,
-  // per-block witnesses, then the 32-byte target (big-endian).
+  // Fill order must match the circuit's wire-declaration order:
+  //   cert_tbs_numb (v8)
+  //   cert_tbs_spki_offset (v<kCertTbsLenBits> = v11)  ← v9/#26
+  //   cert_tbs[kCertTbsMaxBytes] (padded bytes)
+  //   cert_tbs_bw[kCertTbsMaxBlocks] (per-block SHA witnesses)
+  //   e_digest_bytes[32]
   push_v8(hash_filler, cert_sw.numb, Fs);
+  push_uint(hash_filler, wit.cert_tbs_spki_offset, kCertTbsLenBits, Fs);
   push_sha_padded_bytes<kCertTbsMaxBlocks>(hash_filler, cert_sw, Fs);
   push_sha_block_witnesses<kCertTbsMaxBlocks>(hash_filler, cert_sw, Fs);
   for (size_t i = 0; i < kCertTbsDigestLen; ++i) {
     push_v8(hash_filler, e_digest_be[i], Fs);
   }
 
-  // Task 25a/29: prover's committed `ap` halves (2 native EltW).
+  // Task 26: signedAttrs SHA witness + prover-claimed digest. The
+  // wire-level signed_attrs[i] holds SHA-padded CAdES-CANONICAL bytes
+  // (first byte 0x31 — same IMPLICIT→SET OF rewrite OpenSSL CMS
+  // applies when computing the content-sig digest). Pattern matches
+  // cert_tbs above: push padded bytes, let the SHA gadget consume
+  // them directly. No separate raw-byte witness; soundness comes
+  // from the content-sig ECDSA.
+  push_v8(hash_filler, sa_sw.numb, Fs);
+  push_sha_padded_bytes<kSignedAttrsMaxBlocks>(hash_filler, sa_sw, Fs);
+  push_sha_block_witnesses<kSignedAttrsMaxBlocks>(hash_filler, sa_sw, Fs);
+  for (size_t i = 0; i < kSignedAttrsDigestLen; ++i) {
+    push_v8(hash_filler, e2_digest_be[i], Fs);
+  }
+
+  // Task 25a/26: prover's committed `ap` halves. kTotalMacValues
+  // EltWs = 4 MAC witnesses × 2 halves/witness. Order must match
+  // the circuit's declaration: mac_witness_e, mac_witness_e2,
+  // mac_witness_spki_x, mac_witness_spki_y.
   for (size_t i = 0; i < kTotalMacValues; ++i) {
     hash_filler.push_back(ap[i]);
   }
@@ -1149,36 +1487,66 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   Dense<Fp256Base> W_sig(1, c_sig.ninputs);
   DenseFiller<Fp256Base> sig_filler(W_sig);
 
-  // Public section.
+  // Public section (v9): const 1 + MAC region placeholders. Holder
+  // pk is NO LONGER a public input — promoted to private after the
+  // escalation about cert SPKI privacy.
   sig_filler.push_back(p256_base.one());
   push_sig_mac_placeholders(sig_filler);
 
-  // Private section:
-  //   1. e_wit — the 32-byte digest as an Fp256Base::Elt in Montgomery
-  //      form, bound to the hash circuit via the MAC below.
-  //   2. MAC witness — prover's ap halves (packed via BitPluckerEncoder)
-  //      plus the message bit-decomposition (of the same 32 bytes that
-  //      yielded e_elt above, LE-ordered to match of_bytes_field).
-  //   3. ECDSA witness — the 1038-element (rx, ry, pre[], bi[], int_*)
-  //      advice table produced by VerifyWitness3::compute_witness.
+  // Private section — order MUST match build_sig_circuit's declaration:
+  //   holder_pk_x, holder_pk_y, e_wit, e2_wit, then
+  //   P7sSigWitness (macs_[0..4], ecdsa_cert_, ecdsa_content_).
+  sig_filler.push_back(holder_pkX);
+  sig_filler.push_back(holder_pkY);
   sig_filler.push_back(e_elt);
+  sig_filler.push_back(e2_elt);
 
-  // MAC witness — uses the LE-ordered 32 bytes of `e` (MacWitness
-  // calls gf_.of_bytes_field on each 16-byte half).
-  uint8_t e_digest_le[kCertTbsDigestLen];
+  // MAC witnesses — LE-ordered 32 bytes of each bound message.
+  // `spki_x_be` / `spki_y_be` and `kSpkiXAbs` / `kSpkiYAbs` were
+  // computed earlier in this function (during holder_pkX/Y derivation).
+  // `MacWitness::compute_witness(ap_pair, le_bytes)` packs (a) the
+  // two ap halves via BitPluckerEncoder and (b) the 256 bit-wires of
+  // the LE-byte message. Order here MUST match MACReference::compute
+  // slicing below and the circuit's mac_witness_* declaration order.
+  uint8_t e_digest_le [kCertTbsDigestLen];
+  uint8_t e2_digest_le[kSignedAttrsDigestLen];
+  uint8_t spki_x_le   [kSpkiXYLen];
+  uint8_t spki_y_le   [kSpkiXYLen];
   for (size_t i = 0; i < kCertTbsDigestLen; ++i) {
-    e_digest_le[i] = e_digest_be[kCertTbsDigestLen - 1 - i];
+    e_digest_le [i] = e_digest_be [kCertTbsDigestLen     - 1 - i];
+    e2_digest_le[i] = e2_digest_be[kSignedAttrsDigestLen - 1 - i];
+  }
+  for (size_t i = 0; i < kSpkiXYLen; ++i) {
+    spki_x_le[i] = spki_x_be[kSpkiXYLen - 1 - i];
+    spki_y_le[i] = spki_y_be[kSpkiXYLen - 1 - i];
+  }
+  // Note: ap halves are sliced per-message; ap[0..2] pair with e,
+  // ap[2..4] with e2, ap[4..6] with SPKI_X, ap[6..8] with SPKI_Y.
+  {
+    MacWitness<Fp256Base> mw(p256_base, Fs);
+    mw.compute_witness(&ap[kMacMsgIdxE     * kMacValuesPerMessage], e_digest_le);
+    mw.fill_witness(sig_filler);
   }
   {
     MacWitness<Fp256Base> mw(p256_base, Fs);
-    mw.compute_witness(ap, e_digest_le);
+    mw.compute_witness(&ap[kMacMsgIdxE2    * kMacValuesPerMessage], e2_digest_le);
+    mw.fill_witness(sig_filler);
+  }
+  {
+    MacWitness<Fp256Base> mw(p256_base, Fs);
+    mw.compute_witness(&ap[kMacMsgIdxSpkiX * kMacValuesPerMessage], spki_x_le);
+    mw.fill_witness(sig_filler);
+  }
+  {
+    MacWitness<Fp256Base> mw(p256_base, Fs);
+    mw.compute_witness(&ap[kMacMsgIdxSpkiY * kMacValuesPerMessage], spki_y_le);
     mw.fill_witness(sig_filler);
   }
 
-  // ECDSA witness — fills 1033 Fp256Base wires per the shape declared
-  // in VerifyCircuit::Witness::input. compute_witness was called on
-  // the sig-circuit prep above; just drain it into the filler.
-  ecdsa_wit.fill_witness(sig_filler);
+  // ECDSA witnesses — match P7sSignature::Witness::input() order:
+  // ecdsa_cert_ first, then ecdsa_content_.
+  ecdsa_cert_wit.fill_witness(sig_filler);
+  ecdsa_content_wit.fill_witness(sig_filler);
 
   if (sig_filler.size() != c_sig.ninputs) return P7S_INVALID_INPUT;
 
@@ -1209,18 +1577,23 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   sig_p.commit(sig_zk, W_sig, tp, rng);
 
   // Sample av from the post-commit transcript state and compute the
-  // MAC values over the cert_tbs digest (LE-ordered — matches the
-  // in-circuit LE v256 view + Fp256Base::of_bytes_field on the sig
-  // side + gf_.of_bytes_field on the MAC reference side).
+  // MAC values over all 4 messages (LE-ordered — matches the
+  // in-circuit LE v256 views + Fp256Base::of_bytes_field on the sig
+  // side + gf_.of_bytes_field on the MAC reference side). macs
+  // layout must match the circuit's mac_pub vector + kMacMsgIdx*.
   gf2k av = generate_mac_key(tp);
   gf2k macs[kTotalMacValues];
-  {
-    uint8_t e_le[kCertTbsDigestLen];
-    for (size_t i = 0; i < kCertTbsDigestLen; ++i) {
-      e_le[i] = e_digest_be[kCertTbsDigestLen - 1 - i];
-    }
-    mac_ref.compute(macs, av, ap, e_le);
-  }
+  // Reuse the _le buffers already computed above for the MAC witness
+  // fill — they're in scope. Pair macs[i * 2 .. (i+1) * 2] with
+  // ap[i * 2 .. (i+1) * 2] for message i.
+  mac_ref.compute(&macs[kMacMsgIdxE     * kMacValuesPerMessage], av,
+                  &ap  [kMacMsgIdxE     * kMacValuesPerMessage], e_digest_le);
+  mac_ref.compute(&macs[kMacMsgIdxE2    * kMacValuesPerMessage], av,
+                  &ap  [kMacMsgIdxE2    * kMacValuesPerMessage], e2_digest_le);
+  mac_ref.compute(&macs[kMacMsgIdxSpkiX * kMacValuesPerMessage], av,
+                  &ap  [kMacMsgIdxSpkiX * kMacValuesPerMessage], spki_x_le);
+  mac_ref.compute(&macs[kMacMsgIdxSpkiY * kMacValuesPerMessage], av,
+                  &ap  [kMacMsgIdxSpkiY * kMacValuesPerMessage], spki_y_le);
 
   // Write the MAC values + av into both dense arrays' MAC slots.
   // DOES NOT touch the committed snapshot — commit() captured the
@@ -1324,6 +1697,9 @@ P7sErrorCode p7s_verify(const uint8_t* public_blob, size_t public_blob_len,
   Dense<Fp256Base> pub_sig(1, c_sig.npub_in);
   DenseFiller<Fp256Base> sig_filler(pub_sig);
   sig_filler.push_back(p256_base.one());
+  // holder_pk_{x,y} are PRIVATE on the sig side (see build_sig_circuit
+  // v9 layout). The only public input wires besides `1` are the MAC
+  // region — filled below.
   push_sig_mac_values(sig_filler, macs, av);
   if (sig_filler.size() != c_sig.npub_in) return P7S_VERIFIER_FAILURE;
 

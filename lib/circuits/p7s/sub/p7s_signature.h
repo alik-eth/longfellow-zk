@@ -5,22 +5,46 @@
 // Task 25a introduced this class as a thin MAC-binding scaffold that
 // linked the hash circuit (GF(2^128)) and the sig circuit (Fp256Base)
 // via a cross-field MAC on a compile-time sentinel. Task 29 (25b)
-// replaces the sentinel with `e = SHA-256(cert_tbs)` and wires an
-// `ECDSA VerifyCircuit` around the same MAC, so the sig circuit now
-// proves "`(r, s)` is a valid P-256 signature of `e` under the DIIA
-// QTSP 2311 root public key, AND `e` equals the cross-circuit value
-// the hash side committed to".
+// replaced the sentinel with `e = SHA-256(cert_tbs)` and wired one
+// `ECDSA VerifyCircuit` around the MAC, proving "`(r1, s1)` is a valid
+// P-256 signature of `e` under the DIIA QTSP 2311 root public key AND
+// `e` equals the cross-circuit value the hash side committed to".
 //
-// root_pk is a compile-time constant — the DIIA QTSP 2311 uncompressed
-// SEC1 point baked into `kDiiaRootPkX_decimal` / `kDiiaRootPkY_decimal`
-// strings below. It does not appear as a circuit public input; the
-// caller wires it via `lc.konst(p256_base.of_string(...))`.
+// Task 26 (invariant 2a, merged with former #30 SPKI binding) adds
+// the CMS content signature leg. The key that signed the content is
+// NOT the JSON-embedded wallet pubkey (invariant 4's pk, which is
+// secp256k1 for the Ethereum wallet being authorized) — it's the
+// holder's DIIA-issued P-256 signing key, embedded as the
+// SubjectPublicKeyInfo inside cert_tbs. Promoting that cert SPKI to
+// the public blob would leak holder identity (a privacy regression),
+// so instead we extract it from cert_tbs on the hash side (via a
+// byte-range route at a host-witnessed offset, anchored by a 26-byte
+// DIIA SPKI prefix assertion) and MAC-bind its X and Y coordinates
+// across the hash/sig field split as two additional messages. The
+// sig circuit consumes `holder_pk_x` and `holder_pk_y` as PRIVATE
+// EltW inputs, unpacked from the MAC witnesses — the same pattern
+// mdoc uses for `dpkx_` / `dpky_`.
+//
+// The sig circuit now proves:
+//
+//   (A) (r1, s1) is valid ECDSA on `e`  under DIIA root_pk  (invariant 1)
+//   (B) (r2, s2) is valid ECDSA on `e2` under holder_pk     (invariant 2a)
+//   (C) `e`         cross-binds to SHA-256(cert_tbs)        (hash side)
+//   (D) `e2`        cross-binds to SHA-256(signedAttrs)     (hash side)
+//   (E) holder_pk_x cross-binds to cert_tbs SPKI X bytes    (hash side)
+//   (F) holder_pk_y cross-binds to cert_tbs SPKI Y bytes    (hash side)
+//
+// `root_pk` is a compile-time constant baked into the strings below
+// (DIIA QTSP 2311, not a public input). `holder_pk_x` / `holder_pk_y`
+// are PRIVATE Fp256Base EltW inputs in the sig circuit, bound to the
+// hash circuit's cert_tbs SPKI bytes via MAC. Total bound messages =
+// 4 (e, e2, SPKI_X, SPKI_Y); total MAC values = 8 (2 per message).
 //
 // Rationale for the MAC step remains the same as 25a: the ECDSA
-// VerifyCircuit operates over Fp256Base, but the SHA-256 computation
-// happens on the hash side over GF(2^128). The MAC gives us a
-// negligible-probability cross-field binding that `e` in the sig
-// circuit equals `SHA-256(cert_tbs)` in the hash circuit.
+// VerifyCircuit operates over Fp256Base, but the SHA-256 computations
+// and cert-SPKI extraction happen on the hash side over GF(2^128).
+// The MAC gives us a negligible-probability cross-field binding per
+// message.
 
 #ifndef PRIVACY_PROOFS_ZK_LIB_CIRCUITS_P7S_SUB_P7S_SIGNATURE_H_
 #define PRIVACY_PROOFS_ZK_LIB_CIRCUITS_P7S_SUB_P7S_SIGNATURE_H_
@@ -41,10 +65,21 @@ namespace p7s {
 constexpr size_t kMacPluckerBits = 2;
 
 // Number of distinct 256-bit messages the p7s circuits bind across
-// the hash/sig field split. Task 25a bound a sentinel; Task 29 binds
-// `e = SHA-256(cert_tbs)`. Task 26 (invariant 2a) will bump this to 2
-// when the content-signature MAC (over the signedAttrs hash) lands.
-constexpr size_t kMacMessagesCount = 1;
+// the hash/sig field split. Task 25a bound 1 sentinel; Task 29 bound
+// `e = SHA-256(cert_tbs)`; Task 26 (invariant 2a + SPKI binding)
+// bumps to 4:
+//   message 0 = `e  = SHA-256(cert_tbs)`
+//   message 1 = `e2 = SHA-256(signedAttrs_rewritten)`
+//   message 2 = cert_tbs SPKI X coordinate (LE-ordered 32 bytes)
+//   message 3 = cert_tbs SPKI Y coordinate (LE-ordered 32 bytes)
+constexpr size_t kMacMessagesCount = 4;
+
+// Message indices — keeps layout-dependent code (MAC index slicing,
+// dense-array fillers, etc.) readable.
+constexpr size_t kMacMsgIdxE       = 0;
+constexpr size_t kMacMsgIdxE2      = 1;
+constexpr size_t kMacMsgIdxSpkiX   = 2;
+constexpr size_t kMacMsgIdxSpkiY   = 3;
 
 // MAC produces 2 GF(2^128) values per bound message (low + high
 // halves of the 256-bit value). Part of the primitive, not per-task.
@@ -78,10 +113,10 @@ constexpr char kDiiaRootPkY_decimal[] =
     "176";
 
 // Sig-circuit gadget — the Fp256Base half of the cross-field MAC,
-// plus (in Task 29) the ECDSA verification against the hardcoded
-// DIIA root. Mirrors the shape of `MdocSignature` but carries only
-// ONE bound message and ONE ECDSA witness (mdoc binds 3 messages
-// and verifies 2 signatures; p7s invariant 1 verifies exactly 1).
+// plus the ECDSA verifications. Mirrors the shape of `MdocSignature`:
+// mdoc binds 3 messages and verifies 2 signatures; p7s binds 2
+// messages (`e`, `e2`) and verifies 2 signatures (cert sig against
+// the DIIA root, content sig against the user's holder_pk).
 template <class LogicCircuit, class Field, class EC>
 class P7sSignature {
   using EltW = typename LogicCircuit::EltW;
@@ -100,65 +135,86 @@ class P7sSignature {
   using EcdsaWitness = typename Ecdsa::Witness;
 
   // Private witness bundle for the sig-circuit checks. One MAC entry
-  // per bound message (we have one; Task 26 will add a second) plus
-  // the full ECDSA advice table (see verify_circuit.h for the shape).
+  // per bound message (`e`, `e2`) plus one ECDSA advice table per
+  // verified signature (cert sig, content sig). See verify_circuit.h
+  // for the advice-table shape.
   class Witness {
    public:
     MACWitness macs_[kMacMessagesCount];
-    EcdsaWitness ecdsa_;
+    EcdsaWitness ecdsa_cert_;     // invariant 1   — cert sig
+    EcdsaWitness ecdsa_content_;  // invariant 2a  — CMS content sig
 
     void input(const LogicCircuit& lc) {
       for (size_t i = 0; i < kMacMessagesCount; ++i) {
         macs_[i].input(lc);
       }
-      ecdsa_.input(lc);
+      ecdsa_cert_.input(lc);
+      ecdsa_content_.input(lc);
     }
   };
 
   explicit P7sSignature(const LogicCircuit& lc, const EC& ec, const Nat& order)
       : lc_(lc), ec_(ec), order_(order) {}
 
-  // Task 29 (25b): verify that `(r, s)` — implicit in `vw.ecdsa_` —
-  // is a valid ECDSA-P256 signature of `msg_e` under the hardcoded
-  // DIIA root public key `(root_pk_x, root_pk_y)`, AND that the same
-  // `msg_e` equals the cross-circuit value committed in the hash
-  // circuit (via the MAC on `mac_values[2]` / `av`).
+  // Task 26 (invariants 1 + 2a + SPKI binding combined): verify:
+  //   (A) cert sig (r1, s1) on `msg_e  = SHA-256(cert_tbs)` under
+  //       the hardcoded DIIA root pk;
+  //   (B) content sig (r2, s2) on `msg_e2 = SHA-256(signedAttrs)`
+  //       under holder_pk (= cert_tbs SPKI, bound via MAC);
+  //   (C) `msg_e`  cross-binds to the hash circuit's SHA(cert_tbs);
+  //   (D) `msg_e2` cross-binds to the hash circuit's SHA(signedAttrs);
+  //   (E) `holder_pk_x` cross-binds to cert_tbs SPKI X bytes;
+  //   (F) `holder_pk_y` cross-binds to cert_tbs SPKI Y bytes.
   //
-  // Soundness argument:
-  //   * ECDSA VerifyCircuit binds `(r, s)` to produce a valid signature
-  //     on `msg_e` under the given public key. Forging requires
-  //     root_pk's private key.
-  //   * The MAC gadget binds `msg_e` to `x_` in `vw.macs_[0]` (see
-  //     `MAC::unpack_msg`). The same MAC values and `av` appear as
-  //     public inputs in the hash circuit, which binds the same 256-bit
-  //     value to `SHA-256(cert_tbs)` computed in-circuit. Because the
-  //     MAC is almost-universal over the verifier-sampled `av`, a
-  //     successful verification means the two circuits agree on `msg_e`
-  //     with overwhelming probability.
+  // Soundness argument (per-message): ECDSA VerifyCircuit binds
+  // (r, s) on `msg` under the given public key (forging requires the
+  // private key). MAC::verify_mac asserts msg equals the bit-expansion
+  // of `vw.macs_[i].xx_`; the SAME MAC values and `av` appear as
+  // public inputs in the hash circuit, which binds the same 256-bit
+  // value to its in-circuit source (SHA output, or routed SPKI bytes).
+  // Almost-universality of MAC over the verifier-sampled `av` gives
+  // agreement with overwhelming probability.
   //
   // `order` should be the curve order (`n256_order` for P-256). The
-  // MAC primitive range-checks the message bit-decomposition against
+  // MAC primitive range-checks each message bit-decomposition against
   // this bound; the ECDSA circuit separately range-checks `r` and
-  // `-s` against the same bound. For `msg_e = SHA-256(cert_tbs)` the
-  // probability that the SHA output happens to exceed the curve order
-  // is ~2^{-32} — in that case the honest prover fails at witness
-  // generation time (a benign liveness issue, not a soundness issue).
-  void assert_signature(EltW root_pk_x, EltW root_pk_y, EltW msg_e,
-                        const v128 mac_values[kMacValuesPerMessage],
+  // `-s` against the same bound. A MAC::verify_mac call would fail
+  // liveness if the bound message's nat value exceeds the curve order
+  // (probability ~2^{-32} per SHA-256 output; for a P-256 SPKI X or
+  // Y coordinate it is by construction below the prime p_256, which
+  // is slightly larger than the order n_256 — collision with the gap
+  // is possible but honest certs won't hit it, so again a liveness
+  // concern not a soundness one).
+  //
+  // `holder_pk_x` / `holder_pk_y` are PRIVATE Fp256Base EltW inputs
+  // the caller declared via `eltw_input()` in the sig circuit's
+  // private-witness section. Their binding to the actual cert_tbs
+  // SPKI bytes is enforced by the MAC unpack_msg on `vw.macs_[2]` /
+  // `vw.macs_[3]` below.
+  void assert_signature(EltW root_pk_x, EltW root_pk_y, EltW holder_pk_x,
+                        EltW holder_pk_y, EltW msg_e, EltW msg_e2,
+                        const v128 mac_e[kMacValuesPerMessage],
+                        const v128 mac_e2[kMacValuesPerMessage],
+                        const v128 mac_spki_x[kMacValuesPerMessage],
+                        const v128 mac_spki_y[kMacValuesPerMessage],
                         const v128& av, const Witness& vw) const {
-    // 1. ECDSA: the witness contains r = rx (mod n), s, and the scalar-
-    //    mult advice table. verify_signature3 asserts the curve equation
-    //    `id == g·e + pk·r + (rx,ry)·(-s)` and that `(pk_x, pk_y)` and
-    //    `(rx, ry)` are on-curve, `rx != 0`, `s != 0`.
     Ecdsa ecc(lc_, ec_, order_);
-    ecc.verify_signature3(root_pk_x, root_pk_y, msg_e, vw.ecdsa_);
 
-    // 2. MAC: bind msg_e to the cross-circuit value (same `av` sampled
-    //    from the shared transcript post-commit, same ap committed
-    //    pre-commit, same 256-bit bit-decomposition of msg_e on both
-    //    sides).
+    // Invariant 1 — cert sig over e under the DIIA root.
+    ecc.verify_signature3(root_pk_x, root_pk_y, msg_e, vw.ecdsa_cert_);
+
+    // Invariant 2a — CMS content sig over e2 under the holder pk.
+    ecc.verify_signature3(holder_pk_x, holder_pk_y, msg_e2,
+                          vw.ecdsa_content_);
+
+    // MAC gadget — per-message cross-field binding. Same `av` across
+    // all four (sampled once from the shared transcript post-commit);
+    // per-message `ap` committed pre-commit in the mac witnesses.
     mac macc(lc_);
-    macc.verify_mac(msg_e, mac_values, av, vw.macs_[0], order_);
+    macc.verify_mac(msg_e,       mac_e,       av, vw.macs_[kMacMsgIdxE],     order_);
+    macc.verify_mac(msg_e2,      mac_e2,      av, vw.macs_[kMacMsgIdxE2],    order_);
+    macc.verify_mac(holder_pk_x, mac_spki_x,  av, vw.macs_[kMacMsgIdxSpkiX], order_);
+    macc.verify_mac(holder_pk_y, mac_spki_y,  av, vw.macs_[kMacMsgIdxSpkiY], order_);
   }
 };
 

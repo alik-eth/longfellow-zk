@@ -19,7 +19,7 @@ typedef enum {
 } P7sErrorCode;
 
 // ============================================================================
-// Phase 2a p7s circuit — blob protocol (schema v8).
+// Phase 2a p7s circuit — blob protocol (schema v9).
 //
 // Prove/verify take two byte buffers that the caller serializes:
 //   * `witness_blob`: private witness — circuit-dependent; schema below.
@@ -51,9 +51,15 @@ typedef enum {
 //                       root public key. Sentinel is gone; the MAC
 //                       now binds `e = SHA-256(cert_tbs)` across the
 //                       two fields.
+//   (26) invariant 2a — CMS content signature verifies over the CAdES-
+//                       canonical signedAttrs (SET form, [0] IMPLICIT
+//                       0xA0 rewritten to 0x31) under the user's
+//                       `holder_pk` (= invariant-4-constrained pk). The
+//                       MAC additionally binds
+//                       `e2 = SHA-256(signedAttrs_rewritten)`.
 //
-// Witness blob v8 layout (extends v7 with cert_tbs witness):
-//   u32  version                                    = 8
+// Witness blob v9 layout (extends v8 with signedAttrs + content sig):
+//   u32  version                                    = 9
 //   u32  context_len                                in [0, 32]
 //   u8   context[32]                                raw bytes + zero pad
 //   u32  signed_content_len                         in [0, 1015]
@@ -68,30 +74,54 @@ typedef enum {
 //   u32  cert_tbs_len                               in [0, 2039]
 //   u8   cert_tbs[2048]                             raw bytes + zero pad;
 //                                                   filler SHA-pads
+//   u8   cert_sig_r[32]                             big-endian scalar
+//   u8   cert_sig_s[32]                             big-endian scalar
+//   u32  signed_attrs_len                           in [0, 1527]; tag = 0xA0
+//   u8   signed_attrs[1536]                         raw bytes + zero pad;
+//                                                   filler rewrites
+//                                                   signed_attrs[0] 0xA0→0x31
+//                                                   then SHA-pads
+//   u8   content_sig_r[32]                          big-endian scalar
+//   u8   content_sig_s[32]                          big-endian scalar
 //
-// Public blob v8 layout (unchanged from v3/v4/v5/v6/v7):
-//   u32  version                                    = 8
+// Public blob v9 layout (unchanged from v3..v8):
+//   u32  version                                    = 9
 //   u8   context_hash[32]
 //   u8   pk[65]                                     decoded SEC1 uncompressed
 //   u8   nonce[32]                                  decoded freshness nonce
 //
 // Note: the DIIA QTSP 2311 root public key is a COMPILE-TIME CONSTANT
 // baked into sub/p7s_signature.h — it is NOT part of the public blob.
-// A Rust-side `root_pk` field can still appear in the caller's
-// `PublicInputs` struct for type-system reasons, but the serialized
-// public blob does not carry those bytes.
+// The USER holder public key (invariant-2a signer) IS part of the
+// public blob: it's the same `pub.pk[65]` that invariant 4 constrains
+// on the hash side, re-parsed on the host as Fp256Base (X, Y) and
+// pushed as sig-circuit public inputs.
 //
-// Extended proof-output format (v8):
-//   u32  schema_version                             = 8 (LE)
-//   u8   macs_b[32]                                 2 × GF(2^128) MAC values
-//                                                   (low+high halves of
-//                                                    e = SHA-256(cert_tbs))
+// Extended proof-output format (v9):
+//   u32  schema_version                             = 9 (LE)
+//   u8   macs_b[64]                                 4 × GF(2^128) MAC values
+//                                                   (2 per message × 2
+//                                                    messages = e, e2)
 //   u8   hash_zk[...]                               ZkProof<GF2_128>,
 //                                                   self-delimited by
 //                                                   ZkProof::read
 //   u8   sig_zk[...]                                ZkProof<Fp256Base>,
 //                                                   self-delimited by
 //                                                   ZkProof::read
+//
+// Known caveats (deferred, not in this task's scope):
+//   * DER re-encode on cert_sig / content_sig: the Rust host DER-parses
+//     both signatures and supplies raw (r, s) scalars. The circuit proves
+//     "some (r, s) verifies"; it does NOT bind the raw DER bytes to
+//     (r, s). Downstream callers that commit to the raw p7s bytes via
+//     another channel are not affected (PublicInputs does not expose
+//     those bytes). Accepted as a permanent deferral.
+//   * SPKI binding between the cert_tbs embedded pubkey and the JSON
+//     holder_pk (invariant 4) is NOT enforced by invariant 2a alone —
+//     invariant 2a verifies the content sig under holder_pk, and
+//     invariant 1 verifies the cert sig under root_pk over cert_tbs,
+//     but nothing in this task ties the SubjectPublicKeyInfo inside
+//     cert_tbs to holder_pk. That linkage arrives in Task 30.
 //
 // Proof bytes are opaque; the caller must free the buffer via
 // p7s_free_proof.

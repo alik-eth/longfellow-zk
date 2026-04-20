@@ -52,6 +52,55 @@ constexpr size_t kCertTbsLenBits = 11;  // log2(2048)
 // invariant 1's cert_tbs digest to keep call sites self-documenting.
 constexpr size_t kCertTbsDigestLen = 32;
 
+// ---- Invariant 2a (Task 26) — signedAttrs + content signature bounds ----
+//
+// The CAdES-BES signedAttrs SET (with [0] IMPLICIT tag 0xA0 rewritten
+// to 0x31 before SHA-256) is bounded by kSignedAttrsMaxBlocks SHA-256
+// blocks. 24 blocks × 64 = 1536 bytes; minus the 9-byte MD padding
+// floor that leaves 1527 bytes of raw signedAttrs headroom. The DIIA
+// fixture's signedAttrs is ~1387 bytes (dominated by the embedded
+// signingCertificateV2 ESSCertIDv2 + signed timestamp). 24 blocks
+// gives ~140 bytes of headroom over that fixture; any real-world
+// signedAttrs that exceeds kSignedAttrsMaxRaw means the prover layer
+// (Rust host) must fail cleanly rather than truncate, and this
+// constant needs a bump.
+constexpr size_t kSignedAttrsMaxBlocks = 24;
+constexpr size_t kSignedAttrsMaxBytes = kSignedAttrsMaxBlocks * 64;  // 1536
+constexpr size_t kSignedAttrsLenBits = 11;  // log2(2048) — conservative;
+                                            // actual bound is 1536 < 2048.
+
+// SHA-256 digest of signedAttrs — the message the content ECDSA
+// signature signs over. Aliased for call-site readability.
+constexpr size_t kSignedAttrsDigestLen = 32;
+
+// ---- SPKI binding (Task 26, merged with #30) ----
+//
+// cert_tbs embeds a DIIA P-256 SubjectPublicKeyInfo: 26 bytes of fixed
+// DER prefix + a 65-byte SEC1 uncompressed point (0x04 || X[32] ||
+// Y[32]). The 65-byte point IS the holder's signing pubkey — the same
+// key that produced the CMS content signature. We extract it from
+// cert_tbs via a `Routing::shift` over a host-witnessed offset;
+// soundness comes from (a) asserting the 26-byte DER prefix at
+// offset [0..26] of the extracted window (foreclosing offset-redirect
+// attacks), and (b) MAC-binding the SPKI's X and Y coordinates
+// across the hash/sig field split so the sig circuit's ECDSA can
+// treat them as private Fp256Base inputs. The public blob is
+// UNCHANGED — cert SPKI never leaks outside the proof (holder
+// identity privacy).
+//
+// Prefix literal (constant per DIIA QTSP 2311 certs):
+//   30 59           SPKI SEQUENCE hdr (l=89)
+//   30 13           AlgId SEQUENCE hdr (l=19)
+//   06 07 2a 86 48 ce 3d 02 01          OID id-ecPublicKey
+//   06 08 2a 86 48 ce 3d 03 01 07       OID prime256v1 (P-256)
+//   03 42 00        BIT STRING hdr (l=66, unused-bits=0)
+// 26 bytes total. The SEC1 0x04 tag sits at window index 26; X at
+// [27..59]; Y at [59..91].
+constexpr size_t kSpkiPrefixLen = 26;
+constexpr size_t kSpkiXYLen = 32;        // per coordinate
+constexpr size_t kSpkiWindowLen =
+    kSpkiPrefixLen + 1 + 2 * kSpkiXYLen;  // 26 + 1 + 64 = 91
+
 }  // namespace p7s
 }  // namespace proofs
 
