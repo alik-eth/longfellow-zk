@@ -19,28 +19,46 @@ typedef enum {
 } P7sErrorCode;
 
 // ============================================================================
-// Phase 2a Task 1b — invariant 9: context_hash == SHA-256(context_bytes).
+// Phase 2a p7s circuit — blob protocol (schema v2).
 //
-// Public input:
-//   context_hash[32] : the SHA-256 digest the prover claims.
+// Prove/verify take two byte buffers that the caller serializes:
+//   * `witness_blob`: private witness — circuit-dependent; schema below.
+//   * `public_blob`:  public inputs — circuit-dependent; schema below.
 //
-// Private witness (v1 constraint: context_len + 9 <= 64, i.e. ≤ 55 bytes):
-//   context_bytes[context_len] : the preimage.
+// Both blobs start with a little-endian u32 schema version, bumped when
+// the layout changes. See the "schema history" block in p7s_zk.cc's
+// deserializer for the authoritative list.
 //
-// The circuit asserts context_hash == SHA-256(context_bytes). Proof bytes
-// are opaque; the caller must free the buffer via p7s_free_proof.
+// Current invariants (additive, each task extends both schemas):
+//   (1b) invariant 9  — context_hash == SHA-256(context_bytes)
+//   (20) invariant 4  — signed_content[pk_offset..+130] == pk_hex
+//                       AND pk_hex decodes to public.pk (65 bytes)
+//
+// Witness blob v2 layout (all little-endian):
+//   u32  version                                    = 2
+//   u32  context_len                                in [0, 32]
+//   u8   context[32]                                (padded with zeros)
+//   u32  signed_content_len                         in [0, 1024]
+//   u8   signed_content[1024]                       (padded with zeros)
+//   u32  json_pk_offset                             relative to signed_content
+//   u8   pk_hex[130]                                ASCII lowercase hex
+//
+// Public blob v2 layout:
+//   u32  version                                    = 2
+//   u8   context_hash[32]
+//   u8   pk[65]                                     decoded SEC1 uncompressed
+//
+// Proof bytes are opaque; the caller must free the buffer via
+// p7s_free_proof.
 // ============================================================================
 
-// Prove: produce a proof that SHA-256(context_bytes[0..context_len]) equals
-// the declared context_hash.
 extern P7sErrorCode p7s_prove(
-    const uint8_t context_hash[32],
-    uint8_t** proof_out, size_t* proof_len_out,
-    const uint8_t* context_bytes, size_t context_len);
+    const uint8_t* witness_blob, size_t witness_blob_len,
+    const uint8_t* public_blob, size_t public_blob_len,
+    uint8_t** proof_out, size_t* proof_len_out);
 
-// Verify: return P7S_SUCCESS iff `proof` is valid for `context_hash`.
 extern P7sErrorCode p7s_verify(
-    const uint8_t context_hash[32],
+    const uint8_t* public_blob, size_t public_blob_len,
     const uint8_t* proof, size_t proof_len);
 
 // Free a proof buffer returned by p7s_prove.

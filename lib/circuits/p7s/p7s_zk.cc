@@ -1,25 +1,34 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
-// Phase 2a Task 1b — invariant 9: context_hash == SHA-256(context_bytes).
+// Phase 2a p7s circuit — blob protocol (schema v2).
 //
-// Adds a real SHA-256 constraint on top of the Task-1a hello-world. The
-// circuit over f_128 (GF(2^128)) declares:
+// Invariants enforced by the current circuit:
+//   (9)  context_hash == SHA-256(context_bytes)                 — Task 1b
+//   (4)  signed_content[pk_offset..+130] == pk_hex              — Task 20
+//        AND pk_hex decodes to public.pk (65 bytes)             — Task 20
 //
-//   Public input:
-//     target[256]                               — context_hash
+// -----------------------------------------------------------------------------
+// Blob protocol — schema history
+// -----------------------------------------------------------------------------
+//   v1 (Task 1a, 1b): typed C args for context_hash + context_bytes.
+//                     Removed in Task 20 in favor of byte-blobs so additional
+//                     witness fields can land without per-task ABI churn.
 //
-//   Private witness:
-//     numb[8]                                   — number of real SHA blocks
-//     in[64 * kContextMaxBlocks] bytes          — Merkle-Damgård-padded input
-//     BlockWitness × kContextMaxBlocks          — per-block SHA intermediates
+//   v2 (Task 20):
+//     Witness blob (little-endian):
+//       u32  version                = 2
+//       u32  context_len            in [0, 32]
+//       u8   context[32]            padded with zeros
+//       u32  signed_content_len     in [0, 1024]
+//       u8   signed_content[1024]   padded with zeros
+//       u32  json_pk_offset         relative to signed_content; + 130 <= 1024
+//       u8   pk_hex[130]            ASCII lowercase hex
 //
-//   Constraint:
-//     FlatSHA256Circuit::assert_message_hash(numb, in, target, bw)
-//     (implicitly enforces zero padding beyond `numb` blocks).
-//
-// Witness filling is done off-circuit via FlatSHA256Witness::
-// transform_and_witness_message, which produces both the padded `in`
-// buffer and all intermediate round witnesses.
+//     Public blob (little-endian):
+//       u32  version                = 2
+//       u8   context_hash[32]
+//       u8   pk[65]
+// -----------------------------------------------------------------------------
 
 #include "p7s_zk.h"
 
@@ -36,7 +45,11 @@
 #include "circuits/logic/bit_plucker_encoder.h"
 #include "circuits/logic/compiler_backend.h"
 #include "circuits/logic/logic.h"
+#include "circuits/logic/routing.h"
+#include "circuits/p7s/p7s_circuit.h"
 #include "circuits/p7s/p7s_hash.h"
+#include "circuits/p7s/sub/byte_range_eq.h"
+#include "circuits/p7s/sub/hex_decode.h"
 #include "circuits/sha/flatsha256_witness.h"
 #include "gf2k/gf2_128.h"
 #include "gf2k/lch14_reed_solomon.h"
@@ -58,23 +71,34 @@ using RSFactory = LCH14ReedSolomonFactory<F>;
 using CB = CompilerBackend<F>;
 using LC = Logic<F, CB>;
 using P7sHashC = P7sHash<LC>;
+using ByteRangeEqC = ByteRangeEq<LC>;
+using HexDecodeC = HexDecode<LC>;
+using RoutingC = Routing<LC>;
 using ShaBlockWitness = P7sHashC::ShaBlockWitness;
 
 // Ligero parameters — match zk_testing.h's kLigeroRate / kLigeroNreq so
-// Task-1b proofs have the same statistical-soundness margin as the
+// Task-20 proofs have the same statistical-soundness margin as the
 // reference regression tests.
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seed. Bumped from "p7s-1a" so proofs minted under the
-// trivially-satisfiable circuit cannot be misinterpreted as Task-1b proofs.
-constexpr char kTranscriptSeed[] = "p7s-1b";
+// Transcript seed. Bumped from "p7s-1b" so proofs minted under the
+// invariant-9-only circuit cannot be misinterpreted as Task-20 proofs.
+constexpr char kTranscriptSeed[] = "p7s-20";
 constexpr size_t kTranscriptSeedLen = sizeof(kTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
 constexpr size_t kContextPaddedBytes = kShaBlockBytes * kContextMaxBlocks;
 
-// Build the Task-1b circuit.
+// log2(1024) = 10. `json_pk_offset` fits in 10 bits.
+constexpr size_t kSignedContentLogN = 10;
+static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
+              "kSignedContentLogN must equal log2(kMaxSignedContent)");
+
+// Blob schema version.
+constexpr uint32_t kBlobSchemaVersion = 2;
+
+// Build the Task-20 circuit.
 std::unique_ptr<Circuit<F>> build_circuit() {
   const F Fs;
 
@@ -82,25 +106,70 @@ std::unique_ptr<Circuit<F>> build_circuit() {
   const CB cbk(&Q);
   const LC lc(&cbk, Fs);
   P7sHashC ph(lc);
+  ByteRangeEqC breq(lc);
+  HexDecodeC hex_decode(lc);
+  RoutingC routing(lc);
 
-  // Public input: the claimed context_hash.
-  auto target = lc.template vinput<256>();
+  // ---- Public inputs ----
+  // Invariant 9 target (context_hash, bit-decomposed, 256 bits).
+  auto context_hash = lc.template vinput<256>();
 
-  // Private inputs.
-  Q.private_input();
-  auto numb = lc.template vinput<8>();
-
-  std::vector<typename LC::v8> in_bytes(kContextPaddedBytes);
-  for (size_t i = 0; i < kContextPaddedBytes; ++i) {
-    in_bytes[i] = lc.template vinput<8>();
+  // Invariant 4 target (decoded pk, 65 bytes → 65 v8 values).
+  std::vector<typename LC::v8> pk_bytes(kPkBytes);
+  for (size_t i = 0; i < kPkBytes; ++i) {
+    pk_bytes[i] = lc.template vinput<8>();
   }
 
+  // ---- Private witness ----
+  Q.private_input();
+
+  // Invariant 9 SHA witness.
+  auto numb = lc.template vinput<8>();
+  std::vector<typename LC::v8> context_in(kContextPaddedBytes);
+  for (size_t i = 0; i < kContextPaddedBytes; ++i) {
+    context_in[i] = lc.template vinput<8>();
+  }
   std::vector<ShaBlockWitness> bw(kContextMaxBlocks);
   for (size_t b = 0; b < kContextMaxBlocks; ++b) {
     bw[b].input(lc);
   }
 
-  ph.assert_context_hash(numb, in_bytes.data(), target, bw.data());
+  // Invariant 4: full signed_content, json_pk_offset, pk_hex, nibble witnesses.
+  std::vector<typename LC::v8> signed_content(kMaxSignedContent);
+  for (size_t i = 0; i < kMaxSignedContent; ++i) {
+    signed_content[i] = lc.template vinput<8>();
+  }
+  auto json_pk_offset = lc.template vinput<kSignedContentLogN>();
+
+  std::vector<typename LC::v8> pk_hex(kPkHexLen);
+  for (size_t i = 0; i < kPkHexLen; ++i) {
+    pk_hex[i] = lc.template vinput<8>();
+  }
+
+  // Prover-supplied nibble witnesses — one v8 per hex char (upper 4 bits
+  // get zero-asserted inside HexDecode::assert_decodes).
+  std::vector<typename LC::v8> hi_lo_nibbles(kPkHexLen);
+  for (size_t i = 0; i < kPkHexLen; ++i) {
+    hi_lo_nibbles[i] = lc.template vinput<8>();
+  }
+
+  // ---- Constraints ----
+
+  // Invariant 9.
+  ph.assert_context_hash(numb, context_in.data(), context_hash, bw.data());
+
+  // Invariant 4a: signed_content[pk_offset..+130] == pk_hex.
+  // Use the Routing shifter to extract the 130-byte window.
+  std::vector<typename LC::v8> pk_window(kPkHexLen);
+  const typename LC::v8 zz = lc.template vbit<8>(0);
+  routing.template shift<typename LC::v8, kSignedContentLogN>(
+      json_pk_offset, kPkHexLen, pk_window.data(), kMaxSignedContent,
+      signed_content.data(), zz, /*unroll=*/3);
+  breq.assert_eq(pk_window.data(), pk_hex.data(), kPkHexLen);
+
+  // Invariant 4b: pk_hex decodes to public.pk.
+  hex_decode.assert_decodes(pk_hex.data(), pk_bytes.data(),
+                            hi_lo_nibbles.data(), kPkBytes);
 
   return Q.mkcircuit(/*nc=*/1);
 }
@@ -120,10 +189,14 @@ void push_v8(DenseFiller<F>& filler, uint8_t x, const F& Fs) {
   filler.push_back(static_cast<uint64_t>(x), 8, Fs);
 }
 
-// Push the context_hash as the 256-bit `target` public input wires.
-// Matches FlatSHA256Circuit's `assert_hash` layout, which treats the
-// 32 target bytes as big-endian byte order with LSB-first within each byte:
-//   bit j of target corresponds to bit (j % 8) of byte ((255 - j) / 8).
+// Push a k-bit integer as k wires, LSB-first.
+void push_uint(DenseFiller<F>& filler, uint64_t x, size_t k, const F& Fs) {
+  filler.push_back(x, k, Fs);
+}
+
+// Push the context_hash as 256 target bits. Matches FlatSHA256Circuit's
+// assert_hash layout: bit j of target corresponds to bit (j % 8) of byte
+// ((255 - j) / 8).
 void push_target(DenseFiller<F>& filler, const uint8_t context_hash[32],
                  const F& Fs) {
   for (size_t j = 0; j < 256; ++j) {
@@ -134,30 +207,31 @@ void push_target(DenseFiller<F>& filler, const uint8_t context_hash[32],
   }
 }
 
-// Push the SHA private witness (numb + padded bytes + per-block
-// intermediates) into `filler`, matching the circuit's input declaration
-// order inside the private-input section.
+// Push the decoded pk as 65 v8 values (LSB-first bits within each byte),
+// matching the `lc.vinput<8>()` layout.
+void push_pk_public(DenseFiller<F>& filler, const uint8_t pk[kPkBytes],
+                    const F& Fs) {
+  for (size_t i = 0; i < kPkBytes; ++i) {
+    push_v8(filler, pk[i], Fs);
+  }
+}
+
+// Push SHA private witness: numb + padded context bytes + per-block
+// intermediates. Layout matches `build_circuit`'s private-input order.
 void push_sha_witness(DenseFiller<F>& filler,
                       const uint8_t* context_bytes, size_t context_len,
                       const F& Fs) {
-  // Compute padded input and per-block witnesses off-circuit.
   uint8_t numb = 0;
   uint8_t padded_in[kContextPaddedBytes] = {};
   FlatSHA256Witness::BlockWitness bw[kContextMaxBlocks]{};
   FlatSHA256Witness::transform_and_witness_message(
       context_len, context_bytes, kContextMaxBlocks, numb, padded_in, bw);
 
-  // numb as v8.
   push_v8(filler, numb, Fs);
-
-  // Padded input bytes, each as 8 bits LSB-first.
   for (size_t i = 0; i < kContextPaddedBytes; ++i) {
     push_v8(filler, padded_in[i], Fs);
   }
 
-  // Per-block FlatSHA intermediates. FlatSHA256Circuit uses packed_v32
-  // wires with BitPlucker<LC, kP7sPluckerBits>; match the packing used
-  // in flatsha256_circuit_test.cc::fill_input.
   BitPluckerEncoder<F, kP7sPluckerBits> bpenc(Fs);
   for (size_t b = 0; b < kContextMaxBlocks; ++b) {
     for (size_t k = 0; k < 48; ++k) {
@@ -177,39 +251,153 @@ void push_sha_witness(DenseFiller<F>& filler,
   }
 }
 
+// Push invariant-4 private witness: signed_content (padded to 1024),
+// json_pk_offset (10 bits), pk_hex (130 bytes), hi_lo_nibbles (130 bytes).
+void push_invariant4_witness(DenseFiller<F>& filler,
+                             const uint8_t signed_content[kMaxSignedContent],
+                             uint32_t json_pk_offset,
+                             const uint8_t pk_hex[kPkHexLen],
+                             const F& Fs) {
+  for (size_t i = 0; i < kMaxSignedContent; ++i) {
+    push_v8(filler, signed_content[i], Fs);
+  }
+  push_uint(filler, json_pk_offset, kSignedContentLogN, Fs);
+  for (size_t i = 0; i < kPkHexLen; ++i) {
+    push_v8(filler, pk_hex[i], Fs);
+  }
+  // Nibble witnesses derived from pk_hex: one v8 per hex char carrying the
+  // decoded nibble in the low 4 bits and zero in the upper 4. If the
+  // incoming hex char is invalid the nibble is filled with 0 — the circuit
+  // (via HexDecode) will then reject at constraint time.
+  for (size_t i = 0; i < kPkHexLen; ++i) {
+    uint8_t c = pk_hex[i];
+    uint8_t nib = (c >= '0' && c <= '9')   ? (c - '0')
+                  : (c >= 'a' && c <= 'f') ? (c - 'a' + 10)
+                  : (c >= 'A' && c <= 'F') ? (c - 'A' + 10)
+                                           : 0;
+    push_v8(filler, nib, Fs);
+  }
+}
+
+// Read helpers for the little-endian blob format.
+bool read_u32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
+  if (end - p < 4) return false;
+  out = static_cast<uint32_t>(p[0]) |
+        (static_cast<uint32_t>(p[1]) << 8) |
+        (static_cast<uint32_t>(p[2]) << 16) |
+        (static_cast<uint32_t>(p[3]) << 24);
+  p += 4;
+  return true;
+}
+
+// Parsed witness blob (zero-padded to fixed array sizes).
+struct ParsedWitness {
+  uint32_t context_len;
+  uint8_t context[kContextMaxBytes];
+  uint32_t signed_content_len;
+  uint8_t signed_content[kMaxSignedContent];
+  uint32_t json_pk_offset;
+  uint8_t pk_hex[kPkHexLen];
+};
+
+// Parsed public blob.
+struct ParsedPublic {
+  uint8_t context_hash[32];
+  uint8_t pk[kPkBytes];
+};
+
+bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
+                        ParsedWitness& out) {
+  if (blob == nullptr || blob_len == 0) return false;
+  const uint8_t* p = blob;
+  const uint8_t* end = blob + blob_len;
+
+  uint32_t version = 0;
+  if (!read_u32(p, end, version) || version != kBlobSchemaVersion) return false;
+
+  if (!read_u32(p, end, out.context_len)) return false;
+  if (out.context_len > kContextMaxBytes) return false;
+  if (end - p < static_cast<ptrdiff_t>(kContextMaxBytes)) return false;
+  std::memcpy(out.context, p, kContextMaxBytes);
+  p += kContextMaxBytes;
+
+  if (!read_u32(p, end, out.signed_content_len)) return false;
+  if (out.signed_content_len > kMaxSignedContent) return false;
+  if (end - p < static_cast<ptrdiff_t>(kMaxSignedContent)) return false;
+  std::memcpy(out.signed_content, p, kMaxSignedContent);
+  p += kMaxSignedContent;
+
+  if (!read_u32(p, end, out.json_pk_offset)) return false;
+  // `json_pk_offset + kPkHexLen <= kMaxSignedContent` ensures the shifted
+  // window stays within the buffer. (The Routing shifter would zero-default
+  // out-of-range reads, but we refuse obviously nonsensical offsets up
+  // front so the pk_hex witness can't mask them.)
+  if (out.json_pk_offset > kMaxSignedContent - kPkHexLen) return false;
+
+  if (end - p < static_cast<ptrdiff_t>(kPkHexLen)) return false;
+  std::memcpy(out.pk_hex, p, kPkHexLen);
+  p += kPkHexLen;
+
+  if (p != end) return false;
+  return true;
+}
+
+bool parse_public_blob(const uint8_t* blob, size_t blob_len,
+                       ParsedPublic& out) {
+  if (blob == nullptr || blob_len == 0) return false;
+  const uint8_t* p = blob;
+  const uint8_t* end = blob + blob_len;
+
+  uint32_t version = 0;
+  if (!read_u32(p, end, version) || version != kBlobSchemaVersion) return false;
+
+  if (end - p < 32) return false;
+  std::memcpy(out.context_hash, p, 32);
+  p += 32;
+
+  if (end - p < static_cast<ptrdiff_t>(kPkBytes)) return false;
+  std::memcpy(out.pk, p, kPkBytes);
+  p += kPkBytes;
+
+  if (p != end) return false;
+  return true;
+}
+
 }  // namespace
 }  // namespace p7s
 }  // namespace proofs
 
 extern "C" {
 
-P7sErrorCode p7s_prove(const uint8_t context_hash[32], uint8_t** proof_out,
-                       size_t* proof_len_out,
-                       const uint8_t* context_bytes, size_t context_len) {
+P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
+                       const uint8_t* public_blob, size_t public_blob_len,
+                       uint8_t** proof_out, size_t* proof_len_out) {
   using namespace proofs;
   using namespace proofs::p7s;
 
-  if (context_hash == nullptr || proof_out == nullptr ||
-      proof_len_out == nullptr) {
-    return P7S_NULL_INPUT;
+  if (proof_out == nullptr || proof_len_out == nullptr) return P7S_NULL_INPUT;
+
+  ParsedWitness wit{};
+  if (!parse_witness_blob(witness_blob, witness_blob_len, wit)) {
+    return P7S_INVALID_INPUT;
   }
-  if (context_bytes == nullptr && context_len != 0) {
-    return P7S_NULL_INPUT;
-  }
-  if (context_len > kContextMaxBytes) {
+  ParsedPublic pub{};
+  if (!parse_public_blob(public_blob, public_blob_len, pub)) {
     return P7S_INVALID_INPUT;
   }
 
   const F Fs;
   const RSFactory rsf(Fs);
-
   const Circuit<F>& circuit = get_circuit();
 
   Dense<F> W(1, circuit.ninputs);
   DenseFiller<F> filler(W);
   filler.push_back(Fs.one());
-  push_target(filler, context_hash, Fs);
-  push_sha_witness(filler, context_bytes, context_len, Fs);
+  push_target(filler, pub.context_hash, Fs);
+  push_pk_public(filler, pub.pk, Fs);
+  push_sha_witness(filler, wit.context, wit.context_len, Fs);
+  push_invariant4_witness(filler, wit.signed_content, wit.json_pk_offset,
+                          wit.pk_hex, Fs);
 
   if (filler.size() != circuit.ninputs) {
     return P7S_INVALID_INPUT;
@@ -238,21 +426,21 @@ P7sErrorCode p7s_prove(const uint8_t context_hash[32], uint8_t** proof_out,
   return P7S_SUCCESS;
 }
 
-P7sErrorCode p7s_verify(const uint8_t context_hash[32], const uint8_t* proof,
-                        size_t proof_len) {
+P7sErrorCode p7s_verify(const uint8_t* public_blob, size_t public_blob_len,
+                        const uint8_t* proof, size_t proof_len) {
   using namespace proofs;
   using namespace proofs::p7s;
 
-  if (context_hash == nullptr || proof == nullptr) {
-    return P7S_NULL_INPUT;
-  }
-  if (proof_len == 0) {
+  if (proof == nullptr) return P7S_NULL_INPUT;
+  if (proof_len == 0) return P7S_INVALID_INPUT;
+
+  ParsedPublic pub{};
+  if (!parse_public_blob(public_blob, public_blob_len, pub)) {
     return P7S_INVALID_INPUT;
   }
 
   const F Fs;
   const RSFactory rsf(Fs);
-
   const Circuit<F>& circuit = get_circuit();
 
   ZkProof<F> zkp(circuit, kRate, kNreq);
@@ -265,11 +453,11 @@ P7sErrorCode p7s_verify(const uint8_t context_hash[32], const uint8_t* proof,
     return P7S_VERIFIER_FAILURE;
   }
 
-  // Public-input portion only: constant-1 wire + target.
-  Dense<F> pub(1, circuit.npub_in);
-  DenseFiller<F> filler(pub);
+  Dense<F> pub_w(1, circuit.npub_in);
+  DenseFiller<F> filler(pub_w);
   filler.push_back(Fs.one());
-  push_target(filler, context_hash, Fs);
+  push_target(filler, pub.context_hash, Fs);
+  push_pk_public(filler, pub.pk, Fs);
   if (filler.size() != circuit.npub_in) {
     return P7S_INVALID_INPUT;
   }
@@ -278,7 +466,7 @@ P7sErrorCode p7s_verify(const uint8_t context_hash[32], const uint8_t* proof,
   Transcript tv(reinterpret_cast<const uint8_t*>(kTranscriptSeed),
                 kTranscriptSeedLen);
   verifier.recv_commitment(zkp, tv);
-  return verifier.verify(zkp, pub, tv) ? P7S_SUCCESS : P7S_VERIFIER_FAILURE;
+  return verifier.verify(zkp, pub_w, tv) ? P7S_SUCCESS : P7S_VERIFIER_FAILURE;
 }
 
 void p7s_free_proof(uint8_t* proof) { free(proof); }
