@@ -28,6 +28,10 @@ constexpr size_t kPkHexLen = 130;
 // Decoded pk length in bytes.
 constexpr size_t kPkBytes = 65;
 
+// Freshness nonce emitted as lowercase hex (2 chars per byte).
+constexpr size_t kNonceBytes = 32;
+constexpr size_t kNonceHexLen = 64;
+
 }  // namespace p7s
 }  // namespace proofs
 

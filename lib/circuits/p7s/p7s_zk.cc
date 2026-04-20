@@ -1,11 +1,13 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
-// Phase 2a p7s circuit — blob protocol (schema v2).
+// Phase 2a p7s circuit — blob protocol (schema v3).
 //
 // Invariants enforced by the current circuit:
 //   (9)  context_hash == SHA-256(context_bytes)                 — Task 1b
 //   (4)  signed_content[pk_offset..+130] == pk_hex              — Task 20
 //        AND pk_hex decodes to public.pk (65 bytes)             — Task 20
+//   (5)  signed_content[nonce_offset..+64] == nonce_hex         — Task 21
+//        AND nonce_hex decodes to public.nonce (32 bytes)       — Task 21
 //
 // -----------------------------------------------------------------------------
 // Blob protocol — schema history
@@ -28,6 +30,14 @@
 //       u32  version                = 2
 //       u8   context_hash[32]
 //       u8   pk[65]
+//
+//   v3 (Task 21): adds nonce field appended to both blobs.
+//     Witness blob extends v2 with:
+//       u32  json_nonce_offset      relative to signed_content; + 64 <= 1024
+//       u8   nonce_hex[64]          ASCII lowercase hex
+//
+//     Public blob extends v2 with:
+//       u8   nonce[32]              decoded freshness nonce
 // -----------------------------------------------------------------------------
 
 #include "p7s_zk.h"
@@ -82,9 +92,9 @@ using ShaBlockWitness = P7sHashC::ShaBlockWitness;
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seed. Bumped from "p7s-1b" so proofs minted under the
-// invariant-9-only circuit cannot be misinterpreted as Task-20 proofs.
-constexpr char kTranscriptSeed[] = "p7s-20";
+// Transcript seed. Bumped from "p7s-20" so proofs minted under the
+// Task-20 circuit cannot be misinterpreted as Task-21 proofs.
+constexpr char kTranscriptSeed[] = "p7s-21";
 constexpr size_t kTranscriptSeedLen = sizeof(kTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
@@ -96,7 +106,7 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
               "kSignedContentLogN must equal log2(kMaxSignedContent)");
 
 // Blob schema version.
-constexpr uint32_t kBlobSchemaVersion = 2;
+constexpr uint32_t kBlobSchemaVersion = 3;
 
 // Build the Task-20 circuit.
 std::unique_ptr<Circuit<F>> build_circuit() {
@@ -118,6 +128,12 @@ std::unique_ptr<Circuit<F>> build_circuit() {
   std::vector<typename LC::v8> pk_bytes(kPkBytes);
   for (size_t i = 0; i < kPkBytes; ++i) {
     pk_bytes[i] = lc.template vinput<8>();
+  }
+
+  // Invariant 5 target (decoded nonce, 32 bytes → 32 v8 values).
+  std::vector<typename LC::v8> nonce_bytes(kNonceBytes);
+  for (size_t i = 0; i < kNonceBytes; ++i) {
+    nonce_bytes[i] = lc.template vinput<8>();
   }
 
   // ---- Private witness ----
@@ -153,6 +169,17 @@ std::unique_ptr<Circuit<F>> build_circuit() {
     hi_lo_nibbles[i] = lc.template vinput<8>();
   }
 
+  // Invariant 5: json_nonce_offset, nonce_hex, nonce_nibbles.
+  auto json_nonce_offset = lc.template vinput<kSignedContentLogN>();
+  std::vector<typename LC::v8> nonce_hex(kNonceHexLen);
+  for (size_t i = 0; i < kNonceHexLen; ++i) {
+    nonce_hex[i] = lc.template vinput<8>();
+  }
+  std::vector<typename LC::v8> nonce_nibbles(kNonceHexLen);
+  for (size_t i = 0; i < kNonceHexLen; ++i) {
+    nonce_nibbles[i] = lc.template vinput<8>();
+  }
+
   // ---- Constraints ----
 
   // Invariant 9.
@@ -170,6 +197,17 @@ std::unique_ptr<Circuit<F>> build_circuit() {
   // Invariant 4b: pk_hex decodes to public.pk.
   hex_decode.assert_decodes(pk_hex.data(), pk_bytes.data(),
                             hi_lo_nibbles.data(), kPkBytes);
+
+  // Invariant 5a: signed_content[nonce_offset..+64] == nonce_hex.
+  std::vector<typename LC::v8> nonce_window(kNonceHexLen);
+  routing.template shift<typename LC::v8, kSignedContentLogN>(
+      json_nonce_offset, kNonceHexLen, nonce_window.data(), kMaxSignedContent,
+      signed_content.data(), zz, /*unroll=*/3);
+  breq.assert_eq(nonce_window.data(), nonce_hex.data(), kNonceHexLen);
+
+  // Invariant 5b: nonce_hex decodes to public.nonce.
+  hex_decode.assert_decodes(nonce_hex.data(), nonce_bytes.data(),
+                            nonce_nibbles.data(), kNonceBytes);
 
   return Q.mkcircuit(/*nc=*/1);
 }
@@ -216,6 +254,14 @@ void push_pk_public(DenseFiller<F>& filler, const uint8_t pk[kPkBytes],
   }
 }
 
+// Push the decoded nonce as 32 v8 values.
+void push_nonce_public(DenseFiller<F>& filler,
+                       const uint8_t nonce[kNonceBytes], const F& Fs) {
+  for (size_t i = 0; i < kNonceBytes; ++i) {
+    push_v8(filler, nonce[i], Fs);
+  }
+}
+
 // Push SHA private witness: numb + padded context bytes + per-block
 // intermediates. Layout matches `build_circuit`'s private-input order.
 void push_sha_witness(DenseFiller<F>& filler,
@@ -251,8 +297,18 @@ void push_sha_witness(DenseFiller<F>& filler,
   }
 }
 
+// Decode a single lowercase-or-digit hex char to its nibble value. Any
+// non-hex char is mapped to 0 so the HexDecode circuit can reject at
+// constraint time rather than at witness-fill time.
+uint8_t nibble_of(uint8_t c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return 0;
+}
+
 // Push invariant-4 private witness: signed_content (padded to 1024),
-// json_pk_offset (10 bits), pk_hex (130 bytes), hi_lo_nibbles (130 bytes).
+// json_pk_offset (10 bits), pk_hex (130 bytes), pk nibble witnesses.
 void push_invariant4_witness(DenseFiller<F>& filler,
                              const uint8_t signed_content[kMaxSignedContent],
                              uint32_t json_pk_offset,
@@ -266,16 +322,24 @@ void push_invariant4_witness(DenseFiller<F>& filler,
     push_v8(filler, pk_hex[i], Fs);
   }
   // Nibble witnesses derived from pk_hex: one v8 per hex char carrying the
-  // decoded nibble in the low 4 bits and zero in the upper 4. If the
-  // incoming hex char is invalid the nibble is filled with 0 — the circuit
-  // (via HexDecode) will then reject at constraint time.
+  // decoded nibble in the low 4 bits and zero in the upper 4.
   for (size_t i = 0; i < kPkHexLen; ++i) {
-    uint8_t c = pk_hex[i];
-    uint8_t nib = (c >= '0' && c <= '9')   ? (c - '0')
-                  : (c >= 'a' && c <= 'f') ? (c - 'a' + 10)
-                  : (c >= 'A' && c <= 'F') ? (c - 'A' + 10)
-                                           : 0;
-    push_v8(filler, nib, Fs);
+    push_v8(filler, nibble_of(pk_hex[i]), Fs);
+  }
+}
+
+// Push invariant-5 private witness: json_nonce_offset (10 bits),
+// nonce_hex (64 bytes), nonce nibble witnesses.
+void push_invariant5_witness(DenseFiller<F>& filler,
+                             uint32_t json_nonce_offset,
+                             const uint8_t nonce_hex[kNonceHexLen],
+                             const F& Fs) {
+  push_uint(filler, json_nonce_offset, kSignedContentLogN, Fs);
+  for (size_t i = 0; i < kNonceHexLen; ++i) {
+    push_v8(filler, nonce_hex[i], Fs);
+  }
+  for (size_t i = 0; i < kNonceHexLen; ++i) {
+    push_v8(filler, nibble_of(nonce_hex[i]), Fs);
   }
 }
 
@@ -298,12 +362,15 @@ struct ParsedWitness {
   uint8_t signed_content[kMaxSignedContent];
   uint32_t json_pk_offset;
   uint8_t pk_hex[kPkHexLen];
+  uint32_t json_nonce_offset;
+  uint8_t nonce_hex[kNonceHexLen];
 };
 
 // Parsed public blob.
 struct ParsedPublic {
   uint8_t context_hash[32];
   uint8_t pk[kPkBytes];
+  uint8_t nonce[kNonceBytes];
 };
 
 bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
@@ -338,6 +405,13 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   std::memcpy(out.pk_hex, p, kPkHexLen);
   p += kPkHexLen;
 
+  if (!read_u32(p, end, out.json_nonce_offset)) return false;
+  if (out.json_nonce_offset > kMaxSignedContent - kNonceHexLen) return false;
+
+  if (end - p < static_cast<ptrdiff_t>(kNonceHexLen)) return false;
+  std::memcpy(out.nonce_hex, p, kNonceHexLen);
+  p += kNonceHexLen;
+
   if (p != end) return false;
   return true;
 }
@@ -358,6 +432,10 @@ bool parse_public_blob(const uint8_t* blob, size_t blob_len,
   if (end - p < static_cast<ptrdiff_t>(kPkBytes)) return false;
   std::memcpy(out.pk, p, kPkBytes);
   p += kPkBytes;
+
+  if (end - p < static_cast<ptrdiff_t>(kNonceBytes)) return false;
+  std::memcpy(out.nonce, p, kNonceBytes);
+  p += kNonceBytes;
 
   if (p != end) return false;
   return true;
@@ -395,9 +473,11 @@ P7sErrorCode p7s_prove(const uint8_t* witness_blob, size_t witness_blob_len,
   filler.push_back(Fs.one());
   push_target(filler, pub.context_hash, Fs);
   push_pk_public(filler, pub.pk, Fs);
+  push_nonce_public(filler, pub.nonce, Fs);
   push_sha_witness(filler, wit.context, wit.context_len, Fs);
   push_invariant4_witness(filler, wit.signed_content, wit.json_pk_offset,
                           wit.pk_hex, Fs);
+  push_invariant5_witness(filler, wit.json_nonce_offset, wit.nonce_hex, Fs);
 
   if (filler.size() != circuit.ninputs) {
     return P7S_INVALID_INPUT;
@@ -458,6 +538,7 @@ P7sErrorCode p7s_verify(const uint8_t* public_blob, size_t public_blob_len,
   filler.push_back(Fs.one());
   push_target(filler, pub.context_hash, Fs);
   push_pk_public(filler, pub.pk, Fs);
+  push_nonce_public(filler, pub.nonce, Fs);
   if (filler.size() != circuit.npub_in) {
     return P7S_INVALID_INPUT;
   }
