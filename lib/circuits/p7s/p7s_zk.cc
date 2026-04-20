@@ -520,12 +520,13 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
                                       cert_tbs_bw.data());
 
   // Task 29 — cross-field MAC binding to `e = SHA-256(cert_tbs)`.
-  // LE-byte view over the SAME 32 BE-ordered wires (different mapping).
-  // `e_digest_bytes[i]` is BE byte i (i=0 is MSByte); the MAC treats
-  // the digest as a little-endian 256-bit integer — byte 0 of LE ==
-  // byte 31 of BE. Matches `Fp256Base::of_bytes_field` (LE Nat) and
-  // `MACReference::compute` (splits the 32 bytes into two 16-byte
-  // LE halves).
+  // Byte-identical view — same wires as e_digest_v256_flatsha, second
+  // name for readability on the MAC side. Wire identity gives MAC-SHA
+  // byte-equality for free; changing one view without updating the
+  // other would introduce a soundness bug. The algebra works because
+  // `(255 - j) / 8 == 31 - j/8` for j in [0, 256), so the FlatSHA
+  // BE-byte mapping and the MAC LE-byte mapping select the same bit
+  // of the same wire for every j.
   typename LC::v256 e_digest_v256_mac;
   for (size_t j = 0; j < 256; ++j) {
     size_t le_byte_idx = j / 8;
