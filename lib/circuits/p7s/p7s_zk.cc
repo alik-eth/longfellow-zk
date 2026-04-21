@@ -1642,10 +1642,19 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // Range sanity: subject_dn_start must precede subject_sn (the
   // in-circuit check enforces strict inequality, but reject negatives
   // and obvious offset scrambles at parse time too).
-  if (out.subject_dn_start_offset_in_tbs >= out.subject_sn_offset_in_tbs) {
-    return false;
+  //
+  // Gated by `skip_host_anchors` so the test-only bypass FFI entry
+  // (`p7s_prove_test_bypass_host_anchors`) can exercise the in-circuit
+  // `lc.assert1(lc.vlt(subject_dn_start_offset, subject_sn_offset))`
+  // as the sole enforcement layer — without this gate the host check
+  // always trips first and the circuit-side assertion goes untested.
+  // (Task #41 bypass-gated companion for invariant_7 test N1.)
+  if (!skip_host_anchors) {
+    if (out.subject_dn_start_offset_in_tbs >= out.subject_sn_offset_in_tbs) {
+      return false;
+    }
+    if (out.subject_dn_start_offset_in_tbs >= out.cert_tbs_len) return false;
   }
-  if (out.subject_dn_start_offset_in_tbs >= out.cert_tbs_len) return false;
   if (!read_u32(p, end, out.trust_anchor_index)) return false;
   // Task #36: bound check against the compile-time trust-anchor table
   // size. Matches the in-circuit `vlt(trust_anchor_index,
@@ -1653,7 +1662,14 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // at parse time surfaces P7S_INVALID_INPUT instead of an opaque
   // P7S_PROVER_FAILURE. For N=1 this collapses to `index != 0`, but
   // the formulation below stays correct as the table grows.
-  if (out.trust_anchor_index >= kTrustAnchorCount) return false;
+  //
+  // Gated by `skip_host_anchors` so the bypass FFI entry can exercise
+  // the in-circuit `lc.assert1(lc.vlt(trust_anchor_index,
+  // kTrustAnchorCount))` as the sole enforcement layer.
+  // (Task #42 N3 bypass-gated trust_anchor test.)
+  if (!skip_host_anchors) {
+    if (out.trust_anchor_index >= kTrustAnchorCount) return false;
+  }
 
   // Belt-and-suspenders: 9-byte X.520 serialNumber DER anchor at the
   // witnessed offset. Gated by `skip_host_anchors` for parity with the
@@ -1830,6 +1846,14 @@ static P7sErrorCode p7s_prove_impl(
                           skip_host_anchors)) {
     return P7S_INVALID_INPUT;
   }
+  // Safety guard: even in bypass mode, an out-of-range trust_anchor_index
+  // must not reach the `kTrustAnchors[wit.trust_anchor_index]` array
+  // access below (line ~1923) — that would be undefined behaviour. Return
+  // P7S_PROVER_FAILURE (not P7S_INVALID_INPUT) to match the observable
+  // signal of the in-circuit `lc.assert1(lc.vlt(trust_anchor_index,
+  // kTrustAnchorCount))` for bypass-gated tests. In production,
+  // `parse_witness_blob` already rejects out-of-range before this.
+  if (wit.trust_anchor_index >= kTrustAnchorCount) return P7S_PROVER_FAILURE;
   ParsedPublic pub{};
   if (!parse_public_blob(public_blob, public_blob_len, pub)) {
     return P7S_INVALID_INPUT;

@@ -184,6 +184,23 @@ constexpr size_t kTrustAnchorCount =
 static_assert(kTrustAnchorCount >= 1,
               "kTrustAnchors must contain at least one entry");
 
+// Forward plan for N>1 multiplexing (Task #44 / submodule 0431d42):
+// When additional QTSPs are added to `kTrustAnchors[]`, the sig
+// circuit's current "always entry 0" path must be replaced by a
+// Lagrange/barrel-shift multiplexer over `trust_anchor_index`.
+// Concrete steps:
+//   1. For each new anchor: append to `kTrustAnchors[]` and the
+//      host-side `TRUST_ANCHOR_PROBES` list in parser.rs (keeping
+//      both order-aligned).
+//   2. Replace the hardcoded `kTrustAnchors[0]` dereference in
+//      p7s_zk.cc's sig-circuit build path with a runtime mux
+//      conditional on the public `trust_anchor_index` wire.
+//   3. Add a fixture for each new anchor (Task #37 follow-up) and
+//      extend `trust_anchor.rs` tests to cover non-zero indices.
+// The in-circuit `vlt(trust_anchor_index, kTrustAnchorCount)` and
+// host-side `parse_witness_blob` bound check are already wired and
+// stay correct as the table grows — no structural change needed.
+
 // Bit-width of the `trust_anchor_index` wire the hash circuit reads
 // from the public blob. 32 is overkill for small N but matches the
 // `u32 trust_anchor_index` in the v11 public blob layout and gives
