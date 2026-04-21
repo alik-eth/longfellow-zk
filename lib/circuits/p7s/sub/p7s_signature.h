@@ -34,11 +34,16 @@
 //   (E) holder_pk_x cross-binds to cert_tbs SPKI X bytes    (hash side)
 //   (F) holder_pk_y cross-binds to cert_tbs SPKI Y bytes    (hash side)
 //
-// `root_pk` is a compile-time constant baked into the strings below
-// (DIIA QTSP 2311, not a public input). `holder_pk_x` / `holder_pk_y`
-// are PRIVATE Fp256Base EltW inputs in the sig circuit, bound to the
-// hash circuit's cert_tbs SPKI bytes via MAC. Total bound messages =
-// 4 (e, e2, SPKI_X, SPKI_Y); total MAC values = 8 (2 per message).
+// `root_pk` is selected from a compile-time TrustAnchor[] table (see
+// `kTrustAnchors` below) by the witness-driven `trust_anchor_index`
+// public input. Phase 2b ships with N=1 (DIIA only) and a trivial
+// "always entry 0" sig-side lookup; the hash circuit asserts the
+// witnessed index is in range (`< kTrustAnchorCount`) for forward-
+// compat, and real multi-entry multiplexing lands once Task #37 adds
+// non-DIIA fixtures. `holder_pk_x` / `holder_pk_y` are PRIVATE
+// Fp256Base EltW inputs in the sig circuit, bound to the hash
+// circuit's cert_tbs SPKI bytes via MAC. Total bound messages = 4
+// (e, e2, SPKI_X, SPKI_Y); total MAC values = 8 (2 per message).
 //
 // Rationale for the MAC step remains the same as 25a: the ECDSA
 // VerifyCircuit operates over Fp256Base, but the SHA-256 computations
@@ -51,6 +56,7 @@
 
 #include <cstddef>
 
+#include "algebra/static_string.h"
 #include "circuits/ecdsa/verify_circuit.h"
 #include "circuits/logic/bit_plucker.h"
 #include "circuits/mac/mac_circuit.h"
@@ -95,8 +101,8 @@ constexpr size_t kTotalMacValues =
 // 32-byte digest without having to recompute 32.
 constexpr size_t kMacMessageBytes = 32;
 
-// DIIA QTSP 2311 root public key — the trust anchor the signer cert's
-// ECDSA signature is verified against. Extracted from the official
+// DIIA QTSP 2311 root public key — the first entry in the
+// TrustAnchor table below. Extracted from the official
 // `diia-qtsp-2311.der` certificate (Ukrainian Trust List, Nov 2023).
 // SEC1 uncompressed point hex:
 //   0x04
@@ -111,6 +117,69 @@ constexpr char kDiiaRootPkX_decimal[] =
 constexpr char kDiiaRootPkY_decimal[] =
     "47864305589267125428873492369100630325836418204952516382052455720647888924"
     "176";
+
+// ===========================================================================
+// Trust-anchor table (Task 36). Compile-time array of ETSI-compliant
+// QTSP root pubkeys. The witness-driven `trust_anchor_index` (a v32
+// public-input wire on the hash side) selects which row the sig
+// circuit's cert-sig ECDSA verifies under. Phase 2b ships with N=1
+// (DIIA only) and a trivial "pick entry 0" path on the sig side; real
+// multiplexing lands in Task #37 when additional fixtures arrive.
+//
+// All current anchors share:
+//   * P-256 (prime256v1) curve — prime256v1 OID baked into the 26-byte
+//     DIIA SPKI DER prefix the hash circuit asserts on cert_tbs.
+//   * SEC1 uncompressed SubjectPublicKeyInfo layout.
+//   * ETSI EN 319 411 QCP-n-qscd issuance policy (implied by SPKI
+//     shape; not directly asserted in-circuit).
+//
+// If a future anchor uses a different curve / algorithm identifier,
+// the 26-byte SPKI prefix anchor at `kSpkiDiaP256Prefix` has to
+// become per-entry (flagged as Task #36.0 follow-up). For the current
+// table every entry is P-256, so the anchor stays universal.
+struct TrustAnchor {
+  // Compile-time decimal representations of the root public key.
+  // Wrapped in `StaticString` so `FpGeneric::of_string` can consume
+  // them via its non-templated overload (the templated
+  // `of_string(const char (&)[N])` needs an array type and wouldn't
+  // deduce N from a field access path).
+  StaticString root_pk_x_decimal;
+  StaticString root_pk_y_decimal;
+
+  // Human-readable metadata for diagnostics / logging. Never consumed
+  // by the circuit.
+  const char* name;
+};
+
+// `const` (not `constexpr`) because `StaticString`'s constructor isn't
+// constexpr in the upstream header — runtime-initialized at process
+// start, indexed by value like a const lookup table. `kTrustAnchorCount`
+// stays `constexpr` because `sizeof` is compile-time.
+inline const TrustAnchor kTrustAnchors[] = {
+    // Index 0 — DIIA QTSP 2311 (Ukrainian state trust list, Nov 2023).
+    {
+        StaticString(kDiiaRootPkX_decimal),
+        StaticString(kDiiaRootPkY_decimal),
+        "DIIA QTSP 2311 (Ukraine)",
+    },
+    // Future QTSP entries appended here (Task #37 — fixture-gated).
+};
+
+constexpr size_t kTrustAnchorCount =
+    sizeof(kTrustAnchors) / sizeof(TrustAnchor);
+
+// Sanity: the table must be non-empty, or the circuit has no anchor
+// to verify against. Any refactor that zeroed the table would fail
+// this at compile time.
+static_assert(kTrustAnchorCount >= 1,
+              "kTrustAnchors must contain at least one entry");
+
+// Bit-width of the `trust_anchor_index` wire the hash circuit reads
+// from the public blob. 32 is overkill for small N but matches the
+// `u32 trust_anchor_index` in the v11 public blob layout and gives
+// room for the foreseeable future. Any change requires bumping the
+// host-side `kHashPubTrustAnchorIdx` and re-checking the blob layout.
+constexpr size_t kTrustAnchorIndexBits = 32;
 
 // Sig-circuit gadget — the Fp256Base half of the cross-field MAC,
 // plus the ECDSA verifications. Mirrors the shape of `MdocSignature`:

@@ -149,9 +149,22 @@
 //                                                     DIIA — feeds the
 //                                                     dual-match range
 //                                                     check).
-//                    `trust_anchor_index`              placeholder (0);
-//                                                     Task #36 wires
-//                                                     real selection.
+//                    `trust_anchor_index`              selects which
+//                                                     kTrustAnchors[]
+//                                                     entry the sig
+//                                                     circuit's cert-
+//                                                     sig ECDSA runs
+//                                                     under. #34 left
+//                                                     this as a
+//                                                     placeholder;
+//                                                     #36 activated
+//                                                     it with an
+//                                                     in-circuit
+//                                                     `vlt(index,
+//                                                      kTrustAnchorCount)`
+//                                                     bound check +
+//                                                     host-side
+//                                                     mirror.
 //                  The public blob gains `nullifier[32]` +
 //                  `trust_anchor_index u32`. Hash-circuit public inputs
 //                  grow by 32×v8 (nullifier) + v32 (trust_anchor_index)
@@ -175,7 +188,8 @@
 //     Witness blob extends v10 with:
 //       u32 subject_sn_offset_in_tbs
 //       u32 subject_dn_start_offset_in_tbs
-//       u32 trust_anchor_index       (placeholder 0)
+//       u32 trust_anchor_index       (bound-checked against
+//                                     kTrustAnchorCount by Task #36)
 //     Public blob extends v10 with:
 //       u8  nullifier[32]
 //       u32 trust_anchor_index
@@ -416,10 +430,12 @@ constexpr uint32_t kBlobSchemaVersion = 11;
 // Hash-circuit public-input layout (v11). v11 (Task 34) adds two new
 // public inputs between nonce_bytes and the MAC region: a 256-bit
 // `nullifier` output (32 × v8) and a 32-bit `trust_anchor_index`
-// placeholder (v32 — read from the public blob but NOT constrained by
-// the v11 circuit; Task #36 activates real selection). MAC-region
-// position shifts by their combined width; kHashMacIndex is still
-// derived from kHashPubPreMac so every downstream index is correct.
+// (v32). Task 36 activated the trust_anchor_index with an in-circuit
+// `vlt(index, kTrustAnchorCount)` bound check against the compile-
+// time `kTrustAnchors[]` table defined in sub/p7s_signature.h.
+// MAC-region position shifts by their combined width; kHashMacIndex
+// is still derived from kHashPubPreMac so every downstream index is
+// correct.
 //
 //   [0]                              = const 1
 //   [1 .. 1 + 256)                   = context_hash v256
@@ -554,13 +570,24 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // order consistent with the circuit's `assert_message_hash`.
   auto nullifier = lc.template vinput<256>();
 
-  // v11 / Task 34: trust_anchor_index placeholder (v32). The public
-  // blob carries a u32 selecting which entry of a trust-anchor table
-  // the sig circuit's ECDSA should verify under. v11 is DIIA-only so
-  // this is unused; Task #36 activates real selection. Declared as a
-  // public wire so the blob shape stays stable across #34 → #36.
+  // v11 / Task 34 + activated in Task 36: trust_anchor_index (v32).
+  // The public blob carries a u32 selecting which entry of the
+  // compile-time `kTrustAnchors[]` table the sig circuit's cert-sig
+  // ECDSA verifies under. Phase 2b ships with kTrustAnchorCount = 1
+  // (DIIA only), so the in-circuit range check degenerates to
+  // "index < 1" — a strict all-bits-zero assertion. When Task #37
+  // adds non-DIIA anchors, bumping kTrustAnchorCount keeps the
+  // `vlt` constraint correct and the sig-side lookup grows into a
+  // real one-hot multiplexer.
   auto trust_anchor_index = lc.template vinput<kHashPubTrustAnchorIdx>();
-  (void)trust_anchor_index;  // suppress unused-variable in v11.
+  // In-circuit bound check: trust_anchor_index < kTrustAnchorCount.
+  // For the N=1 Phase 2b table this simplifies to every bit == 0;
+  // we use the generic `vlt` form so N>1 tables pass through the
+  // same constraint shape without refactoring. A prover passing
+  // any non-zero index (i.e. claiming verification under an anchor
+  // that doesn't exist in the table) fails this check.
+  lc.assert1(lc.vlt(trust_anchor_index,
+                    static_cast<uint64_t>(kTrustAnchorCount)));
 
   // Task 25a MAC inputs (native GF(2^128) EltW for each value).
   // In GF(2^128) a v128 is natively an EltW, so each MAC public input
@@ -1110,14 +1137,28 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   sig_witness.input(lc);
 
   // ---- Constraints ----
-  // Hardcoded DIIA QTSP 2311 root public key as base-field constants.
+  // Trust-anchor root public key as base-field constants. Phase 2b
+  // ships with kTrustAnchorCount == 1 (DIIA), so the sig circuit
+  // always picks entry 0 here — the hash circuit enforces the
+  // witness-driven `trust_anchor_index < kTrustAnchorCount` bound,
+  // and with N=1 the only in-range index is 0. When Task #37 adds
+  // non-DIIA entries, this lookup expands into a real multiplexer
+  // over `kTrustAnchors[0..N]` indexed by an additional sig-side
+  // public input (bit-decomposed mirror of the hash-side
+  // trust_anchor_index, cross-bound via the existing MAC gadget or
+  // a new message).
+  //
   // `of_string` returns Elts already in Montgomery form (fp_generic.h:
   // 329-336), so `lc.konst(...)` binds the right internal
   // representation directly.
+  static_assert(kTrustAnchorCount == 1,
+                "sig-side root-pk lookup is a single-entry shortcut; "
+                "Task #37 must replace this with a multiplexer over "
+                "kTrustAnchors[] when kTrustAnchorCount > 1");
   typename LC256::EltW root_pk_x =
-      lc.konst(p256_base.of_string(kDiiaRootPkX_decimal));
+      lc.konst(p256_base.of_string(kTrustAnchors[0].root_pk_x_decimal));
   typename LC256::EltW root_pk_y =
-      lc.konst(p256_base.of_string(kDiiaRootPkY_decimal));
+      lc.konst(p256_base.of_string(kTrustAnchors[0].root_pk_y_decimal));
 
   P7sSigCircuit sig_gadget(lc, p256, n256_order);
   // mac_pub layout (matches kMacMsgIdx*):
@@ -1414,8 +1455,14 @@ struct ParsedWitness {
   //                                  cert_tbs. 370 for both DIIA fixtures.
   //   subject_dn_start_offset_in_tbs offset of outer Subject DN SEQUENCE
   //                                  within cert_tbs. 294 for DIIA.
-  //   trust_anchor_index             v11 placeholder (0); Task #36 wires
-  //                                  real trust-anchor selection.
+  //   trust_anchor_index             selects which `kTrustAnchors[]`
+  //                                  entry the cert-sig ECDSA verifies
+  //                                  under. Activated by Task #36;
+  //                                  bound-checked against
+  //                                  kTrustAnchorCount both at parse
+  //                                  time and via an in-circuit
+  //                                  `vlt` assertion in
+  //                                  `build_hash_circuit`.
   uint32_t subject_sn_offset_in_tbs;
   uint32_t subject_dn_start_offset_in_tbs;
   uint32_t trust_anchor_index;
@@ -1600,9 +1647,13 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   }
   if (out.subject_dn_start_offset_in_tbs >= out.cert_tbs_len) return false;
   if (!read_u32(p, end, out.trust_anchor_index)) return false;
-  // v11 placeholder — Task #36 activates real selection and adds a
-  // bound check against the trust-anchor table size.
-  if (out.trust_anchor_index != 0) return false;
+  // Task #36: bound check against the compile-time trust-anchor table
+  // size. Matches the in-circuit `vlt(trust_anchor_index,
+  // kTrustAnchorCount)` constraint one-to-one; catching out-of-range
+  // at parse time surfaces P7S_INVALID_INPUT instead of an opaque
+  // P7S_PROVER_FAILURE. For N=1 this collapses to `index != 0`, but
+  // the formulation below stays correct as the table grows.
+  if (out.trust_anchor_index >= kTrustAnchorCount) return false;
 
   // Belt-and-suspenders: 9-byte X.520 serialNumber DER anchor at the
   // witnessed offset. Gated by `skip_host_anchors` for parity with the
@@ -1641,11 +1692,15 @@ bool parse_public_blob(const uint8_t* blob, size_t blob_len,
   std::memcpy(out.nonce, p, kNonceBytes);
   p += kNonceBytes;
 
-  // v11 (Task 34) — public nullifier output + trust-anchor placeholder.
+  // v11 (Task 34) — public nullifier output + trust_anchor_index
+  // (activated by Task #36; bound-checked to match the in-circuit
+  // `vlt(index, kTrustAnchorCount)` so verify-time rejects out-of-
+  // range values before re-deriving the hash public inputs).
   if (end - p < static_cast<ptrdiff_t>(kNullifierLen)) return false;
   std::memcpy(out.nullifier, p, kNullifierLen);
   p += kNullifierLen;
   if (!read_u32(p, end, out.trust_anchor_index)) return false;
+  if (out.trust_anchor_index >= kTrustAnchorCount) return false;
 
   if (p != end) return false;
   return true;
@@ -1669,8 +1724,10 @@ void fill_hash_public_inputs(DenseFiller<F>& filler, const ParsedPublic& pub,
   // `nullifier_v256_flatsha` view extracts from `nullifier_bytes[]`
   // via `(255 - j) / 8` / `j % 8`. Safe to reuse.
   push_target(filler, pub.nullifier, Fs);
-  // v11 (Task 34) — trust-anchor index (v32 LSB-first; currently
-  // unconstrained — Task #36 activates real selection).
+  // v11 (Task 34, activated by Task 36) — trust-anchor index
+  // (v32 LSB-first). Bound-checked in-circuit against
+  // `kTrustAnchorCount` via `vlt`; `push_uint` streams the u32 LSB-
+  // first into the 32 wires declared as `vinput<kHashPubTrustAnchorIdx>`.
   push_uint(filler, pub.trust_anchor_index, kHashPubTrustAnchorIdx, Fs);
 }
 
@@ -1840,9 +1897,18 @@ static P7sErrorCode p7s_prove_impl(
   Fp256Nat nr2 = nat_from_be<Fp256Nat>(wit.content_sig_r);
   Fp256Nat ns2 = nat_from_be<Fp256Nat>(wit.content_sig_s);
 
-  // DIIA root — compile-time constant, same as #29.
-  Fp256Base::Elt root_pkX = p256_base.of_string(kDiiaRootPkX_decimal);
-  Fp256Base::Elt root_pkY = p256_base.of_string(kDiiaRootPkY_decimal);
+  // Trust-anchor root — selected from the compile-time
+  // `kTrustAnchors[]` table by the witness-driven
+  // `wit.trust_anchor_index`. Parsed value is already bounds-checked
+  // in parse_witness_blob (`index < kTrustAnchorCount`), so the
+  // array indexing below is safe. Matches the sig circuit's
+  // compile-time pick of `kTrustAnchors[0]` for the N=1 Phase 2b
+  // table; extends into a real lookup when kTrustAnchorCount > 1.
+  const TrustAnchor& selected_anchor = kTrustAnchors[wit.trust_anchor_index];
+  Fp256Base::Elt root_pkX =
+      p256_base.of_string(selected_anchor.root_pk_x_decimal);
+  Fp256Base::Elt root_pkY =
+      p256_base.of_string(selected_anchor.root_pk_y_decimal);
 
   // Holder pk from the cert_tbs SPKI, NOT the JSON public blob.
   // The parser and parse_witness_blob already anchor-checked the
