@@ -4,8 +4,10 @@
 // value is now `e = SHA-256(cert_tbs)`, computed in the hash circuit
 // and derived on the sig side from the same 32 digest bytes. There is
 // nothing left to define in this translation unit; the class
-// `P7sSignature` lives entirely in the header, and the DIIA root pubkey
-// is a compile-time string constant wired directly via
+// `P7sSignature` lives entirely in the header, and the trust-anchor
+// root pubkey (TestAnchorA post-#43a; symbol names kept as
+// `kDiiaRootPk{X,Y}_decimal` to minimize cross-file churn) is a
+// compile-time string constant wired directly via
 // `p256_base.of_string(kDiiaRootPkX_decimal)` at circuit-build time.
 //
 // The file is kept (rather than deleted) so the CMakeLists.txt entry

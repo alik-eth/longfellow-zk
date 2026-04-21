@@ -7,19 +7,20 @@
 // via a cross-field MAC on a compile-time sentinel. Task 29 (25b)
 // replaced the sentinel with `e = SHA-256(cert_tbs)` and wired one
 // `ECDSA VerifyCircuit` around the MAC, proving "`(r1, s1)` is a valid
-// P-256 signature of `e` under the DIIA QTSP 2311 root public key AND
+// P-256 signature of `e` under the compile-time trust-anchor root pubkey
+// (DIIA QTSP 2311 at the time of Task 29; TestAnchorA post-#43a) AND
 // `e` equals the cross-circuit value the hash side committed to".
 //
 // Task 26 (invariant 2a, merged with former #30 SPKI binding) adds
 // the CMS content signature leg. The key that signed the content is
 // NOT the JSON-embedded wallet pubkey (invariant 4's pk, which is
 // secp256k1 for the Ethereum wallet being authorized) — it's the
-// holder's DIIA-issued P-256 signing key, embedded as the
+// holder's QTSP-issued P-256 signing key, embedded as the
 // SubjectPublicKeyInfo inside cert_tbs. Promoting that cert SPKI to
 // the public blob would leak holder identity (a privacy regression),
 // so instead we extract it from cert_tbs on the hash side (via a
 // byte-range route at a host-witnessed offset, anchored by a 26-byte
-// DIIA SPKI prefix assertion) and MAC-bind its X and Y coordinates
+// P-256 SPKI prefix assertion) and MAC-bind its X and Y coordinates
 // across the hash/sig field split as two additional messages. The
 // sig circuit consumes `holder_pk_x` and `holder_pk_y` as PRIVATE
 // EltW inputs, unpacked from the MAC witnesses — the same pattern
@@ -27,7 +28,7 @@
 //
 // The sig circuit now proves:
 //
-//   (A) (r1, s1) is valid ECDSA on `e`  under DIIA root_pk  (invariant 1)
+//   (A) (r1, s1) is valid ECDSA on `e`  under anchor root_pk (invariant 1)
 //   (B) (r2, s2) is valid ECDSA on `e2` under holder_pk     (invariant 2a)
 //   (C) `e`         cross-binds to SHA-256(cert_tbs)        (hash side)
 //   (D) `e2`        cross-binds to SHA-256(signedAttrs)     (hash side)
@@ -36,11 +37,11 @@
 //
 // `root_pk` is selected from a compile-time TrustAnchor[] table (see
 // `kTrustAnchors` below) by the witness-driven `trust_anchor_index`
-// public input. Phase 2b ships with N=1 (DIIA only) and a trivial
-// "always entry 0" sig-side lookup; the hash circuit asserts the
-// witnessed index is in range (`< kTrustAnchorCount`) for forward-
-// compat, and real multi-entry multiplexing lands once Task #37 adds
-// non-DIIA fixtures. `holder_pk_x` / `holder_pk_y` are PRIVATE
+// public input. Phase 2b ships with N=1 (TestAnchorA only post-#43a)
+// and a trivial "always entry 0" sig-side lookup; the hash circuit
+// asserts the witnessed index is in range (`< kTrustAnchorCount`) for
+// forward-compat, and real multi-entry multiplexing lands once Task
+// #37 adds non-DIIA fixtures. `holder_pk_x` / `holder_pk_y` are PRIVATE
 // Fp256Base EltW inputs in the sig circuit, bound to the hash
 // circuit's cert_tbs SPKI bytes via MAC. Total bound messages = 4
 // (e, e2, SPKI_X, SPKI_Y); total MAC values = 8 (2 per message).
@@ -129,20 +130,22 @@ constexpr char kDiiaRootPkY_decimal[] =
 // QTSP root pubkeys. The witness-driven `trust_anchor_index` (a v32
 // public-input wire on the hash side) selects which row the sig
 // circuit's cert-sig ECDSA verifies under. Phase 2b ships with N=1
-// (DIIA only) and a trivial "pick entry 0" path on the sig side; real
-// multiplexing lands in Task #37 when additional fixtures arrive.
+// (TestAnchorA only post-#43a) and a trivial "pick entry 0" path on
+// the sig side; real multiplexing lands in Task #37 when additional
+// fixtures arrive.
 //
 // All current anchors share:
 //   * P-256 (prime256v1) curve — prime256v1 OID baked into the 26-byte
-//     DIIA SPKI DER prefix the hash circuit asserts on cert_tbs.
+//     P-256 SPKI DER prefix the hash circuit asserts on cert_tbs.
 //   * SEC1 uncompressed SubjectPublicKeyInfo layout.
 //   * ETSI EN 319 411 QCP-n-qscd issuance policy (implied by SPKI
 //     shape; not directly asserted in-circuit).
 //
 // If a future anchor uses a different curve / algorithm identifier,
-// the 26-byte SPKI prefix anchor at `kSpkiDiaP256Prefix` has to
-// become per-entry (flagged as Task #36.0 follow-up). For the current
-// table every entry is P-256, so the anchor stays universal.
+// the 26-byte SPKI prefix anchor at `kSpkiDiaP256Prefix` (symbol name
+// retained post-#43a) has to become per-entry (flagged as Task #36.0
+// follow-up). For the current table every entry is P-256, so the
+// anchor stays universal.
 struct TrustAnchor {
   // Compile-time decimal representations of the root public key.
   // Wrapped in `StaticString` so `FpGeneric::of_string` can consume
@@ -212,7 +215,8 @@ constexpr size_t kTrustAnchorIndexBits = 32;
 // plus the ECDSA verifications. Mirrors the shape of `MdocSignature`:
 // mdoc binds 3 messages and verifies 2 signatures; p7s binds 2
 // messages (`e`, `e2`) and verifies 2 signatures (cert sig against
-// the DIIA root, content sig against the user's holder_pk).
+// the selected trust-anchor root, content sig against the user's
+// holder_pk).
 template <class LogicCircuit, class Field, class EC>
 class P7sSignature {
   using EltW = typename LogicCircuit::EltW;
@@ -254,7 +258,7 @@ class P7sSignature {
 
   // Task 26 (invariants 1 + 2a + SPKI binding combined): verify:
   //   (A) cert sig (r1, s1) on `msg_e  = SHA-256(cert_tbs)` under
-  //       the hardcoded DIIA root pk;
+  //       the selected trust-anchor root pk;
   //   (B) content sig (r2, s2) on `msg_e2 = SHA-256(signedAttrs)`
   //       under holder_pk (= cert_tbs SPKI, bound via MAC);
   //   (C) `msg_e`  cross-binds to the hash circuit's SHA(cert_tbs);
@@ -296,7 +300,7 @@ class P7sSignature {
                         const v128& av, const Witness& vw) const {
     Ecdsa ecc(lc_, ec_, order_);
 
-    // Invariant 1 — cert sig over e under the DIIA root.
+    // Invariant 1 — cert sig over e under the selected trust-anchor root.
     ecc.verify_signature3(root_pk_x, root_pk_y, msg_e, vw.ecdsa_cert_);
 
     // Invariant 2a — CMS content sig over e2 under the holder pk.

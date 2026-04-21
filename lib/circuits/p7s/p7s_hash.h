@@ -40,8 +40,8 @@ constexpr size_t kContextLenBits = 6;
 
 // v1 bound for signed_content SHA: 16 blocks × 64 bytes = 1024 bytes. The
 // minimum SHA padding overhead is 9 bytes (0x80 + 64-bit length), so the
-// longest representable signed_content is 1024 - 9 = 1015 bytes. The DIIA
-// fixture signed JSON is ~849 bytes — fits comfortably.
+// longest representable signed_content is 1024 - 9 = 1015 bytes. The
+// current QKB-format signed JSON is ~849 bytes — fits comfortably.
 constexpr size_t kSignedContentMaxBlocks = 16;
 constexpr size_t kSignedContentMaxBytes =
     kSignedContentMaxBlocks * 64;  // 1024

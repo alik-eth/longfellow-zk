@@ -46,11 +46,12 @@ typedef enum {
 //                       introduced alongside the existing hash-circuit
 //                       over GF(2^128), linked via a MAC gadget bound
 //                       to a non-zero sentinel.
-//   (29)  invariant 1 — DIIA signer-cert ECDSA signature verifies over
-//                       `cert_tbs` under the hardcoded DIIA QTSP 2311
-//                       root public key. Sentinel is gone; the MAC
-//                       now binds `e = SHA-256(cert_tbs)` across the
-//                       two fields.
+//   (29)  invariant 1 — signer-cert ECDSA signature verifies over
+//                       `cert_tbs` under the compile-time trust-anchor
+//                       root public key (TestAnchorA post-#43a;
+//                       selected out of `kTrustAnchors[]`). Sentinel
+//                       is gone; the MAC now binds
+//                       `e = SHA-256(cert_tbs)` across the two fields.
 //   (26) invariant 2a — CMS content signature verifies over the CAdES-
 //                       canonical signedAttrs (SET form, [0] IMPLICIT
 //                       0xA0 rewritten to 0x31) under the user's
@@ -90,8 +91,9 @@ typedef enum {
 //   u8   pk[65]                                     decoded SEC1 uncompressed
 //   u8   nonce[32]                                  decoded freshness nonce
 //
-// Note: the DIIA QTSP 2311 root public key is a COMPILE-TIME CONSTANT
-// baked into sub/p7s_signature.h — it is NOT part of the public blob.
+// Note: the trust-anchor root public key (TestAnchorA post-#43a) is a
+// COMPILE-TIME CONSTANT baked into sub/p7s_signature.h's
+// `kTrustAnchors[]` — it is NOT part of the public blob.
 // The USER holder public key (invariant-2a signer) IS part of the
 // public blob: it's the same `pub.pk[65]` that invariant 4 constrains
 // on the hash side, re-parsed on the host as Fp256Base (X, Y) and

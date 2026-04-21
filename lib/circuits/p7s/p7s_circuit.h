@@ -18,7 +18,7 @@ namespace proofs {
 namespace p7s {
 
 // v1 bound on the signed_content slice copied into the witness. 1024
-// bytes covers current DIIA QKB payloads (~600 bytes) with headroom.
+// bytes covers current QKB-format payloads (~600 bytes) with headroom.
 constexpr size_t kMaxSignedContent = 1024;
 
 // Length of an uncompressed SEC1 secp256k1 public key as lowercase hex:
@@ -38,11 +38,11 @@ constexpr size_t kMessageDigestLen = 32;
 
 // ---- Invariant 1 (Task 29) — cert TBS + cert signature bounds ----
 //
-// The signer cert's TBSCertificate (the portion the DIIA root signs
-// over) is bounded by kCertTbsMaxBlocks SHA-256 blocks. 32 blocks ×
-// 64 bytes/block = 2048 bytes; minus the 9-byte MD padding floor that
-// leaves 2039 bytes of raw TBS headroom. Current DIIA QTSP certs are
-// ~1203 bytes TBS, so 32 blocks is comfortable (the fixture test
+// The signer cert's TBSCertificate (the portion the trust-anchor root
+// signs over) is bounded by kCertTbsMaxBlocks SHA-256 blocks. 32
+// blocks × 64 bytes/block = 2048 bytes; minus the 9-byte MD padding
+// floor that leaves 2039 bytes of raw TBS headroom. Current QTSP certs
+// are ~1203 bytes TBS, so 32 blocks is comfortable (the fixture test
 // verifies the exact offset).
 constexpr size_t kCertTbsMaxBlocks = 32;
 constexpr size_t kCertTbsMaxBytes = kCertTbsMaxBlocks * 64;  // 2048
@@ -57,10 +57,10 @@ constexpr size_t kCertTbsDigestLen = 32;
 // The CAdES-BES signedAttrs SET (with [0] IMPLICIT tag 0xA0 rewritten
 // to 0x31 before SHA-256) is bounded by kSignedAttrsMaxBlocks SHA-256
 // blocks. 24 blocks × 64 = 1536 bytes; minus the 9-byte MD padding
-// floor that leaves 1527 bytes of raw signedAttrs headroom. The DIIA
-// fixture's signedAttrs is ~1387 bytes (dominated by the embedded
-// signingCertificateV2 ESSCertIDv2 + signed timestamp). 24 blocks
-// gives ~140 bytes of headroom over that fixture; any real-world
+// floor that leaves 1527 bytes of raw signedAttrs headroom. The
+// current fixture's signedAttrs is ~1387 bytes (dominated by the
+// embedded signingCertificateV2 ESSCertIDv2 + signed timestamp). 24
+// blocks gives ~140 bytes of headroom over that fixture; any real-world
 // signedAttrs that exceeds kSignedAttrsMaxRaw means the prover layer
 // (Rust host) must fail cleanly rather than truncate, and this
 // constant needs a bump.
@@ -75,7 +75,7 @@ constexpr size_t kSignedAttrsDigestLen = 32;
 
 // ---- SPKI binding (Task 26, merged with #30) ----
 //
-// cert_tbs embeds a DIIA P-256 SubjectPublicKeyInfo: 26 bytes of fixed
+// cert_tbs embeds a P-256 SubjectPublicKeyInfo: 26 bytes of fixed
 // DER prefix + a 65-byte SEC1 uncompressed point (0x04 || X[32] ||
 // Y[32]). The 65-byte point IS the holder's signing pubkey — the same
 // key that produced the CMS content signature. We extract it from
@@ -88,7 +88,7 @@ constexpr size_t kSignedAttrsDigestLen = 32;
 // UNCHANGED — cert SPKI never leaks outside the proof (holder
 // identity privacy).
 //
-// Prefix literal (constant per DIIA QTSP 2311 certs):
+// Prefix literal (constant for any P-256 `id-ecPublicKey` SPKI):
 //   30 59           SPKI SEQUENCE hdr (l=89)
 //   30 13           AlgId SEQUENCE hdr (l=19)
 //   06 07 2a 86 48 ce 3d 02 01          OID id-ecPublicKey

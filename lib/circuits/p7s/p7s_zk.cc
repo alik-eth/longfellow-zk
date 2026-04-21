@@ -12,8 +12,9 @@
 //   (10) signed_content[decl_offset..+510] == kDeclarationPhrase — Task 23
 //   (2b) message_digest == SHA-256(signed_content)              — Task 24
 //  (25a) cross-field MAC plumbing (sentinel)                     — Task 25
-//   (1)  DIIA signer-cert ECDSA signature verifies over cert_tbs — Task 29
-//        under the hardcoded DIIA QTSP 2311 root pubkey,
+//   (1)  signer-cert ECDSA signature verifies over cert_tbs — Task 29
+//        under the compile-time trust-anchor root pubkey (TestAnchorA
+//        post-#43a; kTrustAnchors[0] in the submodule table),
 //        with `e = SHA-256(cert_tbs)` MAC-bound across hash/sig
 //        circuits (replaces the 25a sentinel).
 //   (2a) CMS content signature verifies over signedAttrs         — Task 26
@@ -34,7 +35,7 @@
 //        DER anchor on cert_tbs[subject_sn_offset..+9] + range
 //        check `subject_sn_offset > subject_dn_start_offset`
 //        (guards against the Issuer DN's serialNumber which has
-//        an identical 9-byte anchor — DIIA QTSP reg code). New
+//        an identical 9-byte anchor — same X.520 ATV shape). New
 //        256-bit public output `nullifier`.
 //
 // -----------------------------------------------------------------------------
@@ -141,12 +142,13 @@
 //                    `subject_sn_offset_in_tbs`        offset of 9-byte
 //                                                     DER anchor in
 //                                                     cert_tbs (370 for
-//                                                     DIIA fixtures).
+//                                                     current fixtures).
 //                    `subject_dn_start_offset_in_tbs`  offset of outer
 //                                                     Subject DN
 //                                                     SEQUENCE in
 //                                                     cert_tbs (294 for
-//                                                     DIIA — feeds the
+//                                                     current fixtures
+//                                                     — feeds the
 //                                                     dual-match range
 //                                                     check).
 //                    `trust_anchor_index`              selects which
@@ -172,8 +174,8 @@
 //                  indexing shifts by 288 bits.
 //                  Dual-match protection: the 9-byte DER anchor appears
 //                  at BOTH the subject DN serialNumber AND the issuer
-//                  DN serialNumber (DIIA's QTSP registration code
-//                  `UA-43395033-2311` fits the same ATV shape). The
+//                  DN serialNumber (both attributes share the same
+//                  X.520 ATV shape). The
 //                  in-circuit range check
 //                  `subject_sn_offset_in_tbs >
 //                   subject_dn_start_offset_in_tbs`
@@ -215,10 +217,12 @@
 //       u32  signed_attrs_md_offset   offset of messageDigest Attribute
 //                                     SEQUENCE tag (0x30) WITHIN
 //                                     signed_attrs (= md_value_offset - 17).
-//                                     Host-witnessed — both DIIA
-//                                     fixtures measure 60 but DIIA's
-//                                     BER (non-canonical) ordering is
-//                                     an implementation choice.
+//                                     Host-witnessed — current
+//                                     fixtures measure 60 but the
+//                                     underlying BER ordering is an
+//                                     implementation choice of the
+//                                     signer, not a canonical form,
+//                                     so a re-issuance could shift it.
 //     Public blob unchanged from v9. Transcript seed "p7s-31-hash".
 //
 //   v9 (Task 26): CMS content signature over signedAttrs — invariant 2a.
@@ -323,7 +327,7 @@ using CertTbsShaBw = CertTbsHash::ShaBlockWitness;
 using SignedAttrsShaBw = SignedAttrsHash::ShaBlockWitness;
 using NullifierShaBw = NullifierHash::ShaBlockWitness;  // v11 (Task 34)
 
-// 26-byte DIIA P-256 SPKI DER prefix — kept in both the host parser
+// 26-byte P-256 SPKI DER prefix — kept in both the host parser
 // (`crates/zk-eidas-p7s/src/parser.rs`) and the hash circuit's
 // anchor assertion. Any change requires updating both sites.
 constexpr uint8_t kSpkiDiaP256Prefix[kSpkiPrefixLen] = {
@@ -337,9 +341,10 @@ constexpr uint8_t kSpkiDiaP256Prefix[kSpkiPrefixLen] = {
                                                    //                unused=0)
 };
 
-// 9-byte X.520 serialNumber attribute DER prefix for DIIA's 16-byte
-// RNOKPP stable-ID. Attribute SEQUENCE hdr (l=23) + OID 2.5.4.5 +
-// PrintableString hdr (l=16). Asserted on-wire at
+// 9-byte X.520 serialNumber attribute DER prefix for a 16-byte
+// stable-ID (DIIA RNOKPP format: `TINUA-` + 10 digits, which the v1
+// lengths are dimensioned for). Attribute SEQUENCE hdr (l=23) + OID
+// 2.5.4.5 + PrintableString hdr (l=16). Asserted on-wire at
 // `cert_tbs[subject_sn_offset..+9]`. Mirrored in
 // `crates/zk-eidas-p7s/src/parser.rs`'s `X520_SUBJECT_SN_ANCHOR`.
 // Any change requires updating both sites. v1 fixes lengths at 23/16;
@@ -476,8 +481,9 @@ constexpr size_t kHashMacIndex = kHashPubPreMac;
 // Sig-circuit public-input layout (v9). Holder pk is NOT in the public
 // blob (privacy: leaking cert SPKI would deanonymize the holder).
 // It enters as a PRIVATE EltW pair in the sig witness, bound to the
-// hash-side cert_tbs SPKI bytes via the MAC gadget. DIIA root public
-// key remains a compile-time `lc.konst(...)`.
+// hash-side cert_tbs SPKI bytes via the MAC gadget. The trust-anchor
+// root public key remains a compile-time `lc.konst(...)` (indexed out
+// of `kTrustAnchors[]` by the witnessed `trust_anchor_index`).
 //
 //   [0]                              = const 1 (auto-allocated wire 0)
 //   [1 .. 1 + 128)                   = mac values[0] as v128 (mac_e[0])
@@ -524,7 +530,7 @@ constexpr size_t kSigMacIndex = kSigPubConst;  // 1
 //     `e2_digest_bytes`.
 //   * Constraint (SPKI extraction): `Routing::shift` a 91-byte window
 //     over cert_tbs at `cert_tbs_spki_offset`; assert the first 26
-//     bytes match the fixed DIIA P-256 SPKI DER prefix; assert byte
+//     bytes match the fixed P-256 SPKI DER prefix; assert byte
 //     26 is `0x04` (SEC1 uncompressed). The X coordinate is bytes
 //     [27..59] (BE), Y is [59..91] (BE).
 //   * MAC-bound messages grow to FOUR: `e`, `e2`, cert SPKI X, cert
@@ -574,11 +580,11 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // The public blob carries a u32 selecting which entry of the
   // compile-time `kTrustAnchors[]` table the sig circuit's cert-sig
   // ECDSA verifies under. Phase 2b ships with kTrustAnchorCount = 1
-  // (DIIA only), so the in-circuit range check degenerates to
-  // "index < 1" — a strict all-bits-zero assertion. When Task #37
-  // adds non-DIIA anchors, bumping kTrustAnchorCount keeps the
-  // `vlt` constraint correct and the sig-side lookup grows into a
-  // real one-hot multiplexer.
+  // (TestAnchorA only post-#43a), so the in-circuit range check
+  // degenerates to "index < 1" — a strict all-bits-zero assertion.
+  // When Task #37 adds non-DIIA anchors, bumping kTrustAnchorCount
+  // keeps the `vlt` constraint correct and the sig-side lookup grows
+  // into a real one-hot multiplexer.
   auto trust_anchor_index = lc.template vinput<kHashPubTrustAnchorIdx>();
   // In-circuit bound check: trust_anchor_index < kTrustAnchorCount.
   // For the N=1 Phase 2b table this simplifies to every bit == 0;
@@ -664,8 +670,8 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // carries per-block intermediate SHA witness values.
   auto cert_tbs_numb = lc.template vinput<8>();
   // Task 26 — offset of the SPKI SEQUENCE (0x30) within cert_tbs.
-  // Host-witnessed (not compile-time stable across DIIA holders —
-  // see handoff-30 §3.2). Bit-width matches kCertTbsMaxBytes so
+  // Host-witnessed (not compile-time stable across holders — see
+  // handoff-30 §3.2). Bit-width matches kCertTbsMaxBytes so
   // the offset covers [0, 2047]. Kept adjacent to cert_tbs_numb so
   // "all cert_tbs metadata" lives in one place.
   auto cert_tbs_spki_offset = lc.template vinput<kCertTbsLenBits>();
@@ -706,9 +712,10 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // unavailable without the private key.
   auto signed_attrs_numb = lc.template vinput<8>();
   // Task 31 — offset of the messageDigest Attribute SEQUENCE (0x30)
-  // within signed_attrs. Host-witnessed (DIIA's BER ordering is an
-  // implementation choice; both fixtures happen to report 60 but a
-  // DIIA backend change would shift this — see handoff-31 §4.2).
+  // within signed_attrs. Host-witnessed (BER attribute ordering inside
+  // signedAttrs is an implementation choice of the signer, not a
+  // canonical form; both current fixtures happen to report 60 but a
+  // signer-side change could shift this — see handoff-31 §4.2).
   // Bit-width matches kSignedAttrsMaxBytes so the offset covers
   // [0, 2047]. Adjacent to signed_attrs_numb so "all signed_attrs
   // metadata" lives in one place.
@@ -731,10 +738,11 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // v11 / Task 34: invariant 7 private witnesses.
   //   subject_sn_offset     host-witnessed offset of the 9-byte X.520
   //                         serialNumber DER anchor within cert_tbs.
-  //                         370 for both DIIA fixtures.
+  //                         370 for current fixtures.
   //   subject_dn_start      host-witnessed offset of the outer Subject
-  //                         DN SEQUENCE within cert_tbs. 294 for DIIA.
-  //                         Feeds the dual-match range check.
+  //                         DN SEQUENCE within cert_tbs. 294 for
+  //                         current fixtures. Feeds the dual-match
+  //                         range check.
   //   nullifier_input_numb  SHA block count (= 1 since stable_id + ctx
   //                         always fits in one 64-byte block).
   //   nullifier_input[64]   host-padded SHA preimage
@@ -877,7 +885,7 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // NOT unique within signed_attrs — the nested
   // id-smime-aa-ets-contentTimestamp attribute wraps a TSA token
   // that contains its own messageDigest with the SAME 17-byte prefix
-  // (DIIA fixtures: offsets 60 AND 930). A prover could lie by
+  // (current fixtures: offsets 60 AND 930). A prover could lie by
   // witnessing the inner offset; the window[17..49] bytes there equal
   // the TSA's digest = SHA-256(real_content) in an honest p7s (TSA
   // timestamps the same content). So witnessing the inner offset
@@ -886,10 +894,10 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // prover needs SHA-256(fake) to equal one of those two specific
   // 32-byte blobs — a SHA-256 preimage attack on a chosen target, 2^256
   // work. Do NOT "strengthen" the anchor to include bytes outside the
-  // 17-byte fixed prefix: any longer anchor would encode
-  // DIIA-specific attribute ordering and break when DIIA changes its
-  // BER layout (see handoff-31 §6.3). SHA-256 preimage resistance is
-  // the correct foundation here.
+  // 17-byte fixed prefix: any longer anchor would encode a particular
+  // signer's attribute ordering and break on any signer-side BER layout
+  // change (see handoff-31 §6.3). SHA-256 preimage resistance is the
+  // correct foundation here.
   std::vector<typename LC::v8> sa_md_window(kSignedAttrsMdWindowLen);
   routing.template shift<typename LC::v8, kSignedAttrsLenBits>(
       signed_attrs_md_offset, kSignedAttrsMdWindowLen, sa_md_window.data(),
@@ -916,15 +924,15 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
 
   // Task 26 (merged with #30) — SPKI extraction from cert_tbs.
   // Route a 91-byte window starting at `cert_tbs_spki_offset`. The
-  // window must contain the 26-byte DIIA P-256 SPKI prefix followed
-  // by `0x04` (SEC1 uncompressed tag) at index 26, then 32 bytes of
+  // window must contain the 26-byte P-256 SPKI prefix followed by
+  // `0x04` (SEC1 uncompressed tag) at index 26, then 32 bytes of
   // X and 32 bytes of Y.
   std::vector<typename LC::v8> spki_window(kSpkiWindowLen);
   routing.template shift<typename LC::v8, kCertTbsLenBits>(
       cert_tbs_spki_offset, kSpkiWindowLen, spki_window.data(),
       kCertTbsMaxBytes, cert_tbs.data(), zz, /*unroll=*/3);
 
-  // Anchor: first 26 bytes MUST be the DIIA P-256 SPKI DER prefix.
+  // Anchor: first 26 bytes MUST be the P-256 SPKI DER prefix.
   // Without this the prover could point the shifter at an arbitrary
   // byte-match elsewhere in cert_tbs. The 0x04 SEC1 tag is pinned
   // implicitly because the prefix ends with `0x03 0x42 0x00` (BIT
@@ -984,10 +992,11 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
                  kSubjectSnAnchorLen);
 
   // Step 3: dual-match range check. The identical 9-byte anchor also
-  // appears at the ISSUER DN's serialNumber attribute (DIIA QTSP reg
-  // code `UA-43395033-2311` — same ATV shape). Without this check the
-  // prover could bind `nullifier` to the issuer's ID, trivially
-  // sharing a nullifier with every DIIA holder. Enforce
+  // appears at the ISSUER DN's serialNumber attribute (the issuer's
+  // registration code fits the same X.520 ATV shape). Without this
+  // check the prover could bind `nullifier` to the issuer's ID,
+  // trivially sharing a nullifier with every holder under this
+  // trust anchor. Enforce
   // `subject_sn_offset > subject_dn_start_offset` on-wire: the issuer
   // DN ends BEFORE the subject DN starts (they're serialized in
   // Issuer → Validity → Subject order), so any offset ≤
@@ -1096,8 +1105,8 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
 }
 
 // Sig-circuit builder — invariants 1 + 2a (Task 26). Verifies:
-//   (A) the DIIA signer cert's ECDSA signature against the hardcoded
-//       DIIA QTSP 2311 root public key over `e = SHA-256(cert_tbs)`;
+//   (A) the signer cert's ECDSA signature against the selected
+//       `kTrustAnchors[]` root public key over `e = SHA-256(cert_tbs)`;
 //   (B) the CMS content ECDSA signature against the user's
 //       holder_pk (public input) over `e2 = SHA-256(signedAttrs)`.
 // Both digests are MAC-bound to the hash circuit's SHA computations
@@ -1122,7 +1131,7 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   // as private Fp256Base EltWs. Binding to cert_tbs SPKI bytes on
   // the hash side is enforced by the per-message MAC gadget below
   // (messages 2 and 3). Making them private avoids leaking the
-  // holder's DIIA-issued signing key (privacy: a fixed cert would
+  // holder's QTSP-issued signing key (privacy: a fixed cert would
   // otherwise make holders individually identifiable across proofs).
   typename LC256::EltW holder_pk_x = lc.eltw_input();
   typename LC256::EltW holder_pk_y = lc.eltw_input();
@@ -1138,9 +1147,9 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
 
   // ---- Constraints ----
   // Trust-anchor root public key as base-field constants. Phase 2b
-  // ships with kTrustAnchorCount == 1 (DIIA), so the sig circuit
-  // always picks entry 0 here — the hash circuit enforces the
-  // witness-driven `trust_anchor_index < kTrustAnchorCount` bound,
+  // ships with kTrustAnchorCount == 1 (TestAnchorA post-#43a), so the
+  // sig circuit always picks entry 0 here — the hash circuit enforces
+  // the witness-driven `trust_anchor_index < kTrustAnchorCount` bound,
   // and with N=1 the only in-range index is 0. When Task #37 adds
   // non-DIIA entries, this lookup expands into a real multiplexer
   // over `kTrustAnchors[0..N]` indexed by an additional sig-side
@@ -1444,17 +1453,19 @@ struct ParsedWitness {
   // (0x30) WITHIN signed_attrs. The 32-byte digest VALUE sits at
   // `signed_attrs[signed_attrs_md_offset + 17 ..
   //              signed_attrs_md_offset + 49]`. Host-witnessed
-  // (DIIA's BER ordering is non-canonical; both fixtures measure 60
-  // but future DIIA re-issuance could shift it).
+  // (signedAttrs BER attribute ordering is not canonical; both
+  // current fixtures measure 60 but any signer-side re-issuance
+  // could shift it).
   uint32_t signed_attrs_md_offset;
   uint8_t signed_attrs[kSignedAttrsMaxBytes];
   uint8_t content_sig_r[32];
   uint8_t content_sig_s[32];
   // v11 (Task 34) — invariant 7 stable-ID extraction.
   //   subject_sn_offset_in_tbs       offset of 9-byte DER anchor within
-  //                                  cert_tbs. 370 for both DIIA fixtures.
+  //                                  cert_tbs. 370 for current fixtures.
   //   subject_dn_start_offset_in_tbs offset of outer Subject DN SEQUENCE
-  //                                  within cert_tbs. 294 for DIIA.
+  //                                  within cert_tbs. 294 for current
+  //                                  fixtures.
   //   trust_anchor_index             selects which `kTrustAnchors[]`
   //                                  entry the cert-sig ECDSA verifies
   //                                  under. Activated by Task #36;
@@ -1936,7 +1947,7 @@ static P7sErrorCode p7s_prove_impl(
 
   // Holder pk from the cert_tbs SPKI, NOT the JSON public blob.
   // The parser and parse_witness_blob already anchor-checked the
-  // 26-byte DIIA SPKI prefix at `cert_tbs_spki_offset`, and the
+  // 26-byte P-256 SPKI prefix at `cert_tbs_spki_offset`, and the
   // in-circuit SPKI extraction does the same on-wire; these offsets
   // are therefore trusted here.
   const size_t kSpkiXAbs =

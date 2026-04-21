@@ -1,10 +1,10 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
 // Defines the N=1 declaration whitelist used by invariant 10.
-// The text is verbatim ASCII from the DIIA QKB `"declaration"` JSON
+// The text is verbatim ASCII from the QKB `"declaration"` JSON
 // field (as present in both `binding.qkb.p7s` and
-// `admin-binding.qkb.p7s` fixtures). Any change here requires a
-// transcript-seed bump in p7s_zk.cc.
+// `admin-binding.qkb.p7s` synthetic fixtures post-#43a). Any change
+// here requires a transcript-seed bump in p7s_zk.cc.
 
 #include "sub/declaration_whitelist.h"
 

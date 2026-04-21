@@ -3,10 +3,11 @@
 // DeclarationWhitelist — invariant 10: the JSON "declaration" field inside
 // signed_content is one of a compile-time-fixed set of accepted phrases.
 //
-// v1 scope (N = 1): a single entry — the verbatim Ukrainian DIIA QKB
-// declaration text in English translation. The length is known at circuit
-// compile time (510 ASCII bytes, byte-counted with `wc -c` on the
-// `"declaration"` JSON value after stripping the trailing newline).
+// v1 scope (N = 1): a single entry — the canonical English holder
+// declaration text embedded in the synthetic QKB fixtures. The length
+// is known at circuit compile time (510 ASCII bytes, byte-counted with
+// `wc -c` on the `"declaration"` JSON value after stripping the
+// trailing newline).
 //
 // v2+ extension (documented, not implemented):
 //   To support N > 1, replace the single `assert_eq` call with an OR
