@@ -122,6 +122,44 @@ constexpr size_t kSignedAttrsMdPrefixLen = 17;
 constexpr size_t kSignedAttrsMdWindowLen =
     kSignedAttrsMdPrefixLen + kMessageDigestLen;  // 17 + 32 = 49
 
+// ---- Invariant 7 (Task 34) — nullifier from stable-ID ----
+//
+// The X.520 serialNumber attribute in cert_tbs's Subject DN carries
+// the holder's stable identifier (DIIA: `TINUA-` + 10-digit RNOKPP =
+// 16 bytes PrintableString). Invariant 7 routes a 9-byte DER anchor +
+// 16-byte value window from cert_tbs at `subject_sn_offset_in_tbs`,
+// asserts the anchor on-wire, range-checks
+// `subject_sn_offset_in_tbs > subject_dn_start_offset_in_tbs` (the
+// ISSUER DN's serialNumber attribute has the SAME 9-byte prefix —
+// the range check is the sole disambiguator, without it a prover
+// could bind the nullifier to the issuer's ID), and computes
+// `SHA-256(stable_id[16] || context_raw[..ctx_len])` as a new 256-bit
+// public output `nullifier`.
+//
+// Anchor literal:
+//   30 17                  Attribute SEQUENCE hdr (l=23)
+//   06 03 55 04 05         OID 2.5.4.5 (id-at-serialNumber)
+//   13 10                  PrintableString hdr (l=16)
+// 9 bytes total; stable-ID value follows at window[9..25].
+//
+// v1 limitation: stable-ID length is fixed at 16 bytes (DIIA RNOKPP).
+// Non-DIIA QTSPs with different lengths are deferred to Task #37.
+constexpr size_t kStableIdLen = 16;
+constexpr size_t kSubjectSnAnchorLen = 9;
+constexpr size_t kSubjectSnWindowLen =
+    kSubjectSnAnchorLen + kStableIdLen;  // 25
+
+// Nullifier SHA input is `stable_id[16] || context_raw[..ctx_len]`.
+// With kContextMaxBytes = 32 and the 9-byte SHA padding floor,
+// 16 + 32 + 9 = 57 < 64, so a SINGLE SHA-256 block holds the padded
+// preimage. The raw input length fits in 6 bits (max 48 bytes).
+constexpr size_t kNullifierShaBlocks = 1;
+constexpr size_t kNullifierShaMaxBytes = 64 * kNullifierShaBlocks;  // 64
+// log2 of the max raw-preimage byte length, rounded up. max raw =
+// kStableIdLen + kContextMaxBytes = 16 + 32 = 48; log2(48) → 6.
+constexpr size_t kNullifierShaLenBits = 6;
+constexpr size_t kNullifierLen = 32;                                // SHA-256
+
 }  // namespace p7s
 }  // namespace proofs
 

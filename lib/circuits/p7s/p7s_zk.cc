@@ -1,6 +1,6 @@
 // Copyright 2026 Oleksandr Vovkotrub. Apache-2.0.
 //
-// Phase 2a p7s circuit — blob protocol (schema v10).
+// Phase 2b p7s circuit — blob protocol (schema v11).
 //
 // Invariants enforced by the current circuit:
 //   (9)  context_hash == SHA-256(context_bytes)                 — Task 1b
@@ -28,6 +28,14 @@
 //        content signature actually attests to. Host-witnessed
 //        offset `signed_attrs_md_offset` + 17-byte CMS
 //        messageDigest DER anchor on-wire.
+//   (7)  nullifier == SHA-256(stable_id[16] || context_raw[..])  — Task 34
+//        where stable_id is the 16-byte X.520 serialNumber value
+//        (OID 2.5.4.5) embedded in cert_tbs's Subject DN. 9-byte
+//        DER anchor on cert_tbs[subject_sn_offset..+9] + range
+//        check `subject_sn_offset > subject_dn_start_offset`
+//        (guards against the Issuer DN's serialNumber which has
+//        an identical 9-byte anchor — DIIA QTSP reg code). New
+//        256-bit public output `nullifier`.
 //
 // -----------------------------------------------------------------------------
 // Blob protocol — schema history
@@ -121,6 +129,57 @@
 //                                   `e = SHA-256(cert_tbs)` (low+high)
 //       u8   hash_zk[...]           ZkProof<GF2_128>, self-delimited
 //       u8   sig_zk[...]            ZkProof<Fp256Base>, self-delimited
+//
+//   v11 (Task 34): nullifier from stable-ID — invariant 7. The 256-bit
+//                  public output `nullifier` is derived in-circuit as
+//                  `SHA-256(stable_id[16] || context_raw[..ctx_len])`,
+//                  where `stable_id` is the 16-byte value of the X.520
+//                  serialNumber attribute (OID 2.5.4.5) embedded in
+//                  cert_tbs's Subject DN (DIIA RNOKPP format: `TINUA-`
+//                  + 10 digits). Three new host-witnessed fields extend
+//                  the witness blob:
+//                    `subject_sn_offset_in_tbs`        offset of 9-byte
+//                                                     DER anchor in
+//                                                     cert_tbs (370 for
+//                                                     DIIA fixtures).
+//                    `subject_dn_start_offset_in_tbs`  offset of outer
+//                                                     Subject DN
+//                                                     SEQUENCE in
+//                                                     cert_tbs (294 for
+//                                                     DIIA — feeds the
+//                                                     dual-match range
+//                                                     check).
+//                    `trust_anchor_index`              placeholder (0);
+//                                                     Task #36 wires
+//                                                     real selection.
+//                  The public blob gains `nullifier[32]` +
+//                  `trust_anchor_index u32`. Hash-circuit public inputs
+//                  grow by 32×v8 (nullifier) + v32 (trust_anchor_index)
+//                  between `nonce_bytes` and the MAC region — MAC
+//                  indexing shifts by 288 bits.
+//                  Dual-match protection: the 9-byte DER anchor appears
+//                  at BOTH the subject DN serialNumber AND the issuer
+//                  DN serialNumber (DIIA's QTSP registration code
+//                  `UA-43395033-2311` fits the same ATV shape). The
+//                  in-circuit range check
+//                  `subject_sn_offset_in_tbs >
+//                   subject_dn_start_offset_in_tbs`
+//                  rejects any offset pointing before the subject DN,
+//                  which includes the entire issuer DN block. Without
+//                  this check a prover could bind `nullifier` to the
+//                  issuer's stable ID — defeating the anti-replay
+//                  guarantee.
+//                  v1 constraint: stable-ID length is fixed at 16
+//                  bytes (DIIA RNOKPP). Non-DIIA QTSPs with different
+//                  lengths deferred to Task #37.
+//     Witness blob extends v10 with:
+//       u32 subject_sn_offset_in_tbs
+//       u32 subject_dn_start_offset_in_tbs
+//       u32 trust_anchor_index       (placeholder 0)
+//     Public blob extends v10 with:
+//       u8  nullifier[32]
+//       u32 trust_anchor_index
+//     Transcript seed "p7s-7-hash".
 //
 //   v10 (Task 31): messageDigest binding — invariant 2c. The 32-byte
 //                  OCTET STRING value of the CMS messageDigest
@@ -240,6 +299,7 @@ using ContextHash = P7sHash<LC, kContextMaxBlocks>;
 using SignedContentHash = P7sHash<LC, kSignedContentMaxBlocks>;
 using CertTbsHash = P7sHash<LC, kCertTbsMaxBlocks>;
 using SignedAttrsHash = P7sHash<LC, kSignedAttrsMaxBlocks>;
+using NullifierHash = P7sHash<LC, kNullifierShaBlocks>;  // v11 (Task 34)
 using ByteRangeEqC = ByteRangeEq<LC>;
 using HexDecodeC = HexDecode<LC>;
 using RoutingC = Routing<LC>;
@@ -247,6 +307,7 @@ using ContextShaBw = ContextHash::ShaBlockWitness;
 using SignedContentShaBw = SignedContentHash::ShaBlockWitness;
 using CertTbsShaBw = CertTbsHash::ShaBlockWitness;
 using SignedAttrsShaBw = SignedAttrsHash::ShaBlockWitness;
+using NullifierShaBw = NullifierHash::ShaBlockWitness;  // v11 (Task 34)
 
 // 26-byte DIIA P-256 SPKI DER prefix — kept in both the host parser
 // (`crates/zk-eidas-p7s/src/parser.rs`) and the hash circuit's
@@ -260,6 +321,19 @@ constexpr uint8_t kSpkiDiaP256Prefix[kSpkiPrefixLen] = {
     0x03, 0x01, 0x07,
     0x03, 0x42, 0x00,                              // BIT STRING hdr (l=66,
                                                    //                unused=0)
+};
+
+// 9-byte X.520 serialNumber attribute DER prefix for DIIA's 16-byte
+// RNOKPP stable-ID. Attribute SEQUENCE hdr (l=23) + OID 2.5.4.5 +
+// PrintableString hdr (l=16). Asserted on-wire at
+// `cert_tbs[subject_sn_offset..+9]`. Mirrored in
+// `crates/zk-eidas-p7s/src/parser.rs`'s `X520_SUBJECT_SN_ANCHOR`.
+// Any change requires updating both sites. v1 fixes lengths at 23/16;
+// non-DIIA QTSPs with variable lengths are Task #37.
+constexpr uint8_t kSubjectSnAnchor[kSubjectSnAnchorLen] = {
+    0x30, 0x17,                                    // ATV SEQUENCE (l=23)
+    0x06, 0x03, 0x55, 0x04, 0x05,                  // OID 2.5.4.5 (serialNumber)
+    0x13, 0x10,                                    // PrintableString (l=16)
 };
 
 // 17-byte CMS messageDigest attribute DER prefix (RFC 5652). Fixed for
@@ -311,16 +385,16 @@ static constexpr char kRootY[] =
 constexpr size_t kRate = 4;
 constexpr size_t kNreq = 189;
 
-// Transcript seed — bumped from "p7s-26-hash" to "p7s-31-hash" so proofs
-// minted under v9 (no messageDigest binding) cannot be misinterpreted
-// as v10 proofs. A SINGLE Transcript instance is used for hash commit,
+// Transcript seed — bumped from "p7s-31-hash" to "p7s-7-hash" so proofs
+// minted under v10 (no in-circuit nullifier) cannot be misinterpreted
+// as v11 proofs. A SINGLE Transcript instance is used for hash commit,
 // av sampling, and sig commit/prove; both circuits share the same seed
 // (mirrors mdoc, which uses one transcript with circuit-specific
 // processing keyed by the distinct circuit structures themselves). The
 // per-circuit seed below names the hash-side convention; the sig side
 // consumes the same Transcript instance directly (no second seed — if
 // that changes, bump both).
-constexpr char kHashTranscriptSeed[] = "p7s-31-hash";
+constexpr char kHashTranscriptSeed[] = "p7s-7-hash";
 constexpr size_t kHashTranscriptSeedLen = sizeof(kHashTranscriptSeed) - 1;
 
 constexpr size_t kShaBlockBytes = 64;
@@ -336,42 +410,43 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
               "kSignedContentLogN must equal log2(kMaxSignedContent)");
 
 // Blob schema version.
-constexpr uint32_t kBlobSchemaVersion = 10;
+constexpr uint32_t kBlobSchemaVersion = 11;
 
 // ===========================================================================
-// Hash-circuit public-input layout (v9). MAC positions are derived from
-// this layout so if any of these counts change, the MAC index updates
-// automatically (and the static_assert below keeps us honest). Only
-// the MAC region grows relative to v8 (kTotalMacValues 2 → 8); the
-// preceding public inputs are unchanged.
+// Hash-circuit public-input layout (v11). v11 (Task 34) adds two new
+// public inputs between nonce_bytes and the MAC region: a 256-bit
+// `nullifier` output (32 × v8) and a 32-bit `trust_anchor_index`
+// placeholder (v32 — read from the public blob but NOT constrained by
+// the v11 circuit; Task #36 activates real selection). MAC-region
+// position shifts by their combined width; kHashMacIndex is still
+// derived from kHashPubPreMac so every downstream index is correct.
 //
 //   [0]                              = const 1
 //   [1 .. 1 + 256)                   = context_hash v256
 //   [257 .. 257 + 520)               = pk_bytes (65 × v8)
 //   [777 .. 777 + 256)               = nonce_bytes (32 × v8)
-//   [1033 .. 1033 + kTotalMacValues) = mac values (EltW each; GF(2^128)
-//                                      native so v128 == EltW). Order:
-//                                      mac_e[2], mac_e2[2], mac_spki_x[2],
-//                                      mac_spki_y[2].
-//   [1033 + kTotalMacValues]         = av (EltW)
-//   npub_in_hash = 1033 + kTotalMacValues + 1 = 1042
-//
-// All of the above are `public`; the private witness starts at
-// npub_in_hash and is opaque to the MAC plumbing.
+//   [1033 .. 1033 + 256)             = nullifier_bytes (32 × v8)    ← v11
+//   [1289 .. 1289 + 32)              = trust_anchor_index v32       ← v11
+//   [1321 .. 1321 + kTotalMacValues) = mac values (EltW each).
+//   [1321 + kTotalMacValues]         = av (EltW)
+//   npub_in_hash = 1321 + kTotalMacValues + 1 = 1330
 constexpr size_t kHashPubConst = 1;
 constexpr size_t kHashPubContextHash = 256;
-constexpr size_t kHashPubPk = kPkBytes * 8;         // 520
-constexpr size_t kHashPubNonce = kNonceBytes * 8;   // 256
+constexpr size_t kHashPubPk = kPkBytes * 8;              // 520
+constexpr size_t kHashPubNonce = kNonceBytes * 8;        // 256
+constexpr size_t kHashPubNullifier = kNullifierLen * 8;  // 256
+constexpr size_t kHashPubTrustAnchorIdx = 32;            // v32 placeholder
 constexpr size_t kHashPubPreMac =
-    kHashPubConst + kHashPubContextHash + kHashPubPk + kHashPubNonce;
+    kHashPubConst + kHashPubContextHash + kHashPubPk + kHashPubNonce +
+    kHashPubNullifier + kHashPubTrustAnchorIdx;
 // Each hash-side MAC public input is 1 native EltW (GF2_128 is 128b
 // wide, and a v128 IS an EltW here). kTotalMacValues mac values +
 // 1 av = (kTotalMacValues + 1) EltW.
 constexpr size_t kHashMacInputWires = kTotalMacValues + 1;
 constexpr size_t kHashPubTotal = kHashPubPreMac + kHashMacInputWires;
-static_assert(kHashPubPreMac == 1033,
+static_assert(kHashPubPreMac == 1321,
               "layout drift — update kHashPubPreMac comment & index");
-static_assert(kHashPubTotal == 1042,
+static_assert(kHashPubTotal == 1330,
               "layout drift — update npub_in_hash comment");
 
 // Index (in the DENSE Wit array) where the hash MAC region begins.
@@ -469,6 +544,23 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   for (size_t i = 0; i < kNonceBytes; ++i) {
     nonce_bytes[i] = lc.template vinput<8>();
   }
+
+  // v11 / Task 34: invariant 7 public output — nullifier SHA target.
+  // Declared as a bit-decomposed v256 bitvec (same layout as
+  // `context_hash` at the invariant 9 target), which matches FlatSHA's
+  // big-endian-per-byte convention and avoids the byte-aligned wire
+  // shuffling `pk_bytes` needs. The Rust public-blob side stores the
+  // 32 bytes big-endian; `push_target` flips them into bit-per-wire
+  // order consistent with the circuit's `assert_message_hash`.
+  auto nullifier = lc.template vinput<256>();
+
+  // v11 / Task 34: trust_anchor_index placeholder (v32). The public
+  // blob carries a u32 selecting which entry of a trust-anchor table
+  // the sig circuit's ECDSA should verify under. v11 is DIIA-only so
+  // this is unused; Task #36 activates real selection. Declared as a
+  // public wire so the blob shape stays stable across #34 → #36.
+  auto trust_anchor_index = lc.template vinput<kHashPubTrustAnchorIdx>();
+  (void)trust_anchor_index;  // suppress unused-variable in v11.
 
   // Task 25a MAC inputs (native GF(2^128) EltW for each value).
   // In GF(2^128) a v128 is natively an EltW, so each MAC public input
@@ -607,6 +699,36 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   std::vector<typename LC::v8> e2_digest_bytes(kSignedAttrsDigestLen);
   for (size_t i = 0; i < kSignedAttrsDigestLen; ++i) {
     e2_digest_bytes[i] = lc.template vinput<8>();
+  }
+
+  // v11 / Task 34: invariant 7 private witnesses.
+  //   subject_sn_offset     host-witnessed offset of the 9-byte X.520
+  //                         serialNumber DER anchor within cert_tbs.
+  //                         370 for both DIIA fixtures.
+  //   subject_dn_start      host-witnessed offset of the outer Subject
+  //                         DN SEQUENCE within cert_tbs. 294 for DIIA.
+  //                         Feeds the dual-match range check.
+  //   nullifier_input_numb  SHA block count (= 1 since stable_id + ctx
+  //                         always fits in one 64-byte block).
+  //   nullifier_input[64]   host-padded SHA preimage
+  //                         `stable_id[16] || context_raw[..] || SHA_pad`.
+  //                         The circuit constrains bytes [0..16] to
+  //                         equal the routed stable_id window, bytes
+  //                         [16..16 + ctx_len] to equal context_in, and
+  //                         byte-length to equal 16 + ctx_len; SHA
+  //                         padding is trusted via FlatSHA's standard
+  //                         length-binding.
+  //   nullifier_input_bw[1] FlatSHA per-block intermediate witnesses.
+  auto subject_sn_offset = lc.template vinput<kCertTbsLenBits>();
+  auto subject_dn_start_offset = lc.template vinput<kCertTbsLenBits>();
+  auto nullifier_input_numb = lc.template vinput<8>();
+  std::vector<typename LC::v8> nullifier_input(kNullifierShaMaxBytes);
+  for (size_t i = 0; i < kNullifierShaMaxBytes; ++i) {
+    nullifier_input[i] = lc.template vinput<8>();
+  }
+  std::vector<NullifierShaBw> nullifier_input_bw(kNullifierShaBlocks);
+  for (size_t b = 0; b < kNullifierShaBlocks; ++b) {
+    nullifier_input_bw[b].input(lc);
   }
 
   // MAC witness (prover's `ap` halves). Four bound messages:
@@ -811,6 +933,100 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
     spki_x_v256_mac[j] = spki_window[kSpkiXStart + be_byte_idx][bit_idx];
     spki_y_v256_mac[j] = spki_window[kSpkiYStart + be_byte_idx][bit_idx];
   }
+
+  // Task 34 / invariant 7 — nullifier from stable-ID.
+  //
+  // Step 1: route a 25-byte (9 + 16) stable-ID window from cert_tbs at
+  // `subject_sn_offset`. The 9-byte DER anchor + 16-byte
+  // PrintableString value occupy a contiguous range; the shifter
+  // extracts it verbatim.
+  std::vector<typename LC::v8> sn_window(kSubjectSnWindowLen);
+  routing.template shift<typename LC::v8, kCertTbsLenBits>(
+      subject_sn_offset, kSubjectSnWindowLen, sn_window.data(),
+      kCertTbsMaxBytes, cert_tbs.data(), zz, /*unroll=*/3);
+
+  // Step 2: 9-byte DER anchor assertion. Without this the prover could
+  // aim the shifter at arbitrary 25 bytes of cert_tbs — e.g. a
+  // PrintableString inside an unrelated extension whose first 9 bytes
+  // coincidentally spell `30 17 06 03 55 04 05 13 10`.
+  std::vector<typename LC::v8> sn_anchor_expected(kSubjectSnAnchorLen);
+  for (size_t i = 0; i < kSubjectSnAnchorLen; ++i) {
+    sn_anchor_expected[i] = lc.template vbit<8>(kSubjectSnAnchor[i]);
+  }
+  breq.assert_eq(sn_window.data(), sn_anchor_expected.data(),
+                 kSubjectSnAnchorLen);
+
+  // Step 3: dual-match range check. The identical 9-byte anchor also
+  // appears at the ISSUER DN's serialNumber attribute (DIIA QTSP reg
+  // code `UA-43395033-2311` — same ATV shape). Without this check the
+  // prover could bind `nullifier` to the issuer's ID, trivially
+  // sharing a nullifier with every DIIA holder. Enforce
+  // `subject_sn_offset > subject_dn_start_offset` on-wire: the issuer
+  // DN ends BEFORE the subject DN starts (they're serialized in
+  // Issuer → Validity → Subject order), so any offset ≤
+  // subject_dn_start_offset points either at the issuer DN or earlier
+  // TBS fields — never at the holder's stable-ID.
+  lc.assert1(lc.vlt(subject_dn_start_offset, subject_sn_offset));
+
+  // Step 4: copy the 16-byte stable-ID from the window into a
+  // fixed-position region of the nullifier SHA preimage. The
+  // nullifier input layout is:
+  //   nullifier_input[0..16]                  = stable_id[16]
+  //   nullifier_input[16..16 + ctx_len]       = context_raw[..ctx_len]
+  //   nullifier_input[16 + ctx_len..SHA_pad]  = Merkle-Damgård padding
+  // Assert byte-equality on the stable-ID prefix (fixed length, so
+  // plain byte_eq works — no mask needed).
+  breq.assert_eq(&sn_window[kSubjectSnAnchorLen], nullifier_input.data(),
+                 kStableIdLen);
+
+  // Step 5: assert `nullifier_input[16..16 + ctx_len] == context_in[..ctx_len]`
+  // using the same masked-range trick invariant 6 uses. ctx_len is
+  // derived from context's SHA padding (`context_hasher`), which was
+  // already computed above for invariant 6 — reuse it.
+  {
+    std::vector<typename LC::v8> null_ctx_view(kContextMaxBytes);
+    for (size_t i = 0; i < kContextMaxBytes; ++i) {
+      null_ctx_view[i] = nullifier_input[kStableIdLen + i];
+    }
+    assert_range_equals_masked<LC, kContextMaxBytes, kContextLenBits>(
+        lc, null_ctx_view.data(), context_in.data(), ctx_len);
+  }
+
+  // Step 6: bind the raw-input length. The SHA pad inside
+  // nullifier_input encodes a bit-length that MUST equal
+  // `(kStableIdLen + ctx_len) * 8` — otherwise a prover could SHA-pad
+  // a shorter/longer preimage and smuggle in arbitrary bytes between
+  // the stable-ID and the padding.
+  static_assert(kNullifierShaLenBits >= kContextLenBits,
+                "kNullifierShaLenBits must accommodate ctx_len + 16");
+  {
+    auto nullifier_raw_len =
+        NullifierHash(lc).template derive_byte_len<kNullifierShaLenBits>(
+            nullifier_input.data(), nullifier_input_numb);
+    // Expected length = kStableIdLen + ctx_len. kStableIdLen = 16 =
+    // bit 4 only; since ctx_len ≤ 32 (bit 5 max), adding 16 never
+    // carries. So:
+    //   bits 0..3 of nullifier_raw_len = bits 0..3 of ctx_len
+    //   bit 4 of nullifier_raw_len    = 1
+    //   bit 5 of nullifier_raw_len    = bit 5 of ctx_len
+    lc.assert1(lc.vlt(ctx_len, static_cast<uint64_t>(kContextMaxBytes + 1)));
+    for (size_t i = 0; i < 4; ++i) {
+      lc.assert_eq(nullifier_raw_len[i], ctx_len[i]);
+    }
+    lc.assert1(nullifier_raw_len[4]);
+    if constexpr (kContextLenBits >= 6) {
+      lc.assert_eq(nullifier_raw_len[5], ctx_len[5]);
+    } else {
+      lc.assert0(nullifier_raw_len[5]);
+    }
+  }
+
+  // Step 7: SHA-256 over the padded nullifier_input produces a v256
+  // digest. Assert it equals the public `nullifier` v256 wires
+  // (same layout as invariant 9's `context_hash` target).
+  NullifierHash(lc).assert_message_hash(
+      nullifier_input_numb, nullifier_input.data(),
+      nullifier, nullifier_input_bw.data());
 
   // Task 29 / 26 — cross-field MAC binding to (e, e2, SPKI_X, SPKI_Y).
   // Digest views — byte-identical to the flatsha views (same wires,
@@ -1193,12 +1409,25 @@ struct ParsedWitness {
   uint8_t signed_attrs[kSignedAttrsMaxBytes];
   uint8_t content_sig_r[32];
   uint8_t content_sig_s[32];
+  // v11 (Task 34) — invariant 7 stable-ID extraction.
+  //   subject_sn_offset_in_tbs       offset of 9-byte DER anchor within
+  //                                  cert_tbs. 370 for both DIIA fixtures.
+  //   subject_dn_start_offset_in_tbs offset of outer Subject DN SEQUENCE
+  //                                  within cert_tbs. 294 for DIIA.
+  //   trust_anchor_index             v11 placeholder (0); Task #36 wires
+  //                                  real trust-anchor selection.
+  uint32_t subject_sn_offset_in_tbs;
+  uint32_t subject_dn_start_offset_in_tbs;
+  uint32_t trust_anchor_index;
 };
 
 struct ParsedPublic {
   uint8_t context_hash[32];
   uint8_t pk[kPkBytes];
   uint8_t nonce[kNonceBytes];
+  // v11 (Task 34) — invariant 7 public output + trust-anchor placeholder.
+  uint8_t nullifier[kNullifierLen];
+  uint32_t trust_anchor_index;
 };
 
 // If `skip_host_anchors` is true, the host-side DER-prefix assertions
@@ -1352,6 +1581,41 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   std::memcpy(out.content_sig_s, p, 32);
   p += 32;
 
+  // v11 (Task 34) — invariant 7 host-witnessed offsets + trust-anchor
+  // index placeholder. Order must match Rust
+  // `crates/zk-eidas-p7s-circuit/src/witness.rs`'s `to_ffi_bytes()` tail.
+  if (!read_u32(p, end, out.subject_sn_offset_in_tbs)) return false;
+  // The 9+16-byte stable-ID window must fit inside real cert_tbs
+  // content (not the zero-pad region) — the anchor bytes we assert are
+  // non-zero.
+  if (out.subject_sn_offset_in_tbs + kSubjectSnWindowLen > out.cert_tbs_len) {
+    return false;
+  }
+  if (!read_u32(p, end, out.subject_dn_start_offset_in_tbs)) return false;
+  // Range sanity: subject_dn_start must precede subject_sn (the
+  // in-circuit check enforces strict inequality, but reject negatives
+  // and obvious offset scrambles at parse time too).
+  if (out.subject_dn_start_offset_in_tbs >= out.subject_sn_offset_in_tbs) {
+    return false;
+  }
+  if (out.subject_dn_start_offset_in_tbs >= out.cert_tbs_len) return false;
+  if (!read_u32(p, end, out.trust_anchor_index)) return false;
+  // v11 placeholder — Task #36 activates real selection and adds a
+  // bound check against the trust-anchor table size.
+  if (out.trust_anchor_index != 0) return false;
+
+  // Belt-and-suspenders: 9-byte X.520 serialNumber DER anchor at the
+  // witnessed offset. Gated by `skip_host_anchors` for parity with the
+  // SPKI / messageDigest anchors; `p7s_prove_test_bypass_host_anchors`
+  // skips this so invariant_7 tests can exercise the in-circuit anchor
+  // as the sole enforcement layer.
+  if (!skip_host_anchors) {
+    if (std::memcmp(&out.cert_tbs[out.subject_sn_offset_in_tbs],
+                    kSubjectSnAnchor, kSubjectSnAnchorLen) != 0) {
+      return false;
+    }
+  }
+
   if (p != end) return false;
   return true;
 }
@@ -1377,6 +1641,12 @@ bool parse_public_blob(const uint8_t* blob, size_t blob_len,
   std::memcpy(out.nonce, p, kNonceBytes);
   p += kNonceBytes;
 
+  // v11 (Task 34) — public nullifier output + trust-anchor placeholder.
+  if (end - p < static_cast<ptrdiff_t>(kNullifierLen)) return false;
+  std::memcpy(out.nullifier, p, kNullifierLen);
+  p += kNullifierLen;
+  if (!read_u32(p, end, out.trust_anchor_index)) return false;
+
   if (p != end) return false;
   return true;
 }
@@ -1394,6 +1664,14 @@ void fill_hash_public_inputs(DenseFiller<F>& filler, const ParsedPublic& pub,
   push_target(filler, pub.context_hash, Fs);
   push_pk_public(filler, pub.pk, Fs);
   push_nonce_public(filler, pub.nonce, Fs);
+  // v11 (Task 34) — invariant 7 public output.
+  // `push_target` uses the same big-endian bit layout the circuit's
+  // `nullifier_v256_flatsha` view extracts from `nullifier_bytes[]`
+  // via `(255 - j) / 8` / `j % 8`. Safe to reuse.
+  push_target(filler, pub.nullifier, Fs);
+  // v11 (Task 34) — trust-anchor index (v32 LSB-first; currently
+  // unconstrained — Task #36 activates real selection).
+  push_uint(filler, pub.trust_anchor_index, kHashPubTrustAnchorIdx, Fs);
 }
 
 void push_hash_mac_values(DenseFiller<F>& filler,
@@ -1668,6 +1946,32 @@ static P7sErrorCode p7s_prove_impl(
   for (size_t i = 0; i < kSignedAttrsDigestLen; ++i) {
     push_v8(hash_filler, e2_digest_be[i], Fs);
   }
+
+  // v11 / Task 34: invariant 7 private witness fill.
+  //   subject_sn_offset_in_tbs (v11 offset)
+  //   subject_dn_start_offset_in_tbs (v11 offset)
+  //   nullifier_input_numb (v8 SHA block count)
+  //   nullifier_input[64] (SHA-padded stable_id || context)
+  //   nullifier_input_bw[1] (per-block SHA witnesses)
+  //
+  // Build the nullifier preimage buffer off-circuit:
+  //   raw = stable_id[16] || context_raw[ctx_len]
+  // then SHA-pad. The stable_id bytes come from
+  // cert_tbs[subject_sn_offset + 9 .. subject_sn_offset + 25].
+  const size_t kStableIdAbs = wit.subject_sn_offset_in_tbs + kSubjectSnAnchorLen;
+  uint8_t nullifier_raw[kStableIdLen + kContextMaxBytes] = {};
+  std::memcpy(nullifier_raw, &wit.cert_tbs[kStableIdAbs], kStableIdLen);
+  std::memcpy(&nullifier_raw[kStableIdLen], wit.context, wit.context_len);
+  const size_t nullifier_raw_len = kStableIdLen + wit.context_len;
+  ShaWitness<kNullifierShaBlocks> null_sw;
+  compute_sha_witness<kNullifierShaBlocks>(nullifier_raw, nullifier_raw_len,
+                                           null_sw);
+
+  push_uint(hash_filler, wit.subject_sn_offset_in_tbs, kCertTbsLenBits, Fs);
+  push_uint(hash_filler, wit.subject_dn_start_offset_in_tbs, kCertTbsLenBits, Fs);
+  push_v8(hash_filler, null_sw.numb, Fs);
+  push_sha_padded_bytes<kNullifierShaBlocks>(hash_filler, null_sw, Fs);
+  push_sha_block_witnesses<kNullifierShaBlocks>(hash_filler, null_sw, Fs);
 
   // Task 25a/26: prover's committed `ap` halves. kTotalMacValues
   // EltWs = 4 MAC witnesses × 2 halves/witness. Order must match
