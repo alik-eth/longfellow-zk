@@ -5,10 +5,10 @@
 // and derived on the sig side from the same 32 digest bytes. There is
 // nothing left to define in this translation unit; the class
 // `P7sSignature` lives entirely in the header, and the trust-anchor
-// root pubkey (TestAnchorA post-#43a; symbol names kept as
-// `kDiiaRootPk{X,Y}_decimal` to minimize cross-file churn) is a
-// compile-time string constant wired directly via
-// `p256_base.of_string(kDiiaRootPkX_decimal)` at circuit-build time.
+// root pubkeys (TestAnchorA + TestAnchorB post-#44) live as
+// compile-time string constants (`kTestAnchorARootPk{X,Y}_decimal`
+// etc.) wired directly via `p256_base.of_string(...)` at
+// circuit-build time.
 //
 // The file is kept (rather than deleted) so the CMakeLists.txt entry
 // added in 25a continues to resolve, and so future invariant-2a work

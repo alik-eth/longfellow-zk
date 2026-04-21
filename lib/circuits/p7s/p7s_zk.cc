@@ -330,7 +330,7 @@ using NullifierShaBw = NullifierHash::ShaBlockWitness;  // v11 (Task 34)
 // 26-byte P-256 SPKI DER prefix — kept in both the host parser
 // (`crates/zk-eidas-p7s/src/parser.rs`) and the hash circuit's
 // anchor assertion. Any change requires updating both sites.
-constexpr uint8_t kSpkiDiaP256Prefix[kSpkiPrefixLen] = {
+constexpr uint8_t kSpkiP256Prefix[kSpkiPrefixLen] = {
     0x30, 0x59,                                    // SPKI SEQUENCE hdr (l=89)
     0x30, 0x13,                                    // AlgId SEQUENCE hdr (l=19)
     0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,      // OID id-ecPublicKey
@@ -478,39 +478,51 @@ static_assert(kHashPubTotal == 1330,
 constexpr size_t kHashMacIndex = kHashPubPreMac;
 
 // ===========================================================================
-// Sig-circuit public-input layout (v9). Holder pk is NOT in the public
-// blob (privacy: leaking cert SPKI would deanonymize the holder).
-// It enters as a PRIVATE EltW pair in the sig witness, bound to the
-// hash-side cert_tbs SPKI bytes via the MAC gadget. The trust-anchor
-// root public key remains a compile-time `lc.konst(...)` (indexed out
-// of `kTrustAnchors[]` by the witnessed `trust_anchor_index`).
+// Sig-circuit public-input layout (Task #44 — v10 bump). Holder pk is
+// NOT in the public blob (privacy: leaking cert SPKI would deanonymize
+// the holder). It enters as a PRIVATE EltW pair in the sig witness,
+// bound to the hash-side cert_tbs SPKI bytes via the MAC gadget.
+//
+// Task #44 added a SINGLE public EltW input for `trust_anchor_index`
+// (the same u32 value the hash circuit reads, reinterpreted as a
+// field element). The sig circuit constrains it to `{0, 1}` for N=2
+// and uses it to multiplex over `kTrustAnchors[0..N]`. Soundness: the
+// verifier parses one public blob and pushes the SAME
+// `trust_anchor_index` into both circuits, so they agree by
+// construction — no MAC binding needed for this specific value.
 //
 //   [0]                              = const 1 (auto-allocated wire 0)
-//   [1 .. 1 + 128)                   = mac values[0] as v128 (mac_e[0])
-//   [129 .. 129 + 128)               = mac values[1] (mac_e[1])
-//   [257 .. 257 + 128)               = mac values[2] (mac_e2[0])
-//   [385 .. 385 + 128)               = mac values[3] (mac_e2[1])
-//   [513 .. 513 + 128)               = mac values[4] (mac_spki_x[0])
-//   [641 .. 641 + 128)               = mac values[5] (mac_spki_x[1])
-//   [769 .. 769 + 128)               = mac values[6] (mac_spki_y[0])
-//   [897 .. 897 + 128)               = mac values[7] (mac_spki_y[1])
-//   [1025 .. 1025 + 128)             = av (v128)
-//   npub_in_sig = 1 + 9 × 128        = 1153
+//   [1]                              = trust_anchor_index (EltW)      ← new
+//   [2 .. 2 + 128)                   = mac values[0] as v128 (mac_e[0])
+//   [130 .. 130 + 128)               = mac values[1] (mac_e[1])
+//   [258 .. 258 + 128)               = mac values[2] (mac_e2[0])
+//   [386 .. 386 + 128)               = mac values[3] (mac_e2[1])
+//   [514 .. 514 + 128)               = mac values[4] (mac_spki_x[0])
+//   [642 .. 642 + 128)               = mac values[5] (mac_spki_x[1])
+//   [770 .. 770 + 128)               = mac values[6] (mac_spki_y[0])
+//   [898 .. 898 + 128)               = mac values[7] (mac_spki_y[1])
+//   [1026 .. 1026 + 128)             = av (v128)
+//   npub_in_sig = 1 + 1 + 9 × 128    = 1154
 constexpr size_t kSigPubConst = 1;
+// Single Fp256Base EltW carrying the trust_anchor_index (small u32
+// value, range-constrained by the in-circuit `idx * (idx - 1) == 0`
+// assertion for N=2 — tighten if N grows).
+constexpr size_t kSigPubTrustAnchorIdx = 1;
 // Each sig-side MAC public input is a v128 = 128 bit wires (Fp256Base
 // isn't wide enough to hold a 128-bit GF(2^128) element as a single
 // field element, so it's bit-decomposed).
 constexpr size_t kSigMacBitsPerWire = 128;
 constexpr size_t kSigMacInputWires =
     (kTotalMacValues + 1) * kSigMacBitsPerWire;  // 9 × 128 = 1152
-constexpr size_t kSigPubTotal = kSigPubConst + kSigMacInputWires;
-static_assert(kSigPubTotal == 1153,
+constexpr size_t kSigPubTotal =
+    kSigPubConst + kSigPubTrustAnchorIdx + kSigMacInputWires;
+static_assert(kSigPubTotal == 1154,
               "layout drift — update npub_in_sig comment");
 
 // Index (in the DENSE W_sig array) where the sig MAC region begins.
 // update_mac_in_dense writes 128 wires per MAC value (one field
 // element per bit).
-constexpr size_t kSigMacIndex = kSigPubConst;  // 1
+constexpr size_t kSigMacIndex = kSigPubConst + kSigPubTrustAnchorIdx;  // 2
 
 // ===========================================================================
 // Hash circuit builder — keeps every pre-v7 constraint intact and adds
@@ -576,22 +588,19 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // order consistent with the circuit's `assert_message_hash`.
   auto nullifier = lc.template vinput<256>();
 
-  // v11 / Task 34 + activated in Task 36: trust_anchor_index (v32).
-  // The public blob carries a u32 selecting which entry of the
-  // compile-time `kTrustAnchors[]` table the sig circuit's cert-sig
-  // ECDSA verifies under. Phase 2b ships with kTrustAnchorCount = 1
-  // (TestAnchorA only post-#43a), so the in-circuit range check
-  // degenerates to "index < 1" — a strict all-bits-zero assertion.
-  // When Task #37 adds non-DIIA anchors, bumping kTrustAnchorCount
-  // keeps the `vlt` constraint correct and the sig-side lookup grows
-  // into a real one-hot multiplexer.
+  // v11 / Task 34; activated in Task 36; real bound check in Task #44.
+  // trust_anchor_index (v32). The public blob carries a u32 selecting
+  // which entry of the compile-time `kTrustAnchors[]` table the sig
+  // circuit's cert-sig ECDSA verifies under. Phase 2b now ships with
+  // kTrustAnchorCount = 2 (TestAnchorA + TestAnchorB), so the
+  // in-circuit `vlt(index, 2)` is a genuine 1-bit bound check: any
+  // prover claiming an index >= 2 fails here.
   auto trust_anchor_index = lc.template vinput<kHashPubTrustAnchorIdx>();
   // In-circuit bound check: trust_anchor_index < kTrustAnchorCount.
-  // For the N=1 Phase 2b table this simplifies to every bit == 0;
-  // we use the generic `vlt` form so N>1 tables pass through the
-  // same constraint shape without refactoring. A prover passing
-  // any non-zero index (i.e. claiming verification under an anchor
-  // that doesn't exist in the table) fails this check.
+  // The sig circuit independently range-constrains the same index
+  // value via `idx * (idx - 1) == 0` (see build_sig_circuit); verifier
+  // parses one public blob and pushes the same u32 into both circuits,
+  // so the two checks bracket the same value from both sides.
   lc.assert1(lc.vlt(trust_anchor_index,
                     static_cast<uint64_t>(kTrustAnchorCount)));
 
@@ -940,7 +949,7 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // requires X/Y to be on the curve.
   std::vector<typename LC::v8> spki_prefix_expected(kSpkiPrefixLen);
   for (size_t i = 0; i < kSpkiPrefixLen; ++i) {
-    spki_prefix_expected[i] = lc.template vbit<8>(kSpkiDiaP256Prefix[i]);
+    spki_prefix_expected[i] = lc.template vbit<8>(kSpkiP256Prefix[i]);
   }
   breq.assert_eq(spki_window.data(), spki_prefix_expected.data(),
                  kSpkiPrefixLen);
@@ -1104,21 +1113,28 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   return Q.mkcircuit(/*nc=*/1);
 }
 
-// Sig-circuit builder — invariants 1 + 2a (Task 26). Verifies:
+// Sig-circuit builder — invariants 1 + 2a (Task 26), with the Task #44
+// multi-anchor multiplexer. Verifies:
 //   (A) the signer cert's ECDSA signature against the selected
-//       `kTrustAnchors[]` root public key over `e = SHA-256(cert_tbs)`;
+//       `kTrustAnchors[trust_anchor_index]` root public key over
+//       `e = SHA-256(cert_tbs)`;
 //   (B) the CMS content ECDSA signature against the user's
-//       holder_pk (public input) over `e2 = SHA-256(signedAttrs)`.
+//       holder_pk (private input) over `e2 = SHA-256(signedAttrs)`.
 // Both digests are MAC-bound to the hash circuit's SHA computations
-// (cross-field MAC with shared `av` / per-message `ap` halves).
+// (cross-field MAC with shared `av` / per-message `ap` halves). The
+// `trust_anchor_index` itself is a public Fp256Base EltW shared by
+// value between the hash + sig circuits — the verifier parses one
+// public blob and pushes the same u32 into both.
 std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   QuadCircuit<Fp256Base> Q(p256_base);
   const CB256 cbk(&Q);
   const LC256 lc(&cbk, p256_base);
 
   // ---- Public inputs ----
-  // mac values + av as bit-decomposed v128 each. 4 bound messages
-  // × 2 mac values each + 1 av = 9 × 128 = 1152 bit-wires.
+  // trust_anchor_index (single EltW) + mac values + av. mac values
+  // are bit-decomposed v128 each: 4 bound messages × 2 mac values
+  // each + 1 av = 9 × 128 = 1152 bit-wires, plus 1 EltW.
+  typename LC256::EltW trust_anchor_idx = lc.eltw_input();
   typename LC256::v128 mac_pub[kTotalMacValues + 1];
   for (size_t i = 0; i < kTotalMacValues + 1; ++i) {
     mac_pub[i] = lc.template vinput<128>();
@@ -1146,28 +1162,50 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   sig_witness.input(lc);
 
   // ---- Constraints ----
-  // Trust-anchor root public key as base-field constants. Phase 2b
-  // ships with kTrustAnchorCount == 1 (TestAnchorA post-#43a), so the
-  // sig circuit always picks entry 0 here — the hash circuit enforces
-  // the witness-driven `trust_anchor_index < kTrustAnchorCount` bound,
-  // and with N=1 the only in-range index is 0. When Task #37 adds
-  // non-DIIA entries, this lookup expands into a real multiplexer
-  // over `kTrustAnchors[0..N]` indexed by an additional sig-side
-  // public input (bit-decomposed mirror of the hash-side
-  // trust_anchor_index, cross-bound via the existing MAC gadget or
-  // a new message).
+  // Trust-anchor root public key: one-hot multiplexer over
+  // `kTrustAnchors[]` indexed by the public `trust_anchor_idx`.
   //
-  // `of_string` returns Elts already in Montgomery form (fp_generic.h:
+  // Soundness sketch: `trust_anchor_idx` is a PUBLIC Fp256Base input
+  // that the verifier also sees in the hash circuit's public blob —
+  // both circuits receive the same u32, reinterpreted into their
+  // respective field representations. The hash circuit asserts
+  // `vlt(trust_anchor_index, kTrustAnchorCount)` (v32 bits) so the
+  // value is in `[0, N)`; this circuit independently constrains
+  // `idx * (idx - 1) == 0` which for N=2 also forces `idx ∈ {0, 1}`.
+  // The two constraints agree on the valid-index set by construction.
+  //
+  // For N=2, the one-hot mux `k0 + idx*(k1 - k0)` collapses to `k0`
+  // when idx == 0 and `k1` when idx == 1. The product-of-differences
+  // zero check below is the canonical `idx ∈ {0, 1}` constraint.
+  //
+  // `of_string` returns Elts already in Montgomery form (fp_generic.h
   // 329-336), so `lc.konst(...)` binds the right internal
   // representation directly.
-  static_assert(kTrustAnchorCount == 1,
-                "sig-side root-pk lookup is a single-entry shortcut; "
-                "Task #37 must replace this with a multiplexer over "
-                "kTrustAnchors[] when kTrustAnchorCount > 1");
-  typename LC256::EltW root_pk_x =
+  static_assert(kTrustAnchorCount == 2,
+                "N=2 sig-side mux expects exactly 2 entries. To extend "
+                "to N>2, replace the 2-way `k0 + idx*(k1-k0)` expression "
+                "with a generic Σ_i Lagrange_i(idx) * k_i construction "
+                "and update the `idx * (idx - 1) == 0` bound check.");
+  typename LC256::EltW k0_x =
       lc.konst(p256_base.of_string(kTrustAnchors[0].root_pk_x_decimal));
-  typename LC256::EltW root_pk_y =
+  typename LC256::EltW k0_y =
       lc.konst(p256_base.of_string(kTrustAnchors[0].root_pk_y_decimal));
+  typename LC256::EltW k1_x =
+      lc.konst(p256_base.of_string(kTrustAnchors[1].root_pk_x_decimal));
+  typename LC256::EltW k1_y =
+      lc.konst(p256_base.of_string(kTrustAnchors[1].root_pk_y_decimal));
+  typename LC256::EltW one_elt = lc.konst(p256_base.one());
+
+  // idx ∈ {0, 1}: (idx) * (idx - 1) == 0.
+  typename LC256::EltW idx_minus_one = lc.sub(trust_anchor_idx, one_elt);
+  typename LC256::EltW idx_product = lc.mul(trust_anchor_idx, idx_minus_one);
+  lc.assert_eq(idx_product, lc.konst(p256_base.zero()));
+
+  // root_pk = k0 + idx * (k1 - k0).
+  typename LC256::EltW root_pk_x =
+      lc.add(k0_x, lc.mul(trust_anchor_idx, lc.sub(k1_x, k0_x)));
+  typename LC256::EltW root_pk_y =
+      lc.add(k0_y, lc.mul(trust_anchor_idx, lc.sub(k1_y, k0_y)));
 
   P7sSigCircuit sig_gadget(lc, p256, n256_order);
   // mac_pub layout (matches kMacMsgIdx*):
@@ -1574,7 +1612,7 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // circuit-side 26-byte assertion becomes an untested comment.
   if (!skip_host_anchors) {
     if (std::memcmp(&out.cert_tbs[out.cert_tbs_spki_offset],
-                    kSpkiDiaP256Prefix, kSpkiPrefixLen) != 0) {
+                    kSpkiP256Prefix, kSpkiPrefixLen) != 0) {
       return false;
     }
     if (out.cert_tbs[out.cert_tbs_spki_offset + kSpkiPrefixLen] != 0x04) {
@@ -1671,8 +1709,8 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // size. Matches the in-circuit `vlt(trust_anchor_index,
   // kTrustAnchorCount)` constraint one-to-one; catching out-of-range
   // at parse time surfaces P7S_INVALID_INPUT instead of an opaque
-  // P7S_PROVER_FAILURE. For N=1 this collapses to `index != 0`, but
-  // the formulation below stays correct as the table grows.
+  // P7S_PROVER_FAILURE. With N=2 (Task #44) this rejects any index
+  // >= 2; stays correct as the table grows.
   //
   // Gated by `skip_host_anchors` so the bypass FFI entry can exercise
   // the in-circuit `lc.assert1(lc.vlt(trust_anchor_index,
@@ -1935,10 +1973,13 @@ static P7sErrorCode p7s_prove_impl(
   // Trust-anchor root — selected from the compile-time
   // `kTrustAnchors[]` table by the witness-driven
   // `wit.trust_anchor_index`. Parsed value is already bounds-checked
-  // in parse_witness_blob (`index < kTrustAnchorCount`), so the
-  // array indexing below is safe. Matches the sig circuit's
-  // compile-time pick of `kTrustAnchors[0]` for the N=1 Phase 2b
-  // table; extends into a real lookup when kTrustAnchorCount > 1.
+  // in parse_witness_blob (`index < kTrustAnchorCount`), so the array
+  // indexing below is safe. Matches the sig circuit's in-circuit mux
+  // over `kTrustAnchors[0..kTrustAnchorCount)` (Task #44): the prover
+  // feeds this same root_pk into `ecdsa_cert_wit.compute_witness`
+  // here (witness-side) and the circuit selects it from its
+  // compile-time table indexed by the public `trust_anchor_index`
+  // (verifier side). If they disagree, the ECDSA verify fails.
   const TrustAnchor& selected_anchor = kTrustAnchors[wit.trust_anchor_index];
   Fp256Base::Elt root_pkX =
       p256_base.of_string(selected_anchor.root_pk_x_decimal);
@@ -2087,10 +2128,14 @@ static P7sErrorCode p7s_prove_impl(
   Dense<Fp256Base> W_sig(1, c_sig.ninputs);
   DenseFiller<Fp256Base> sig_filler(W_sig);
 
-  // Public section (v9): const 1 + MAC region placeholders. Holder
-  // pk is NO LONGER a public input — promoted to private after the
-  // escalation about cert SPKI privacy.
+  // Public section: const 1 + trust_anchor_index (Task #44) + MAC
+  // region placeholders. Holder pk is NOT a public input (privacy:
+  // cert SPKI would deanonymize the holder). The trust_anchor_index
+  // is the same u32 value the hash circuit reads from the public
+  // blob, reinterpreted as an Fp256Base field element.
   sig_filler.push_back(p256_base.one());
+  sig_filler.push_back(
+      p256_base.of_scalar(static_cast<uint64_t>(pub.trust_anchor_index)));
   push_sig_mac_placeholders(sig_filler);
 
   // Private section — order MUST match build_sig_circuit's declaration:
@@ -2297,9 +2342,14 @@ P7sErrorCode p7s_verify(const uint8_t* public_blob, size_t public_blob_len,
   Dense<Fp256Base> pub_sig(1, c_sig.npub_in);
   DenseFiller<Fp256Base> sig_filler(pub_sig);
   sig_filler.push_back(p256_base.one());
+  // Task #44: trust_anchor_index public input (single EltW). The sig
+  // circuit's `idx * (idx - 1) == 0` constraint + 2-way mux select
+  // the root_pk used for cert-sig ECDSA verification.
+  sig_filler.push_back(
+      p256_base.of_scalar(static_cast<uint64_t>(pub.trust_anchor_index)));
   // holder_pk_{x,y} are PRIVATE on the sig side (see build_sig_circuit
-  // v9 layout). The only public input wires besides `1` are the MAC
-  // region — filled below.
+  // layout). The remaining public-input wires are the MAC region —
+  // filled below.
   push_sig_mac_values(sig_filler, macs, av);
   if (sig_filler.size() != c_sig.npub_in) return P7S_VERIFIER_FAILURE;
 

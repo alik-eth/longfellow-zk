@@ -37,14 +37,15 @@
 //
 // `root_pk` is selected from a compile-time TrustAnchor[] table (see
 // `kTrustAnchors` below) by the witness-driven `trust_anchor_index`
-// public input. Phase 2b ships with N=1 (TestAnchorA only post-#43a)
-// and a trivial "always entry 0" sig-side lookup; the hash circuit
-// asserts the witnessed index is in range (`< kTrustAnchorCount`) for
-// forward-compat, and real multi-entry multiplexing lands once Task
-// #37 adds non-DIIA fixtures. `holder_pk_x` / `holder_pk_y` are PRIVATE
-// Fp256Base EltW inputs in the sig circuit, bound to the hash
-// circuit's cert_tbs SPKI bytes via MAC. Total bound messages = 4
-// (e, e2, SPKI_X, SPKI_Y); total MAC values = 8 (2 per message).
+// public input. Phase 2b ships with N=2 (TestAnchorA + TestAnchorB,
+// both synthetic; see Task #44). The sig circuit implements a one-hot
+// multiplexer over the table indexed by `trust_anchor_index`, and the
+// hash circuit asserts the witnessed index is in range
+// (`< kTrustAnchorCount`). Real production anchors arrive with Task
+// #37. `holder_pk_x` / `holder_pk_y` are PRIVATE Fp256Base EltW inputs
+// in the sig circuit, bound to the hash circuit's cert_tbs SPKI bytes
+// via MAC. Total bound messages = 4 (e, e2, SPKI_X, SPKI_Y); total MAC
+// values = 8 (2 per message).
 //
 // Rationale for the MAC step remains the same as 25a: the ECDSA
 // VerifyCircuit operates over Fp256Base, but the SHA-256 computations
@@ -107,9 +108,7 @@ constexpr size_t kMacMessageBytes = 32;
 // synthetic fixtures produced by
 // `crates/zk-eidas-p7s/src/bin/gen_synthetic_fixtures.rs` (seed
 // "zk-eidas-test-anchor-A-root-v1") carry a signer cert whose sig
-// verifies under this root. Symbol names kept as `kDiiaRootPkX/Y_*`
-// to minimize cross-file churn — rename is tracked as a low-priority
-// follow-up if/when #44 introduces multiple anchors.
+// verifies under this root.
 //
 // SEC1 uncompressed point hex:
 //   0x04
@@ -118,21 +117,38 @@ constexpr size_t kMacMessageBytes = 32;
 // Decimal forms are baked in as compile-time string literals so
 // `p256_base.of_string(...)` returns a Montgomery-form `Elt` without
 // any runtime parsing ambiguity.
-constexpr char kDiiaRootPkX_decimal[] =
+constexpr char kTestAnchorARootPkX_decimal[] =
     "10411018639600370223116240342174465648759973561081352565806674112222641861"
     "6483";
-constexpr char kDiiaRootPkY_decimal[] =
+constexpr char kTestAnchorARootPkY_decimal[] =
     "88269951206551578807887439798916112555166422509420054001162626778754936359"
     "976";
 
+// TestAnchorB synthetic root public key (Task #44). Second synthetic
+// anchor so the N=2 multiplexer in `build_sig_circuit` is exercised
+// by a real fixture. Produced by `gen_synthetic_fixtures.rs` with
+// seed "zk-eidas-p7s-testanchor-b-root-v1"; the fixture pair
+// `testanchor-b-binding.qkb.p7s` / `testanchor-b-admin-binding.qkb.p7s`
+// carries a signer cert whose sig verifies under this root.
+//
+// SEC1 uncompressed point hex:
+//   0x04
+//   0x3a48db8f884948fb58ce44bc21a3deeb6e62ceb23c7a1384cf27d126c8ea0b9b  (X)
+//   0xbaed0eeec7f234ced5e8b233cec71ed2346d1dbb3559acb2f5ccc1faa4778043  (Y)
+constexpr char kTestAnchorBRootPkX_decimal[] =
+    "26362873558568434135757859508946912507274750529511868229520166364868409691"
+    "035";
+constexpr char kTestAnchorBRootPkY_decimal[] =
+    "84549035652812971100161935258006361651891028412283608100255874746995940229"
+    "187";
+
 // ===========================================================================
-// Trust-anchor table (Task 36). Compile-time array of ETSI-compliant
-// QTSP root pubkeys. The witness-driven `trust_anchor_index` (a v32
-// public-input wire on the hash side) selects which row the sig
-// circuit's cert-sig ECDSA verifies under. Phase 2b ships with N=1
-// (TestAnchorA only post-#43a) and a trivial "pick entry 0" path on
-// the sig side; real multiplexing lands in Task #37 when additional
-// fixtures arrive.
+// Trust-anchor table (Task 36, extended to N=2 by Task #44). Compile-
+// time array of ETSI-compliant QTSP root pubkeys. The witness-driven
+// `trust_anchor_index` (a v32 public-input wire on the hash side)
+// selects which row the sig circuit's cert-sig ECDSA verifies under.
+// Phase 2b ships with N=2 (TestAnchorA + TestAnchorB, both synthetic);
+// real production anchors arrive with Task #37.
 //
 // All current anchors share:
 //   * P-256 (prime256v1) curve — prime256v1 OID baked into the 26-byte
@@ -142,10 +158,9 @@ constexpr char kDiiaRootPkY_decimal[] =
 //     shape; not directly asserted in-circuit).
 //
 // If a future anchor uses a different curve / algorithm identifier,
-// the 26-byte SPKI prefix anchor at `kSpkiDiaP256Prefix` (symbol name
-// retained post-#43a) has to become per-entry (flagged as Task #36.0
-// follow-up). For the current table every entry is P-256, so the
-// anchor stays universal.
+// the 26-byte SPKI prefix anchor at `kSpkiP256Prefix` has to become
+// per-entry (flagged as Task #36.0 follow-up). For the current table
+// every entry is P-256, so the anchor stays universal.
 struct TrustAnchor {
   // Compile-time decimal representations of the root public key.
   // Wrapped in `StaticString` so `FpGeneric::of_string` can consume
@@ -168,12 +183,22 @@ inline const TrustAnchor kTrustAnchors[] = {
     // Index 0 — TestAnchorA (synthetic, Task #43a). Replaces the
     // DIIA QTSP 2311 anchor that was present before the PII scrub;
     // the decimal constants above were regenerated by
-    // `gen_synthetic_fixtures`. A real DIIA anchor returns when #37
-    // lands non-PII multi-QTSP fixtures.
+    // `gen_synthetic_fixtures`. A real production anchor returns when
+    // #37 lands non-PII multi-QTSP fixtures.
     {
-        StaticString(kDiiaRootPkX_decimal),
-        StaticString(kDiiaRootPkY_decimal),
+        StaticString(kTestAnchorARootPkX_decimal),
+        StaticString(kTestAnchorARootPkY_decimal),
         "TestAnchorA (synthetic, P-256)",
+    },
+    // Index 1 — TestAnchorB (synthetic, Task #44). Second synthetic
+    // anchor so the N=2 multiplexer in `build_sig_circuit` is a real
+    // 2-way mux rather than a degenerate "pick entry 0" shortcut.
+    // Fixtures: `testanchor-b-binding.qkb.p7s` /
+    // `testanchor-b-admin-binding.qkb.p7s`.
+    {
+        StaticString(kTestAnchorBRootPkX_decimal),
+        StaticString(kTestAnchorBRootPkY_decimal),
+        "TestAnchorB (synthetic, P-256)",
     },
     // Future QTSP entries appended here (Task #37 — fixture-gated).
 };
@@ -187,22 +212,14 @@ constexpr size_t kTrustAnchorCount =
 static_assert(kTrustAnchorCount >= 1,
               "kTrustAnchors must contain at least one entry");
 
-// Forward plan for N>1 multiplexing (Task #44 / submodule 0431d42):
-// When additional QTSPs are added to `kTrustAnchors[]`, the sig
-// circuit's current "always entry 0" path must be replaced by a
-// Lagrange/barrel-shift multiplexer over `trust_anchor_index`.
-// Concrete steps:
-//   1. For each new anchor: append to `kTrustAnchors[]` and the
-//      host-side `TRUST_ANCHOR_PROBES` list in parser.rs (keeping
-//      both order-aligned).
-//   2. Replace the hardcoded `kTrustAnchors[0]` dereference in
-//      p7s_zk.cc's sig-circuit build path with a runtime mux
-//      conditional on the public `trust_anchor_index` wire.
-//   3. Add a fixture for each new anchor (Task #37 follow-up) and
-//      extend `trust_anchor.rs` tests to cover non-zero indices.
-// The in-circuit `vlt(trust_anchor_index, kTrustAnchorCount)` and
-// host-side `parse_witness_blob` bound check are already wired and
-// stay correct as the table grows — no structural change needed.
+// N=2 multiplexer (Task #44): the sig circuit's cert-sig ECDSA
+// verifies under a `(root_pk_x, root_pk_y)` pair selected from
+// `kTrustAnchors[]` by a one-hot multiplexer over the public
+// `trust_anchor_index` wire. The hash circuit still asserts
+// `vlt(trust_anchor_index, kTrustAnchorCount)` for the bound check.
+// Appending a third anchor is purely additive: extend the table
+// here, extend `TRUST_ANCHOR_PROBES` in `parser.rs` in the same
+// order, and the multiplexer picks up the new row automatically.
 
 // Bit-width of the `trust_anchor_index` wire the hash circuit reads
 // from the public blob. 32 is overkill for small N but matches the
