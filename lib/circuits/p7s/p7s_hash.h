@@ -17,6 +17,7 @@
 #define PRIVACY_PROOFS_ZK_LIB_CIRCUITS_P7S_P7S_HASH_H_
 
 #include <cstddef>
+#include <cstdint>
 
 #include "circuits/logic/bit_plucker.h"
 #include "circuits/sha/flatsha256_circuit.h"
@@ -127,6 +128,44 @@ void assert_range_equals_masked(
     l.assert_implies(in_range, bytes_eq);
   }
 }
+
+// ---- v12 (Plan 1, 2026-04-27) — issuer-pseudonym privacy ---------
+//
+// The v12 hard fork introduces a 32-byte holder-side secret
+// `holder_seed` (private witness) and three new public outputs:
+//   * nullifier        = SHA-256(0x01 || holder_seed || context_hash)
+//                        (rewritten invariant 7; was stable_id-bound in v11)
+//   * enroll_commit    = SHA-256(0x03 || holder_seed)
+//                        (invariant 14; bound to JSON `holder_seed_commit`
+//                         hex via invariant 13; same `holder_seed` wires
+//                         re-used = invariant 15 wire equality)
+//   * enroll_nullifier = SHA-256(0x02 || stable_id || ENROLL_DOMAIN_SEP)
+//                        (invariant 12; issuer-computable handle for
+//                         sybil 1-write enforcement)
+//
+// `context_hash` is a 32-byte fixed-length value (the verifier-chosen
+// scope, pre-hashed by the host) — replaces the variable-length
+// `context_raw` window v11 used for the nullifier preimage.
+//
+// All constants must stay byte-for-byte in sync with the Rust mirror
+// at `crates/zk-eidas-p7s-circuit/src/witness.rs` (HOLDER_SEED_LEN,
+// ENROLL_*_LEN, DS_TAG_*, ENROLL_DOMAIN_SEP).
+
+constexpr size_t kHolderSeedLen      = 32;  // private holder secret
+constexpr size_t kContextHashLen     = 32;  // app context, pre-hashed
+constexpr size_t kEnrollCommitLen    = 32;  // SHA-256(0x03 || holder_seed)
+constexpr size_t kEnrollNullifierLen = 32;  // SHA-256(0x02 || stable_id || ENROLL_DOMAIN_SEP)
+
+constexpr uint8_t kDsTagPerAppNullifier = 0x01;
+constexpr uint8_t kDsTagEnrollNullifier = 0x02;
+constexpr uint8_t kDsTagEnrollCommit    = 0x03;
+
+// "zk-eidas-enroll!" — 16 bytes, ASCII, no NUL padding.
+constexpr uint8_t kEnrollDomainSep[16] = {
+    0x7a, 0x6b, 0x2d, 0x65, 0x69, 0x64, 0x61, 0x73,
+    0x2d, 0x65, 0x6e, 0x72, 0x6f, 0x6c, 0x6c, 0x21,
+};
+constexpr size_t kEnrollDomainSepLen = 16;
 
 }  // namespace p7s
 }  // namespace proofs
