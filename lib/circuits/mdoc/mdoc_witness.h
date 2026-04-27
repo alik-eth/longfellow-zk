@@ -661,6 +661,20 @@ class MdocHashWitness {
   FlatSHA256Witness::BlockWitness escrow_bw_[5];
   uint8_t escrow_digest_[32];
 
+  // v12: holder-bound nullifier scratch.
+  // holder_seed_ is the wallet-derived 32-byte secret (Path B: TEE-ECDH
+  // against Q_anchor). holder_seed_commit_ = SHA-256(0x03 || holder_seed_)
+  // is routed into the COSE1 Sig_structure external_aad slot at proof
+  // time and is also the value the issuer signs.
+  uint8_t holder_seed_[32];
+  uint8_t holder_seed_commit_[32];
+  uint8_t enroll_commit_block_[64];
+  FlatSHA256Witness::BlockWitness enroll_commit_bw_;
+  uint8_t enroll_commit_hash_[32];
+  uint8_t enroll_nullifier_block_[64];
+  FlatSHA256Witness::BlockWitness enroll_nullifier_bw_;
+  uint8_t enroll_nullifier_hash_[32];
+
   ParsedMdoc pm_;
 
   explicit MdocHashWitness(size_t num_attr, const EC& ec, const Field& Fn)
@@ -671,6 +685,12 @@ class MdocHashWitness {
     memset(binding_hash_, 0, 32);
     memset(escrow_block_, 0, 320);
     memset(escrow_digest_, 0, 32);
+    memset(holder_seed_, 0, 32);
+    memset(holder_seed_commit_, 0, 32);
+    memset(enroll_commit_block_, 0, 64);
+    memset(enroll_commit_hash_, 0, 32);
+    memset(enroll_nullifier_block_, 0, 64);
+    memset(enroll_nullifier_hash_, 0, 32);
   }
 
   void fill_cbor_index(DenseFiller<Field>& df, const CborIndex& ind) const {
@@ -841,6 +861,24 @@ class MdocHashWitness {
     for (size_t j = 0; j < 5; ++j) {
       fill_sha(filler, escrow_bw_[j]);
     }
+
+    // v12 witnesses: holder_seed[32], holder_seed_commit[32],
+    // enroll_commit (64-byte block + 1 BlockWitness),
+    // enroll_nullifier (64-byte block + 1 BlockWitness).
+    for (size_t i = 0; i < 32; ++i) {
+      filler.push_back(holder_seed_[i], 8, fn_);
+    }
+    for (size_t i = 0; i < 32; ++i) {
+      filler.push_back(holder_seed_commit_[i], 8, fn_);
+    }
+    for (size_t i = 0; i < 64; ++i) {
+      filler.push_back(enroll_commit_block_[i], 8, fn_);
+    }
+    fill_sha(filler, enroll_commit_bw_);
+    for (size_t i = 0; i < 64; ++i) {
+      filler.push_back(enroll_nullifier_block_[i], 8, fn_);
+    }
+    fill_sha(filler, enroll_nullifier_bw_);
   }
 
   size_t max_shablocks(size_t version) const {

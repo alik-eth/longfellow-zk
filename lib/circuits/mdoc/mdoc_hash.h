@@ -140,6 +140,27 @@ class MdocHash {
     v8 escrow_in_[256];  // 8 × 32-byte fields concatenated
     ShaBlockWitness escrow_bw_[5];  // 5 SHA-256 blocks
 
+    // v12: holder-bound nullifier witnesses.
+    //
+    // holder_seed_ feeds three separate SHA preimages:
+    //   - nullifier_in_  via assert_nullifier      (v12: SHA(0x01||seed||contract))
+    //   - enroll_commit_in_ via assert_enroll_commit (SHA(0x03||seed))
+    // The SAME holder_seed_ wires are referenced from both, providing
+    // cross-output binding (v12 invariant 15 mdoc-equivalent): a malicious
+    // prover cannot satisfy both SHAs under contradictory holder_seed values.
+    //
+    // holder_seed_commit_ is a separate witness whose bytes are routed into
+    // the COSE1 Sig_structure external_aad slot by construct_signature_preimage.
+    // assert_enroll_commit pins it to the enroll_commit_target output via
+    // byte-equality (v12 invariant 13 mdoc-equivalent), binding the issuer
+    // signature to holder_seed.
+    v8 holder_seed_[32];
+    v8 holder_seed_commit_[32];
+    v8 enroll_commit_in_[64];        // SHA preimage scratchpad (1 block)
+    ShaBlockWitness enroll_commit_bw_;
+    v8 enroll_nullifier_in_[64];     // SHA preimage scratchpad (1 block)
+    ShaBlockWitness enroll_nullifier_bw_;
+
     explicit Witness(size_t num_attr) {
       num_attr_ = num_attr;
       attr_mso_.resize(num_attr);
@@ -158,7 +179,10 @@ class MdocHash {
       nb_ = lc.template vinput<8>();
 
       // sha input init =========================
-      for (size_t i = 0; i + kCose1PrefixLen < 64 * kMaxSHABlocks; ++i) {
+      // v12: prefix is 51 bytes (vs v11's 18), so the MSO-payload witness
+      // budget shrinks accordingly. Same kMaxSHABlocks; longer prefix steals
+      // from payload.
+      for (size_t i = 0; i + kCose1PrefixV12Len < 64 * kMaxSHABlocks; ++i) {
         in_[i] = lc.template vinput<8>();
       }
       for (size_t j = 0; j < kMaxSHABlocks; j++) {
@@ -203,6 +227,24 @@ class MdocHash {
       for (size_t j = 0; j < 5; ++j) {
         escrow_bw_[j].input(lc);
       }
+
+      // v12 witnesses: holder_seed[32], holder_seed_commit[32],
+      // enroll_commit (64-byte SHA preimage + 1 BlockWitness),
+      // enroll_nullifier (64-byte SHA preimage + 1 BlockWitness).
+      for (size_t i = 0; i < 32; ++i) {
+        holder_seed_[i] = lc.template vinput<8>();
+      }
+      for (size_t i = 0; i < 32; ++i) {
+        holder_seed_commit_[i] = lc.template vinput<8>();
+      }
+      for (size_t i = 0; i < 64; ++i) {
+        enroll_commit_in_[i] = lc.template vinput<8>();
+      }
+      enroll_commit_bw_.input(lc);
+      for (size_t i = 0; i < 64; ++i) {
+        enroll_nullifier_in_[i] = lc.template vinput<8>();
+      }
+      enroll_nullifier_bw_.input(lc);
     }
   };
 
