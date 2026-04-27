@@ -170,6 +170,13 @@ constexpr size_t kEnrollNullifierShaMaxBytes = 64 * kEnrollNullifierShaBlocks;  
 // log2(33) → 6.
 constexpr size_t kEnrollNullifierShaLenBits = 6;
 
+// v12 invariant 13 — `holder_seed_commit` JSON field is a 32-byte
+// SHA-256 digest serialized as 64 lowercase hex characters in the
+// binding JSON. Same hex-decode pipeline as `pk` (130 hex / 65 bytes)
+// and `nonce` (64 hex / 32 bytes).
+constexpr size_t kHolderSeedCommitHexLen = 64;
+constexpr size_t kHolderSeedCommitBytes = 32;
+
 }  // namespace p7s
 }  // namespace proofs
 

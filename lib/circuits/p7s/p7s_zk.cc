@@ -688,6 +688,29 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   auto json_context_offset = lc.template vinput<kSignedContentLogN>();
   auto json_declaration_offset = lc.template vinput<kSignedContentLogN>();
 
+  // v12 (Plan 1) invariant 13 — `holder_seed_commit` hex locator
+  // (and the 64-char hex window + per-char nibble witnesses + 32-byte
+  // decoded byte array). Same shape as `pk` / `nonce`: routing.shift
+  // pulls the 64-char window from `signed_content`, breq.assert_eq
+  // ties it to `holder_seed_commit_hex`, and hex_decode.assert_decodes
+  // produces `holder_seed_commit_bytes`. The 32 decoded bytes are
+  // then constrained to equal the v256 `enroll_commit_target` (the
+  // SHA output of invariant 14) — closing invariant 13's binding.
+  auto json_holder_seed_commit_offset =
+      lc.template vinput<kSignedContentLogN>();
+  std::vector<typename LC::v8> holder_seed_commit_hex(kHolderSeedCommitHexLen);
+  for (size_t i = 0; i < kHolderSeedCommitHexLen; ++i) {
+    holder_seed_commit_hex[i] = lc.template vinput<8>();
+  }
+  std::vector<typename LC::v8> hsc_nibbles(kHolderSeedCommitHexLen);
+  for (size_t i = 0; i < kHolderSeedCommitHexLen; ++i) {
+    hsc_nibbles[i] = lc.template vinput<8>();
+  }
+  std::vector<typename LC::v8> holder_seed_commit_bytes(kHolderSeedCommitBytes);
+  for (size_t i = 0; i < kHolderSeedCommitBytes; ++i) {
+    holder_seed_commit_bytes[i] = lc.template vinput<8>();
+  }
+
   // Invariant 2b: signed_content_numb, block witnesses, message_digest.
   auto signed_content_numb = lc.template vinput<8>();
   std::vector<SignedContentShaBw> signed_content_bw(kSignedContentMaxBlocks);
@@ -882,6 +905,47 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // Invariant 5b.
   hex_decode.assert_decodes(nonce_hex.data(), nonce_bytes.data(),
                             nonce_nibbles.data(), kNonceBytes);
+
+  // v12 (Plan 1) Invariant 13 — extract `holder_seed_commit` hex from
+  // signed_content, hex-decode to 32 bytes, and bind the result to
+  // `enroll_commit_target` (the v256 SHA output of invariant 14).
+  // Soundness chain:
+  //   * routing.shift pulls 64 hex chars from signed_content[hsc_off..+64]
+  //   * breq.assert_eq ties the routed window to `holder_seed_commit_hex`
+  //   * hex_decode.assert_decodes ties hex → 32 raw bytes (3-layer
+  //     soundness: nibble bound + bit packing + 16-way char/nibble
+  //     lookup, see hex_decode.h)
+  //   * v8 ↔ v256 conversion + lc.assert_eq closes byte-equality
+  //     against the SHA output. Since invariant 14 ties enroll_commit
+  //     = SHA-256(0x03 || holder_seed) and invariant 13 ties the same
+  //     bytes to the (QTSP-signed) JSON commit, both binding holes
+  //     are sealed: any prover whose holder_seed disagrees with the
+  //     credential's holder_seed_commit fails one or the other.
+  {
+    std::vector<typename LC::v8> hsc_window(kHolderSeedCommitHexLen);
+    routing.template shift<typename LC::v8, kSignedContentLogN>(
+        json_holder_seed_commit_offset, kHolderSeedCommitHexLen,
+        hsc_window.data(), kMaxSignedContent, signed_content.data(), zz,
+        /*unroll=*/3);
+    breq.assert_eq(hsc_window.data(), holder_seed_commit_hex.data(),
+                   kHolderSeedCommitHexLen);
+
+    hex_decode.assert_decodes(holder_seed_commit_hex.data(),
+                              holder_seed_commit_bytes.data(),
+                              hsc_nibbles.data(), kHolderSeedCommitBytes);
+
+    // Bind decoded bytes to enroll_commit_target. Inverse of the
+    // FlatSHA bit-decomposition used at invariant 14's
+    // `assert_message_hash`: byte i.bits[bit_idx] sit at v256 index
+    // (31 - i)*8 + bit_idx. Same pattern used in invariant 7 to feed
+    // context_hash bytes into the nullifier preimage.
+    for (size_t i = 0; i < kHolderSeedCommitBytes; ++i) {
+      for (size_t b = 0; b < 8; ++b) {
+        lc.assert_eq(holder_seed_commit_bytes[i][b],
+                     enroll_commit_target[(31 - i) * 8 + b]);
+      }
+    }
+  }
 
   // Invariant 6.
   auto ctx_len = context_hasher.template derive_byte_len<kContextLenBits>(
