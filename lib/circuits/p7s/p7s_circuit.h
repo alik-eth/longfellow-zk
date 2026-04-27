@@ -122,21 +122,17 @@ constexpr size_t kSignedAttrsMdPrefixLen = 17;
 constexpr size_t kSignedAttrsMdWindowLen =
     kSignedAttrsMdPrefixLen + kMessageDigestLen;  // 17 + 32 = 49
 
-// ---- Invariant 7 (Task 34) — nullifier from stable-ID ----
+// ---- Invariant 7 (Task 34, rewritten in v12) — per-app nullifier ----
 //
-// The X.520 serialNumber attribute in cert_tbs's Subject DN carries
-// the holder's stable identifier (DIIA: `TINUA-` + 10-digit RNOKPP =
-// 16 bytes PrintableString). Invariant 7 routes a 9-byte DER anchor +
-// 16-byte value window from cert_tbs at `subject_sn_offset_in_tbs`,
-// asserts the anchor on-wire, range-checks
-// `subject_sn_offset_in_tbs > subject_dn_start_offset_in_tbs` (the
-// ISSUER DN's serialNumber attribute has the SAME 9-byte prefix —
-// the range check is the sole disambiguator, without it a prover
-// could bind the nullifier to the issuer's ID), and computes
-// `SHA-256(stable_id[16] || context_raw[..ctx_len])` as a new 256-bit
-// public output `nullifier`.
+// v11 (Task 34) bound the nullifier to the X.520 serialNumber stable
+// identifier. v12 (Plan 1, 2026-04-27) rewrites it to a holder-side
+// secret: `nullifier = SHA-256(0x01 || holder_seed[32] || context_hash[32])`.
+// The stable_id is still extracted from cert_tbs's Subject DN — but
+// in v12 it feeds invariant 12's `enroll_nullifier` (issuer-computable
+// sybil handle), not invariant 7. The dual-match anchor + range check
+// machinery is unchanged; only the SHA preimage shape moved.
 //
-// Anchor literal:
+// Anchor literal (unchanged from v11):
 //   30 17                  Attribute SEQUENCE hdr (l=23)
 //   06 03 55 04 05         OID 2.5.4.5 (id-at-serialNumber)
 //   13 10                  PrintableString hdr (l=16)
@@ -149,16 +145,30 @@ constexpr size_t kSubjectSnAnchorLen = 9;
 constexpr size_t kSubjectSnWindowLen =
     kSubjectSnAnchorLen + kStableIdLen;  // 25
 
-// Nullifier SHA input is `stable_id[16] || context_raw[..ctx_len]`.
-// With kContextMaxBytes = 32 and the 9-byte SHA padding floor,
-// 16 + 32 + 9 = 57 < 64, so a SINGLE SHA-256 block holds the padded
-// preimage. The raw input length fits in 6 bits (max 48 bytes).
-constexpr size_t kNullifierShaBlocks = 1;
-constexpr size_t kNullifierShaMaxBytes = 64 * kNullifierShaBlocks;  // 64
-// log2 of the max raw-preimage byte length, rounded up. max raw =
-// kStableIdLen + kContextMaxBytes = 16 + 32 = 48; log2(48) → 6.
-constexpr size_t kNullifierShaLenBits = 6;
+// v12 nullifier SHA input is `0x01 || holder_seed[32] || context_hash[32]`
+// = 65 bytes raw. SHA-256 Merkle-Damgård padding adds ≥9 bytes (0x80 +
+// pad zeros + 64-bit length), so the minimum padded length is 74 bytes,
+// which spills into a SECOND 64-byte block. Bumped from 1 → 2 blocks.
+// Max raw fits in 7 bits (65 ≤ 127).
+constexpr size_t kNullifierShaBlocks = 2;
+constexpr size_t kNullifierShaMaxBytes = 64 * kNullifierShaBlocks;  // 128
+// log2(65) → 7. Width of the bitvec used by the SHA padding length-field.
+constexpr size_t kNullifierShaLenBits = 7;
 constexpr size_t kNullifierLen = 32;                                // SHA-256
+
+// v12 enroll_commit SHA input is `0x03 || holder_seed[32]` = 33 bytes
+// raw. 33 + 9 (pad floor) = 42 < 64 → exactly 1 block.
+constexpr size_t kEnrollCommitShaBlocks = 1;
+constexpr size_t kEnrollCommitShaMaxBytes = 64 * kEnrollCommitShaBlocks;  // 64
+// log2(33) → 6.
+constexpr size_t kEnrollCommitShaLenBits = 6;
+
+// v12 enroll_nullifier SHA input is `0x02 || stable_id[16] ||
+// ENROLL_DOMAIN_SEP[16]` = 33 bytes raw → exactly 1 block.
+constexpr size_t kEnrollNullifierShaBlocks = 1;
+constexpr size_t kEnrollNullifierShaMaxBytes = 64 * kEnrollNullifierShaBlocks;  // 64
+// log2(33) → 6.
+constexpr size_t kEnrollNullifierShaLenBits = 6;
 
 }  // namespace p7s
 }  // namespace proofs
