@@ -728,16 +728,19 @@ class MdocHashWitness {
     }
   }
 
-  // Compute nullifier = SHA-256(e_bytes || contract_hash).
-  // Must be called after compute_witness() (which sets e_).
+  // v12 per-app nullifier: SHA-256(0x01 || holder_seed_[32] || contract_hash[8]).
+  // Must be called after holder_seed_ is set on the host (caller responsibility).
+  // The v12 hash decouples from the MSO digest e_; the same value is computed
+  // by the in-circuit assert_nullifier from the SAME holder_seed_ wires.
   void compute_nullifier(const uint8_t contract_hash[8]) {
-    uint8_t msg[40];
-    ec_.f_.to_bytes_field(msg, e_);
-    memcpy(msg + 32, contract_hash, 8);
+    uint8_t msg[41];
+    msg[0] = 0x01;
+    memcpy(msg + 1, holder_seed_, 32);
+    memcpy(msg + 33, contract_hash, 8);
 
     uint8_t nb;
     FlatSHA256Witness::transform_and_witness_message(
-        40, msg, 1, nb, nullifier_block_, &nullifier_bw_);
+        41, msg, 1, nb, nullifier_block_, &nullifier_bw_);
 
     // Extract hash from block witness h1 (big-endian uint32_t[8])
     for (size_t i = 0; i < 8; ++i) {

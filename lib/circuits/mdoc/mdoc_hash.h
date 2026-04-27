@@ -305,8 +305,8 @@ class MdocHash {
     assert_key(dpkx, &cmp_buf[kPkxInd]);
     assert_key(dpky, &cmp_buf[kPkyInd]);
 
-    // Nullifier: SHA-256(e || contract_hash) == nullifier_target
-    assert_nullifier(e, contract_hash, nullifier_target, vw);
+    // v12 per-app nullifier: SHA-256(0x01 || holder_seed || contract_hash)
+    assert_nullifier(vw, contract_hash, nullifier_target);
 
     // Holder binding: SHA-256(oa[0].v1[0..31]) == binding_target
     assert_binding(oa[0], binding_target, vw);
@@ -656,33 +656,40 @@ class MdocHash {
     lc_.vmux(sh.perm[2 * slot], len, t[1], t[0]);
   }
 
-  // Asserts nullifier = SHA-256(e || contract_hash) where e is the 32-byte
-  // big-endian MSO hash and contract_hash is 8 bytes.  The full 64-byte
-  // SHA-256 block is constrained: 32 bytes e + 8 bytes contract_hash +
-  // 24 bytes deterministic padding (0x80 + zeros + 0x0140 length).
-  void assert_nullifier(const v256& e, const v8 contract_hash[/*8*/],
-                        const v256& nullifier_target,
-                        const Witness& vw) const {
-    // Assert witness bytes 0..31 match e (little-endian, matching to_bytes_field).
-    // e[j] = bit j%8 of e_bytes[j/8], where e_bytes is to_bytes_field output.
-    for (size_t j = 0; j < 256; ++j) {
-      lc_.assert_eq(vw.nullifier_in_[j / 8][j % 8], e[j]);
+  // v12 per-app nullifier: SHA-256(0x01 || holder_seed[32] || contract_hash[8]).
+  // Preimage = 41 bytes; SHA pad floor -> 1 block. The 1-byte domain-sep
+  // tag (DS_TAG_PER_APP_NULLIFIER = 0x01, mirrors zk-eidas-p7s outputs)
+  // segregates this hash from enroll_commit (0x03) and enroll_nullifier
+  // (0x02).
+  //
+  // Note (vs v11): v11 hashed (e || contract_hash) -- using the MSO digest
+  // as the secret. v12 replaces e with holder_seed, decoupling the per-app
+  // nullifier from the issuer-side credential bytes and giving it a
+  // wallet-derived secret that is uniform across credential reissuance.
+  // The same vw.holder_seed_ wires are referenced by assert_enroll_commit,
+  // providing the cross-output binding (invariant 15 mdoc-equivalent).
+  void assert_nullifier(const Witness& vw, const v8 contract_hash[/*8*/],
+                        const v256& nullifier_target) const {
+    // byte 0: domain-sep tag 0x01
+    lc_.vassert_eq(vw.nullifier_in_[0], lc_.template vbit<8>(0x01));
+    // bytes 1..33: holder_seed
+    for (size_t i = 0; i < 32; ++i) {
+      lc_.vassert_eq(vw.nullifier_in_[1 + i], vw.holder_seed_[i]);
     }
-    // Assert witness bytes 32..39 match contract_hash
+    // bytes 33..41: contract_hash
     for (size_t i = 0; i < 8; ++i) {
-      lc_.vassert_eq(vw.nullifier_in_[32 + i], contract_hash[i]);
+      lc_.vassert_eq(vw.nullifier_in_[33 + i], contract_hash[i]);
     }
-    // Assert deterministic SHA-256 padding for 40-byte message
-    // byte 40: 0x80, bytes 41..55: 0x00, bytes 56..61: 0x00,
-    // byte 62: 0x01, byte 63: 0x40  (320 bits = 0x0140)
-    lc_.vassert_eq(vw.nullifier_in_[40], lc_.template vbit<8>(0x80));
-    for (size_t i = 41; i < 62; ++i) {
+    // SHA-256 padding for 41-byte message:
+    // byte 41: 0x80, bytes 42..61: 0x00, bytes 62..63 = BE length
+    // 41*8 = 328 = 0x0148 -> byte 62 = 0x01, byte 63 = 0x48
+    lc_.vassert_eq(vw.nullifier_in_[41], lc_.template vbit<8>(0x80));
+    for (size_t i = 42; i < 62; ++i) {
       lc_.vassert_eq(vw.nullifier_in_[i], lc_.template vbit<8>(0x00));
     }
     lc_.vassert_eq(vw.nullifier_in_[62], lc_.template vbit<8>(0x01));
-    lc_.vassert_eq(vw.nullifier_in_[63], lc_.template vbit<8>(0x40));
+    lc_.vassert_eq(vw.nullifier_in_[63], lc_.template vbit<8>(0x48));
 
-    // Verify SHA-256 hash of the block matches nullifier_target
     auto one = lc_.template vbit<8>(1);
     sha_.assert_message_hash(1, one, vw.nullifier_in_, nullifier_target,
                              &vw.nullifier_bw_);
