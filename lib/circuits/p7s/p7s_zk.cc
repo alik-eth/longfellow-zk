@@ -317,7 +317,9 @@ using ContextHash = P7sHash<LC, kContextMaxBlocks>;
 using SignedContentHash = P7sHash<LC, kSignedContentMaxBlocks>;
 using CertTbsHash = P7sHash<LC, kCertTbsMaxBlocks>;
 using SignedAttrsHash = P7sHash<LC, kSignedAttrsMaxBlocks>;
-using NullifierHash = P7sHash<LC, kNullifierShaBlocks>;  // v11 (Task 34)
+using NullifierHash = P7sHash<LC, kNullifierShaBlocks>;  // v11; rewired in v12
+using EnrollCommitHash = P7sHash<LC, kEnrollCommitShaBlocks>;        // v12
+using EnrollNullifierHash = P7sHash<LC, kEnrollNullifierShaBlocks>;  // v12
 using ByteRangeEqC = ByteRangeEq<LC>;
 using HexDecodeC = HexDecode<LC>;
 using RoutingC = Routing<LC>;
@@ -325,7 +327,9 @@ using ContextShaBw = ContextHash::ShaBlockWitness;
 using SignedContentShaBw = SignedContentHash::ShaBlockWitness;
 using CertTbsShaBw = CertTbsHash::ShaBlockWitness;
 using SignedAttrsShaBw = SignedAttrsHash::ShaBlockWitness;
-using NullifierShaBw = NullifierHash::ShaBlockWitness;  // v11 (Task 34)
+using NullifierShaBw = NullifierHash::ShaBlockWitness;  // v11; rewired in v12
+using EnrollCommitShaBw = EnrollCommitHash::ShaBlockWitness;        // v12
+using EnrollNullifierShaBw = EnrollNullifierHash::ShaBlockWitness;  // v12
 
 // 26-byte P-256 SPKI DER prefix — kept in both the host parser
 // (`crates/zk-eidas-p7s/src/parser.rs`) and the hash circuit's
@@ -588,6 +592,17 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // order consistent with the circuit's `assert_message_hash`.
   auto nullifier = lc.template vinput<256>();
 
+  // v12 (Plan 1) public outputs — invariants 14 / 12 SHA targets.
+  // Same FlatSHA bit-decomposition convention as `nullifier`. Public
+  // blob byte order is set in the v12 233-byte layout:
+  //   nullifier         at bytes [133..165)
+  //   enroll_commit     at bytes [165..197)
+  //   enroll_nullifier  at bytes [197..229)
+  // Wire-declaration order matches; Task 1.8 wires the prover-side
+  // public-input emission to honor it.
+  auto enroll_commit_target = lc.template vinput<256>();      // invariant 14
+  auto enroll_nullifier_target = lc.template vinput<256>();   // invariant 12
+
   // v11 / Task 34; activated in Task 36; real bound check in Task #44.
   // trust_anchor_index (v32). The public blob carries a u32 selecting
   // which entry of the compile-time `kTrustAnchors[]` table the sig
@@ -786,6 +801,43 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   std::vector<NullifierShaBw> nullifier_input_bw(kNullifierShaBlocks);
   for (size_t b = 0; b < kNullifierShaBlocks; ++b) {
     nullifier_input_bw[b].input(lc);
+  }
+
+  // v12 (Plan 1) — invariant 14 (enroll_commit) private witness:
+  //   enroll_commit_input[64]   host-padded SHA preimage
+  //                             `0x03 || holder_seed[32] || SHA_pad` (33
+  //                             bytes raw → 1 block).
+  //   enroll_commit_input_bw[1] FlatSHA per-block intermediate witnesses.
+  // The 33 bytes [0..33) are constrained byte-for-byte against constants
+  // (tag at [0]) and the shared `holder_seed` wires ([1..33)); bytes
+  // [33..64) are constrained to the SHA padding constants. Block count
+  // is fixed at 1.
+  std::vector<typename LC::v8> enroll_commit_input(kEnrollCommitShaMaxBytes);
+  for (size_t i = 0; i < kEnrollCommitShaMaxBytes; ++i) {
+    enroll_commit_input[i] = lc.template vinput<8>();
+  }
+  std::vector<EnrollCommitShaBw> enroll_commit_input_bw(kEnrollCommitShaBlocks);
+  for (size_t b = 0; b < kEnrollCommitShaBlocks; ++b) {
+    enroll_commit_input_bw[b].input(lc);
+  }
+
+  // v12 (Plan 1) — invariant 12 (enroll_nullifier) private witness:
+  //   enroll_nullifier_input[64]    host-padded SHA preimage
+  //                                 `0x02 || stable_id[16] ||
+  //                                  ENROLL_DOMAIN_SEP[16] || SHA_pad`
+  //                                 (33 bytes raw → 1 block).
+  //   enroll_nullifier_input_bw[1]  FlatSHA per-block intermediate witnesses.
+  // The 33 bytes [0..33) are constrained: tag at [0], stable_id from
+  // the routed sn_window at [1..17), ENROLL_DOMAIN_SEP constant at
+  // [17..33). Bytes [33..64) are SHA padding constants.
+  std::vector<typename LC::v8> enroll_nullifier_input(kEnrollNullifierShaMaxBytes);
+  for (size_t i = 0; i < kEnrollNullifierShaMaxBytes; ++i) {
+    enroll_nullifier_input[i] = lc.template vinput<8>();
+  }
+  std::vector<EnrollNullifierShaBw> enroll_nullifier_input_bw(
+      kEnrollNullifierShaBlocks);
+  for (size_t b = 0; b < kEnrollNullifierShaBlocks; ++b) {
+    enroll_nullifier_input_bw[b].input(lc);
   }
 
   // MAC witness (prover's `ap` halves). Four bound messages:
@@ -1109,6 +1161,60 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   NullifierHash(lc).assert_message_hash(
       nullifier_input_numb, nullifier_input.data(),
       nullifier, nullifier_input_bw.data());
+
+  // v12 (Plan 1) — invariant 14 (enroll_commit) +
+  // invariant 15 (wire equality with invariant 7's holder_seed).
+  //   enroll_commit == SHA-256(0x03 || holder_seed[32])
+  //
+  // Preimage is 33 bytes raw, fits in 1 SHA-256 block (64 bytes
+  // padded). All bytes are constants or shared `holder_seed[i]`
+  // wires:
+  //   enroll_commit_input[0]      == 0x03 (kDsTagEnrollCommit)
+  //   enroll_commit_input[1..33)  == holder_seed[0..32)
+  //   enroll_commit_input[33..64) == SHA pad constants
+  // Reusing the same `holder_seed[i]` v8 wires as invariant 7
+  // satisfies invariant 15 (wire equality across the two preimages)
+  // by construction — no separate cross-buffer assertion needed.
+  {
+    // (a) Domain-separation tag at byte 0.
+    typename LC::v8 ds_tag = lc.template vbit<8>(kDsTagEnrollCommit);
+    breq.assert_eq(&enroll_commit_input[0], &ds_tag, 1);
+
+    // (b) holder_seed[32] at bytes 1..33 — SAME wires as invariant 7.
+    for (size_t i = 0; i < kHolderSeedLen; ++i) {
+      for (size_t b = 0; b < 8; ++b) {
+        lc.assert_eq(enroll_commit_input[1 + i][b], holder_seed[i][b]);
+      }
+    }
+
+    // (c) SHA pad for 33-byte message → 1 block. Layout:
+    //   byte 33       = 0x80
+    //   bytes 34..62  = 0x00
+    //   bytes 62..64  = 0x01 0x08 (264 = 33 * 8 bits, BE u16 in tail)
+    typename LC::v8 pad80 = lc.template vbit<8>(0x80);
+    typename LC::v8 pad00 = lc.template vbit<8>(0x00);
+    typename LC::v8 len_hi = lc.template vbit<8>(0x01);
+    typename LC::v8 len_lo = lc.template vbit<8>(0x08);
+    breq.assert_eq(&enroll_commit_input[33], &pad80, 1);
+    for (size_t i = 34; i < 62; ++i) {
+      breq.assert_eq(&enroll_commit_input[i], &pad00, 1);
+    }
+    breq.assert_eq(&enroll_commit_input[62], &len_hi, 1);
+    breq.assert_eq(&enroll_commit_input[63], &len_lo, 1);
+
+    // SHA block count is fixed at 1 — pass a constant v8 to the
+    // FlatSHA call. (Unlike invariant 7's nullifier_input_numb, we
+    // don't allocate a separate witness wire here since the block
+    // count for invariant 14 is compile-time constant.)
+    typename LC::v8 numb_const =
+        lc.template vbit<8>(kEnrollCommitShaBlocks);
+
+    // (d) SHA-256 over the padded 1-block preimage equals the public
+    // `enroll_commit_target` v256 output. Same FlatSHA convention.
+    EnrollCommitHash(lc).assert_message_hash(
+        numb_const, enroll_commit_input.data(),
+        enroll_commit_target, enroll_commit_input_bw.data());
+  }
 
   // Task 29 / 26 — cross-field MAC binding to (e, e2, SPKI_X, SPKI_Y).
   // Digest views — byte-identical to the flatsha views (same wires,
