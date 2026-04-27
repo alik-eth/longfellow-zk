@@ -809,7 +809,10 @@ class MdocHashWitness {
     // Fill sha of main mso.
     filler.push_back(numb_, 8, fn_);
     // Don't push the prefix.  Version <=7 has a 35-block limit.
-    for (size_t i = kCose1PrefixLen; i < max_shablocks(version) * 64; ++i) {
+    // v12: prefix grew 18 -> 51 bytes, so the post-prefix payload window
+    // shrinks accordingly. Circuit-side input() reads in_[] starting from
+    // i + kCose1PrefixV12Len; this push must lockstep.
+    for (size_t i = kCose1PrefixV12Len; i < max_shablocks(version) * 64; ++i) {
       filler.push_back(signed_bytes_[i], 8, fn_);
     }
     for (size_t j = 0; j < max_shablocks(version); j++) {
@@ -900,12 +903,18 @@ class MdocHashWitness {
     if (version < 4) return MDOC_PROVER_VERSION_NOT_SUPPORTED;
 
     std::vector<uint8_t> buf;
-    if (pm_.t_mso_.len >= max_shablocks(version) * 64 - 9 - kCose1PrefixLen) {
+    if (pm_.t_mso_.len >= max_shablocks(version) * 64 - 9 - kCose1PrefixV12Len) {
       log(ERROR, "tagged mso is too big: %zu", pm_.t_mso_.len);
       return MDOC_PROVER_TAGGED_MSO_TOO_BIG;
     }
 
-    buf.assign(std::begin(kCose1Prefix), std::end(kCose1Prefix));
+    // v12: copy the 51-byte COSE1 prefix and overwrite bytes [18..50)
+    // with the 32-byte holder_seed_commit (compute_holder_seed_commit()
+    // must have populated it before this call).
+    buf.assign(std::begin(kCose1PrefixV12), std::end(kCose1PrefixV12));
+    for (size_t i = 0; i < kHolderSeedCommitWitnessLen; ++i) {
+      buf[kHolderSeedCommitPrefixOffset + i] = holder_seed_commit_[i];
+    }
     // Add 2-byte length
     buf.push_back((pm_.t_mso_.len >> 8) & 0xff);
     buf.push_back(pm_.t_mso_.len & 0xff);

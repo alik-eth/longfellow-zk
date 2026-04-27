@@ -372,13 +372,25 @@ class MdocHash {
   }
 
  private:
+  // v12 COSE1 preimage: same Sig_structure shape as v11 but with
+  // holder_seed_commit (32 witness bytes) routed into the external_aad
+  // slot at offset [18..50). Constant prefix bytes outside that window
+  // come from kCose1PrefixV12; the 32-byte witness slot is overwritten
+  // with vw.holder_seed_commit_ wires before the SHA chain consumes the
+  // buffer. The MSO payload bytes follow at offset kCose1PrefixV12Len.
   std::vector<v8> construct_signature_preimage(const Witness& vw) const {
     std::vector<v8> bbuf(64 * kMaxSHABlocks);
     for (size_t i = 0; i < 64 * kMaxSHABlocks; ++i) {
-      if (i < kCose1PrefixLen) {
-        lc_.bits(8, bbuf[i].data(), kCose1Prefix[i]);
+      if (i < kCose1PrefixV12Len) {
+        if (i >= kHolderSeedCommitPrefixOffset &&
+            i < kHolderSeedCommitPrefixOffset + kHolderSeedCommitWitnessLen) {
+          size_t hsc_idx = i - kHolderSeedCommitPrefixOffset;
+          bbuf[i] = vw.holder_seed_commit_[hsc_idx];
+        } else {
+          lc_.bits(8, bbuf[i].data(), kCose1PrefixV12[i]);
+        }
       } else {
-        bbuf[i] = vw.in_[i - kCose1PrefixLen];
+        bbuf[i] = vw.in_[i - kCose1PrefixV12Len];
       }
     }
     return bbuf;
