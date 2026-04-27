@@ -39,6 +39,51 @@ static constexpr size_t kCose1PrefixLen = 18;
 constexpr static const size_t kMaxMsoLen =
     kMaxSHABlocks * 64 - 9 - kCose1PrefixLen;
 
+// v12 (issuer-pseudonym privacy via holder-bound nullifier).
+// Layout: same COSE1 Sig_structure as v11, but external_aad carries
+// holder_seed_commit (32 bytes) instead of being empty.
+//
+//   84             - array(4)
+//   6A 53..31      - "Signature1" (10 bytes text)
+//   43 A1 01 26    - protected = bstr(3) {1: -7} = ES256
+//   58 20 <32B>    - external_aad = bstr(32) holder_seed_commit  <- NEW slot
+//   59 <2-byte len>- payload bstr length-prefix
+//
+// The 32 bytes between bytes 18 and 50 are NOT a constant -- they are
+// witness inputs supplied at proof time. The constant array contains
+// zeros at those positions; the circuit overwrites them with witness
+// wires (see mdoc_hash.h::construct_signature_preimage).
+static constexpr uint8_t kCose1PrefixV12[51] = {
+    0x84, 0x6A, 0x53, 0x69, 0x67, 0x6E, 0x61, 0x74, 0x75, 0x72, 0x65, 0x31,
+    0x43, 0xA1, 0x01, 0x26,
+    0x58, 0x20,                        // bstr(32) length-prefix for external_aad
+    /* bytes 18..50: holder_seed_commit witness slot -- zero in constant table */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x59,                              // payload bstr length-prefix
+};
+static constexpr size_t kCose1PrefixV12Len            = 51;
+static constexpr size_t kHolderSeedCommitPrefixOffset = 18;
+static constexpr size_t kHolderSeedCommitWitnessLen   = 32;
+
+// Witness-side payload length cap for v12. The longer prefix steals
+// from the payload budget; same kMaxSHABlocks as v11.
+constexpr static const size_t kMaxMsoLenV12 =
+    kMaxSHABlocks * 64 - 9 - kCose1PrefixV12Len;
+
+// 16-byte ASCII domain-separation tag for enroll-nullifier hashing.
+// Mirrors crates/zk-eidas-p7s/src/outputs.rs::ENROLL_DOMAIN_SEP. Defined
+// here for the mdoc circuit's assert_enroll_nullifier; the p7s circuit
+// has its own copy in p7s_hash.h (vendor C++ has no clean cross-circuit
+// shared-header pattern, duplicating the 16-byte constant is fine).
+static constexpr uint8_t kEnrollDomainSep[16] = {
+    'z', 'k', '-', 'e', 'i', 'd', 'a', 's',
+    '-', 'e', 'n', 'r', 'o', 'l', 'l', '!',
+};
+static constexpr size_t kEnrollDomainSepLen = 16;
+
 static constexpr size_t kValidityInfoLen = 12;
 static constexpr size_t kValidFromLen = 9;
 static constexpr size_t kDeviceKeyLen = 9;
