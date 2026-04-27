@@ -656,6 +656,46 @@ class MdocHash {
     lc_.vmux(sh.perm[2 * slot], len, t[1], t[0]);
   }
 
+  // v12 enroll-nullifier: SHA-256(0x02 || e[32] || ENROLL_DOMAIN_SEP[16]).
+  // Preimage = 49 bytes, SHA pad floor -> 1 block. Tag 0x02 segregates
+  // this from per-app nullifier (0x01) and enroll_commit (0x03).
+  //
+  // The credential-derived secret here is the MSO digest e (same e that
+  // the COSE1 ECDSA verify hashes against deviceKey). Combining e with
+  // a fixed domain-sep gives a stable per-credential identifier for the
+  // enrollment registry that is unlinkable to the per-app nullifier
+  // (different domain-sep + different secret) but reproducible across
+  // presentations of the same credential.
+  void assert_enroll_nullifier(const Witness& vw, const v256& e,
+                               const v256& enroll_nullifier_target) const {
+    // byte 0: domain-sep tag 0x02
+    lc_.vassert_eq(vw.enroll_nullifier_in_[0], lc_.template vbit<8>(0x02));
+    // bytes 1..33: e (same to_bytes_field bit encoding as v11 assert_nullifier
+    // used: bit j%8 of byte j/8).
+    for (size_t j = 0; j < 256; ++j) {
+      lc_.assert_eq(vw.enroll_nullifier_in_[1 + j / 8][j % 8], e[j]);
+    }
+    // bytes 33..49: kEnrollDomainSep
+    for (size_t i = 0; i < kEnrollDomainSepLen; ++i) {
+      lc_.vassert_eq(vw.enroll_nullifier_in_[33 + i],
+                     lc_.template vbit<8>(kEnrollDomainSep[i]));
+    }
+    // SHA-256 padding for 49-byte message:
+    // byte 49: 0x80, bytes 50..61: 0x00, bytes 62..63 = BE length
+    // 49*8 = 392 = 0x0188 -> byte 62 = 0x01, byte 63 = 0x88
+    lc_.vassert_eq(vw.enroll_nullifier_in_[49], lc_.template vbit<8>(0x80));
+    for (size_t i = 50; i < 62; ++i) {
+      lc_.vassert_eq(vw.enroll_nullifier_in_[i], lc_.template vbit<8>(0x00));
+    }
+    lc_.vassert_eq(vw.enroll_nullifier_in_[62], lc_.template vbit<8>(0x01));
+    lc_.vassert_eq(vw.enroll_nullifier_in_[63], lc_.template vbit<8>(0x88));
+
+    auto one = lc_.template vbit<8>(1);
+    sha_.assert_message_hash(1, one, vw.enroll_nullifier_in_,
+                             enroll_nullifier_target,
+                             &vw.enroll_nullifier_bw_);
+  }
+
   // v12 enroll-commit: SHA-256(0x03 || holder_seed[32]). Preimage = 33 bytes,
   // SHA pad floor -> 1 block. Tag 0x03 (DS_TAG_ENROLL_COMMIT) segregates this
   // from the per-app nullifier (0x01) and enroll_nullifier (0x02).

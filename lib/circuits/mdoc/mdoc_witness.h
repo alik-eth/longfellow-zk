@@ -752,6 +752,28 @@ class MdocHashWitness {
     }
   }
 
+  // v12 enroll-nullifier: SHA-256(0x02 || e[32] || ENROLL_DOMAIN_SEP[16]).
+  // Must be called after compute_witness() (which sets e_).
+  void compute_enroll_nullifier() {
+    uint8_t msg[49];
+    msg[0] = 0x02;
+    ec_.f_.to_bytes_field(msg + 1, e_);
+    memcpy(msg + 33, kEnrollDomainSep, kEnrollDomainSepLen);
+
+    uint8_t nb;
+    FlatSHA256Witness::transform_and_witness_message(
+        49, msg, 1, nb, enroll_nullifier_block_, &enroll_nullifier_bw_);
+
+    // Extract hash from block witness h1
+    for (size_t i = 0; i < 8; ++i) {
+      uint32_t w = enroll_nullifier_bw_.h1[i];
+      enroll_nullifier_hash_[i * 4 + 0] = (w >> 24) & 0xff;
+      enroll_nullifier_hash_[i * 4 + 1] = (w >> 16) & 0xff;
+      enroll_nullifier_hash_[i * 4 + 2] = (w >> 8) & 0xff;
+      enroll_nullifier_hash_[i * 4 + 3] = w & 0xff;
+    }
+  }
+
   // v12 enroll-commit: SHA-256(0x03 || holder_seed_[32]). Caller must set
   // holder_seed_ before calling. Also populates holder_seed_commit_ which
   // equals the hash bytes -- the in-circuit assert_enroll_commit pins them
