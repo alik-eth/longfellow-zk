@@ -1026,62 +1026,86 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // TBS fields — never at the holder's stable-ID.
   lc.assert1(lc.vlt(subject_dn_start_offset, subject_sn_offset));
 
-  // Step 4: copy the 16-byte stable-ID from the window into a
-  // fixed-position region of the nullifier SHA preimage. The
-  // nullifier input layout is:
-  //   nullifier_input[0..16]                  = stable_id[16]
-  //   nullifier_input[16..16 + ctx_len]       = context_raw[..ctx_len]
-  //   nullifier_input[16 + ctx_len..SHA_pad]  = Merkle-Damgård padding
-  // Assert byte-equality on the stable-ID prefix (fixed length, so
-  // plain byte_eq works — no mask needed).
-  breq.assert_eq(&sn_window[kSubjectSnAnchorLen], nullifier_input.data(),
-                 kStableIdLen);
+  // v12 (Plan 1, 2026-04-27) — invariant 7 rewritten:
+  //   nullifier == SHA-256(0x01 || holder_seed[32] || context_hash[32])
+  //
+  // The preimage is FIXED-LENGTH (65 bytes raw, 128 bytes SHA-padded
+  // across 2 blocks). All bytes outside the holder_seed and
+  // context_hash regions are compile-time constants — no host-side
+  // variable-length routing, no mask, no length-binding bitvec dance.
+  // Soundness rests on three byte-equality assertions:
+  //   (a) nullifier_input[0]      == 0x01 (kDsTagPerAppNullifier)
+  //   (b) nullifier_input[1..33]  == holder_seed[0..32]    (private)
+  //   (c) nullifier_input[33..65] == context_hash[0..32]   (public)
+  // plus
+  //   (d) nullifier_input[65..128] == SHA-256 padding constants
+  //                                   (0x80 || zeros || 0x0208 BE)
+  // and finally
+  //   (e) SHA-256(nullifier_input[0..128]) == public `nullifier`.
+  //
+  // The stable_id window routing + anchor + dual-match range check
+  // above are KEPT — they're now consumed by invariant 12
+  // (enroll_nullifier) instead of invariant 7. The block count is
+  // fixed at 2 since the preimage length is fixed.
 
-  // Step 5: assert `nullifier_input[16..16 + ctx_len] == context_in[..ctx_len]`
-  // using the same masked-range trick invariant 6 uses. ctx_len is
-  // derived from context's SHA padding (`context_hasher`), which was
-  // already computed above for invariant 6 — reuse it.
+  // (a) Domain-separation tag at byte 0.
   {
-    std::vector<typename LC::v8> null_ctx_view(kContextMaxBytes);
-    for (size_t i = 0; i < kContextMaxBytes; ++i) {
-      null_ctx_view[i] = nullifier_input[kStableIdLen + i];
-    }
-    assert_range_equals_masked<LC, kContextMaxBytes, kContextLenBits>(
-        lc, null_ctx_view.data(), context_in.data(), ctx_len);
+    typename LC::v8 ds_tag = lc.template vbit<8>(kDsTagPerAppNullifier);
+    breq.assert_eq(&nullifier_input[0], &ds_tag, 1);
   }
 
-  // Step 6: bind the raw-input length. The SHA pad inside
-  // nullifier_input encodes a bit-length that MUST equal
-  // `(kStableIdLen + ctx_len) * 8` — otherwise a prover could SHA-pad
-  // a shorter/longer preimage and smuggle in arbitrary bytes between
-  // the stable-ID and the padding.
-  static_assert(kNullifierShaLenBits >= kContextLenBits,
-                "kNullifierShaLenBits must accommodate ctx_len + 16");
-  {
-    auto nullifier_raw_len =
-        NullifierHash(lc).template derive_byte_len<kNullifierShaLenBits>(
-            nullifier_input.data(), nullifier_input_numb);
-    // Expected length = kStableIdLen + ctx_len. kStableIdLen = 16 =
-    // bit 4 only; since ctx_len ≤ 32 (bit 5 max), adding 16 never
-    // carries. So:
-    //   bits 0..3 of nullifier_raw_len = bits 0..3 of ctx_len
-    //   bit 4 of nullifier_raw_len    = 1
-    //   bit 5 of nullifier_raw_len    = bit 5 of ctx_len
-    lc.assert1(lc.vlt(ctx_len, static_cast<uint64_t>(kContextMaxBytes + 1)));
-    for (size_t i = 0; i < 4; ++i) {
-      lc.assert_eq(nullifier_raw_len[i], ctx_len[i]);
-    }
-    lc.assert1(nullifier_raw_len[4]);
-    if constexpr (kContextLenBits >= 6) {
-      lc.assert_eq(nullifier_raw_len[5], ctx_len[5]);
-    } else {
-      lc.assert0(nullifier_raw_len[5]);
+  // (b) holder_seed[32] at bytes 1..33. Same wires `holder_seed[i]`
+  // are re-used by invariant 14 (enroll_commit); that satisfies the
+  // invariant 15 cross-invariant wire equality automatically.
+  for (size_t i = 0; i < kHolderSeedLen; ++i) {
+    for (size_t b = 0; b < 8; ++b) {
+      lc.assert_eq(nullifier_input[1 + i][b], holder_seed[i][b]);
     }
   }
 
-  // Step 7: SHA-256 over the padded nullifier_input produces a v256
-  // digest. Assert it equals the public `nullifier` v256 wires
-  // (same layout as invariant 9's `context_hash` target).
+  // (c) context_hash[32] at bytes 33..65. The public input
+  // `context_hash` is a v256 in FlatSHA bit-decomposition convention
+  // (bit j corresponds to bit (j%8) of output byte ((255 - j)/8)).
+  // For each preimage byte i (0..32), pull the 8 bits of v256 from
+  // positions [(31 - i)*8 .. (31 - i)*8 + 8). Inverse of the v8→v256
+  // construction used for `e_digest_v256_mac` (~line 1100).
+  for (size_t i = 0; i < kContextHashLen; ++i) {
+    for (size_t b = 0; b < 8; ++b) {
+      lc.assert_eq(nullifier_input[1 + kHolderSeedLen + i][b],
+                   context_hash[(31 - i) * 8 + b]);
+    }
+  }
+
+  // (d) SHA-256 Merkle–Damgård padding for a 65-byte message in 2
+  // blocks (128 bytes total). Pad layout:
+  //   byte 65       = 0x80
+  //   bytes 66..120 = 0x00
+  //   bytes 120..126 = 0x00 (high 6 bytes of the 64-bit BE length)
+  //   bytes 126..128 = 0x02 0x08 (520 = 65 * 8 bits, BE u16 in tail)
+  {
+    typename LC::v8 pad80 = lc.template vbit<8>(0x80);
+    typename LC::v8 pad00 = lc.template vbit<8>(0x00);
+    typename LC::v8 len_hi = lc.template vbit<8>(0x02);
+    typename LC::v8 len_lo = lc.template vbit<8>(0x08);
+    breq.assert_eq(&nullifier_input[65], &pad80, 1);
+    for (size_t i = 66; i < 126; ++i) {
+      breq.assert_eq(&nullifier_input[i], &pad00, 1);
+    }
+    breq.assert_eq(&nullifier_input[126], &len_hi, 1);
+    breq.assert_eq(&nullifier_input[127], &len_lo, 1);
+  }
+
+  // Bind the SHA block count to the constant 2. nullifier_input_numb
+  // is host-witnessed to avoid changing the FlatSHA call shape; the
+  // assertion forecloses the prover supplying numb=1 to elide the
+  // second block's contribution.
+  {
+    typename LC::v8 numb_const = lc.template vbit<8>(kNullifierShaBlocks);
+    breq.assert_eq(&nullifier_input_numb, &numb_const, 1);
+  }
+
+  // (e) SHA-256 over the fixed-layout 2-block preimage equals the
+  // public `nullifier` v256 output. Same FlatSHA convention as v11.
   NullifierHash(lc).assert_message_hash(
       nullifier_input_numb, nullifier_input.data(),
       nullifier, nullifier_input_bw.data());
