@@ -1776,6 +1776,10 @@ struct ParsedWitness {
   uint8_t nonce_hex[kNonceHexLen];
   uint32_t json_context_offset;
   uint32_t json_declaration_offset;
+  // v12 (Plan 1, 2026-04-27) — holder_seed_commit hex field locator
+  // and 64 raw hex chars. Bound to enroll_commit_target via invariant 13.
+  uint32_t json_holder_seed_commit_offset;
+  uint8_t holder_seed_commit_hex[kHolderSeedCommitHexLen];
   uint8_t message_digest[kMessageDigestLen];
   uint32_t cert_tbs_len;
   // v9: offset (absolute within cert_tbs, NOT relative to signed_content)
@@ -1896,6 +1900,22 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   if (out.json_declaration_offset > kMaxSignedContent - kDeclarationLen) {
     return false;
   }
+
+  // v12 (Plan 1, 2026-04-27) — holder_seed_commit hex field offset +
+  // 64 raw hex chars. Invariant 13 routes the 64-byte window from
+  // signed_content[hsc_off..+64], hex-decodes to 32 bytes, and asserts
+  // byte-equality against `enroll_commit_target` (the SHA output of
+  // invariant 14). Bound check: hsc_off + 64 must fit inside
+  // kMaxSignedContent (1024) so the routing.shift zero-fill region
+  // never gets read by the in-circuit anchor.
+  if (!read_u32(p, end, out.json_holder_seed_commit_offset)) return false;
+  if (out.json_holder_seed_commit_offset >
+      kMaxSignedContent - kHolderSeedCommitHexLen) {
+    return false;
+  }
+  if (end - p < static_cast<ptrdiff_t>(kHolderSeedCommitHexLen)) return false;
+  std::memcpy(out.holder_seed_commit_hex, p, kHolderSeedCommitHexLen);
+  p += kHolderSeedCommitHexLen;
 
   if (end - p < static_cast<ptrdiff_t>(kMessageDigestLen)) return false;
   std::memcpy(out.message_digest, p, kMessageDigestLen);
@@ -2405,17 +2425,14 @@ static P7sErrorCode p7s_prove_impl(
   push_invariant6_witness(hash_filler, wit.json_context_offset, Fs);
   push_invariant10_witness(hash_filler, wit.json_declaration_offset, Fs);
 
-  // v12 (Plan 1) — invariant 13 witness fill. The host's binding-JSON
-  // parser populates `wit.json_holder_seed_commit_offset` and the
-  // 64-char `wit.holder_seed_commit_hex`; the prover-side filler
-  // pushes them plus derived nibbles + decoded bytes. Until Phase 2's
-  // host parser update lands (Tasks 2.2 / 2.3), the witness blob has
-  // no `holder_seed_commit` fields — we push zero placeholders here
-  // so wire counts match. Prove will fail at the in-circuit byte-eq
-  // between `holder_seed_commit_bytes` and `enroll_commit_target`,
-  // not at the FFI parse boundary.
-  uint8_t hsc_hex_zero[kHolderSeedCommitHexLen] = {};
-  push_invariant13_witness(hash_filler, /*offset=*/0, hsc_hex_zero, Fs);
+  // v12 (Plan 1) — invariant 13 witness fill. The host parser
+  // populates `wit.json_holder_seed_commit_offset` (relative to
+  // signed_content) and the 64 raw hex chars; the prover-side filler
+  // re-derives the per-char nibble values + decoded 32 bytes from the
+  // hex string.
+  push_invariant13_witness(
+      hash_filler, wit.json_holder_seed_commit_offset,
+      wit.holder_seed_commit_hex, Fs);
   push_v8(hash_filler, sc_sw.numb, Fs);
   push_sha_block_witnesses<kSignedContentMaxBlocks>(hash_filler, sc_sw, Fs);
   for (size_t i = 0; i < kMessageDigestLen; ++i) {
