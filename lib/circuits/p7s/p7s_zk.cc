@@ -2476,25 +2476,24 @@ static P7sErrorCode p7s_prove_impl(
     push_v8(hash_filler, e2_digest_be[i], Fs);
   }
 
-  // v11 / Task 34: invariant 7 private witness fill.
-  //   subject_sn_offset_in_tbs (v11 offset)
+  // v12 (Plan 1) — invariant 7 private witness fill.
+  //   subject_sn_offset_in_tbs (v11 offset; still bound to invariant 12)
   //   subject_dn_start_offset_in_tbs (v11 offset)
-  //   nullifier_input_numb (v8 SHA block count)
-  //   nullifier_input[64] (SHA-padded stable_id || context)
-  //   nullifier_input_bw[1] (per-block SHA witnesses)
+  //   nullifier_input_numb (v8 SHA block count, == kNullifierShaBlocks == 2)
+  //   nullifier_input[128] (SHA-padded `0x01 || holder_seed[32] || context_hash[32]`)
+  //   nullifier_input_bw[2] (per-block SHA witnesses)
   //
-  // Build the nullifier preimage buffer off-circuit:
-  //   raw = stable_id[16] || context_raw[ctx_len]
-  // then SHA-pad. The stable_id bytes come from
-  // cert_tbs[subject_sn_offset + 9 .. subject_sn_offset + 25].
-  const size_t kStableIdAbs = wit.subject_sn_offset_in_tbs + kSubjectSnAnchorLen;
-  uint8_t nullifier_raw[kStableIdLen + kContextMaxBytes] = {};
-  std::memcpy(nullifier_raw, &wit.cert_tbs[kStableIdAbs], kStableIdLen);
-  std::memcpy(&nullifier_raw[kStableIdLen], wit.context, wit.context_len);
-  const size_t nullifier_raw_len = kStableIdLen + wit.context_len;
+  // Per spec rev 9, the per-app nullifier is now bound to the holder's
+  // wallet-resident `holder_seed` and the public `context_hash` rather
+  // than to subject_sn || raw context bytes. Preimage is exactly 65
+  // bytes (1 + 32 + 32), which spans 2 SHA-256 blocks after padding.
+  uint8_t nullifier_raw[1 + kHolderSeedLen + 32] = {};
+  nullifier_raw[0] = kDsTagPerAppNullifier;
+  std::memcpy(&nullifier_raw[1], wit.holder_seed, kHolderSeedLen);
+  std::memcpy(&nullifier_raw[1 + kHolderSeedLen], pub.context_hash, 32);
   ShaWitness<kNullifierShaBlocks> null_sw;
-  compute_sha_witness<kNullifierShaBlocks>(nullifier_raw, nullifier_raw_len,
-                                           null_sw);
+  compute_sha_witness<kNullifierShaBlocks>(nullifier_raw,
+                                           sizeof(nullifier_raw), null_sw);
 
   push_uint(hash_filler, wit.subject_sn_offset_in_tbs, kCertTbsLenBits, Fs);
   push_uint(hash_filler, wit.subject_dn_start_offset_in_tbs, kCertTbsLenBits, Fs);
