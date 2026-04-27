@@ -199,6 +199,52 @@ MdocVerifierErrorCode run_mdoc_verifier(
     const uint8_t* zkproof, size_t proof_len, const char* docType,
     const ZkSpecStruct* zk_spec_version);
 
+// v12 prover entry point. Same as run_mdoc_prover but takes
+//   - holder_seed (32 bytes; Path B TEE-ECDH output, private)
+//   - holder_seed_commit (32 bytes; SHA-256(0x03 || holder_seed),
+//     routed into the COSE1 external_aad slot at proof time. The
+//     issuer signs over this; provided here for cross-checking
+//     against the host-side computation, but the prover ignores
+//     it -- it uses the value derived from holder_seed.)
+// And emits two extra public outputs:
+//   - enroll_commit_out (32 bytes; SHA-256(0x03 || holder_seed))
+//   - enroll_nullifier_out (32 bytes; SHA-256(0x02 || e || ENROLL_DOMAIN_SEP))
+MdocProverErrorCode run_mdoc_prover_v12(
+    const uint8_t* bcp, size_t bcsz,
+    const uint8_t* mdoc, size_t mdoc_len,
+    const char* pkx, const char* pky,
+    const uint8_t* transcript, size_t tr_len,
+    const RequestedAttribute* attrs, size_t attrs_len,
+    const char* now,
+    const uint8_t* contract_hash,        /* 8 bytes */
+    const uint8_t* escrow_fields,        /* 8x32 = 256 bytes */
+    const uint8_t* holder_seed,          /* 32 bytes (private) */
+    const uint8_t* holder_seed_commit,   /* 32 bytes (private; ignored, see note) */
+    uint8_t** prf, size_t* proof_len,
+    uint8_t nullifier_hash_out[32],
+    uint8_t binding_hash_out[32],
+    uint8_t escrow_digest_out[32],
+    uint8_t enroll_commit_out[32],       /* NEW */
+    uint8_t enroll_nullifier_out[32],    /* NEW */
+    const ZkSpecStruct* zk_spec_version);
+
+// v12 verifier entry point. Mirrors run_mdoc_verifier with
+// enroll_commit + enroll_nullifier added as expected public outputs.
+MdocVerifierErrorCode run_mdoc_verifier_v12(
+    const uint8_t* bcp, size_t bcsz,
+    const char* pkx, const char* pky,
+    const uint8_t* transcript, size_t tr_len,
+    const RequestedAttribute* attrs, size_t attrs_len,
+    const char* now,
+    const uint8_t* contract_hash,
+    const uint8_t nullifier_hash[32],
+    const uint8_t binding_hash[32],
+    const uint8_t escrow_digest[32],
+    const uint8_t enroll_commit[32],      /* NEW */
+    const uint8_t enroll_nullifier[32],   /* NEW */
+    const uint8_t* zkproof, size_t proof_len, const char* docType,
+    const ZkSpecStruct* zk_spec_version);
+
 // Produces a compressed version of the circuit bytes for the specified number
 // of attributes. The generator only supports the latest version of the ZKSpec
 // for a number of attributes. Attempt to generate older circuits will result in
