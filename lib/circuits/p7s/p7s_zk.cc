@@ -1280,6 +1280,58 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
         enroll_commit_target, enroll_commit_input_bw.data());
   }
 
+  // v12 (Plan 1) — invariant 12 (enroll_nullifier).
+  //   enroll_nullifier == SHA-256(0x02 || stable_id[16] ||
+  //                               ENROLL_DOMAIN_SEP[16])
+  //
+  // Preimage is 33 bytes raw → 1 SHA-256 block. The stable_id wires
+  // come from `sn_window[kSubjectSnAnchorLen..kSubjectSnAnchorLen +
+  // kStableIdLen)` (the same routed cert_tbs window invariant 7 used
+  // in v11 for its nullifier — preserved for v12 to feed enroll_nullifier
+  // instead). The dual-match anchor + range check assertions above
+  // remain the soundness gate that this stable_id is the holder's,
+  // not the issuer QTSP's registration code.
+  {
+    // (a) Domain-separation tag at byte 0.
+    typename LC::v8 ds_tag = lc.template vbit<8>(kDsTagEnrollNullifier);
+    breq.assert_eq(&enroll_nullifier_input[0], &ds_tag, 1);
+
+    // (b) stable_id[16] at bytes 1..17 — REUSE the routed sn_window.
+    breq.assert_eq(&enroll_nullifier_input[1],
+                   &sn_window[kSubjectSnAnchorLen], kStableIdLen);
+
+    // (c) ENROLL_DOMAIN_SEP[16] at bytes 17..33 — compile-time constant.
+    for (size_t i = 0; i < kEnrollDomainSepLen; ++i) {
+      typename LC::v8 ds_byte = lc.template vbit<8>(kEnrollDomainSep[i]);
+      breq.assert_eq(&enroll_nullifier_input[1 + kStableIdLen + i],
+                     &ds_byte, 1);
+    }
+
+    // (d) SHA pad for 33-byte message → 1 block. Same layout as
+    // invariant 14 (33 bytes raw, 264-bit length-field tail
+    // `0x01 0x08`).
+    typename LC::v8 pad80 = lc.template vbit<8>(0x80);
+    typename LC::v8 pad00 = lc.template vbit<8>(0x00);
+    typename LC::v8 len_hi = lc.template vbit<8>(0x01);
+    typename LC::v8 len_lo = lc.template vbit<8>(0x08);
+    breq.assert_eq(&enroll_nullifier_input[33], &pad80, 1);
+    for (size_t i = 34; i < 62; ++i) {
+      breq.assert_eq(&enroll_nullifier_input[i], &pad00, 1);
+    }
+    breq.assert_eq(&enroll_nullifier_input[62], &len_hi, 1);
+    breq.assert_eq(&enroll_nullifier_input[63], &len_lo, 1);
+
+    // SHA block count fixed = 1.
+    typename LC::v8 numb_const =
+        lc.template vbit<8>(kEnrollNullifierShaBlocks);
+
+    // (e) SHA-256 over the padded 1-block preimage equals the public
+    // `enroll_nullifier_target` v256 output.
+    EnrollNullifierHash(lc).assert_message_hash(
+        numb_const, enroll_nullifier_input.data(),
+        enroll_nullifier_target, enroll_nullifier_input_bw.data());
+  }
+
   // Task 29 / 26 — cross-field MAC binding to (e, e2, SPKI_X, SPKI_Y).
   // Digest views — byte-identical to the flatsha views (same wires,
   // same bits per j; `(255 - j) / 8 == 31 - j/8`). See Nit D comment
