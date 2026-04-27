@@ -617,6 +617,19 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   // ---- Private witness ----
   Q.private_input();
 
+  // v12 (Plan 1, 2026-04-27) — holder_seed is a 32-byte private witness
+  // re-used across invariants 7 (per-app nullifier preimage) and 14
+  // (enroll_commit preimage). Same wires, no copies — invariant 15
+  // (wire equality between the two preimages' holder_seed bytes) is
+  // enforced trivially because both invariants reference these same
+  // `holder_seed[i]` values via `vassert_eq`. Path A derives this from
+  // an EIP-712 deterministic ECDSA signature; Path B from TEE-ECDH;
+  // both are opaque to the circuit.
+  std::vector<typename LC::v8> holder_seed(kHolderSeedLen);
+  for (size_t i = 0; i < kHolderSeedLen; ++i) {
+    holder_seed[i] = lc.template vinput<8>();
+  }
+
   // Invariant 9 SHA witness (context hash).
   auto context_numb = lc.template vinput<8>();
   std::vector<typename LC::v8> context_in(kContextPaddedBytes);
