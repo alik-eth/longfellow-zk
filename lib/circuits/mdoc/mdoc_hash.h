@@ -656,6 +656,56 @@ class MdocHash {
     lc_.vmux(sh.perm[2 * slot], len, t[1], t[0]);
   }
 
+  // v12 enroll-commit: SHA-256(0x03 || holder_seed[32]). Preimage = 33 bytes,
+  // SHA pad floor -> 1 block. Tag 0x03 (DS_TAG_ENROLL_COMMIT) segregates this
+  // from the per-app nullifier (0x01) and enroll_nullifier (0x02).
+  //
+  // Two cross-bindings here:
+  //   1. (Invariant 15 mdoc-equivalent) The same vw.holder_seed_ wires that
+  //      assert_nullifier reads -- so a malicious prover cannot satisfy both
+  //      SHAs under contradictory holder_seed values.
+  //   2. (Invariant 13 mdoc-equivalent) After the SHA assertion, the bytes
+  //      routed into the COSE1 external_aad slot -- vw.holder_seed_commit_,
+  //      consumed by construct_signature_preimage -- must byte-equal
+  //      enroll_commit_target. This is what binds the deviceKey signature
+  //      (which signs the COSE1 Sig_structure containing those bytes) to
+  //      the holder_seed; without it, holder_seed could be any value
+  //      decoupled from the issuer-signed envelope.
+  void assert_enroll_commit(const Witness& vw,
+                            const v256& enroll_commit_target) const {
+    // byte 0: domain-sep tag 0x03
+    lc_.vassert_eq(vw.enroll_commit_in_[0], lc_.template vbit<8>(0x03));
+    // bytes 1..33: holder_seed
+    for (size_t i = 0; i < 32; ++i) {
+      lc_.vassert_eq(vw.enroll_commit_in_[1 + i], vw.holder_seed_[i]);
+    }
+    // SHA-256 padding for 33-byte message:
+    // byte 33: 0x80, bytes 34..61: 0x00, bytes 62..63 = BE length
+    // 33*8 = 264 = 0x0108 -> byte 62 = 0x01, byte 63 = 0x08
+    lc_.vassert_eq(vw.enroll_commit_in_[33], lc_.template vbit<8>(0x80));
+    for (size_t i = 34; i < 62; ++i) {
+      lc_.vassert_eq(vw.enroll_commit_in_[i], lc_.template vbit<8>(0x00));
+    }
+    lc_.vassert_eq(vw.enroll_commit_in_[62], lc_.template vbit<8>(0x01));
+    lc_.vassert_eq(vw.enroll_commit_in_[63], lc_.template vbit<8>(0x08));
+
+    auto one = lc_.template vbit<8>(1);
+    sha_.assert_message_hash(1, one, vw.enroll_commit_in_, enroll_commit_target,
+                             &vw.enroll_commit_bw_);
+
+    // Invariant 13 mdoc-equivalent: enroll_commit_target byte-equals
+    // vw.holder_seed_commit_. The SHA-output v256 packs hash byte i at
+    // bit indices [(31-i)*8 .. (31-i)*8 + 7] (LSB-first within byte) per
+    // FlatSHA256Circuit::assert_hash. holder_seed_commit_[i][b] is bit b
+    // of byte i in normal byte order.
+    for (size_t i = 0; i < 32; ++i) {
+      for (size_t b = 0; b < 8; ++b) {
+        lc_.assert_eq(enroll_commit_target[(31 - i) * 8 + b],
+                      vw.holder_seed_commit_[i][b]);
+      }
+    }
+  }
+
   // v12 per-app nullifier: SHA-256(0x01 || holder_seed[32] || contract_hash[8]).
   // Preimage = 41 bytes; SHA pad floor -> 1 block. The 1-byte domain-sep
   // tag (DS_TAG_PER_APP_NULLIFIER = 0x01, mirrors zk-eidas-p7s outputs)

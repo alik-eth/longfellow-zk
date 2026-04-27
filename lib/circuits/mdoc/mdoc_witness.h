@@ -752,6 +752,34 @@ class MdocHashWitness {
     }
   }
 
+  // v12 enroll-commit: SHA-256(0x03 || holder_seed_[32]). Caller must set
+  // holder_seed_ before calling. Also populates holder_seed_commit_ which
+  // equals the hash bytes -- the in-circuit assert_enroll_commit pins them
+  // to enroll_commit_target via byte-equality (invariant 13 mdoc-equivalent),
+  // so they MUST be the same value here. The same bytes are what
+  // compute_witness routes into the COSE1 external_aad slot at offsets
+  // [18..50) of the SHA preimage.
+  void compute_enroll_commit() {
+    uint8_t msg[33];
+    msg[0] = 0x03;
+    memcpy(msg + 1, holder_seed_, 32);
+
+    uint8_t nb;
+    FlatSHA256Witness::transform_and_witness_message(
+        33, msg, 1, nb, enroll_commit_block_, &enroll_commit_bw_);
+
+    // Extract hash from block witness h1 (big-endian uint32_t[8])
+    for (size_t i = 0; i < 8; ++i) {
+      uint32_t w = enroll_commit_bw_.h1[i];
+      enroll_commit_hash_[i * 4 + 0] = (w >> 24) & 0xff;
+      enroll_commit_hash_[i * 4 + 1] = (w >> 16) & 0xff;
+      enroll_commit_hash_[i * 4 + 2] = (w >> 8) & 0xff;
+      enroll_commit_hash_[i * 4 + 3] = w & 0xff;
+    }
+    // holder_seed_commit_ == enroll_commit_hash_ (invariant 13)
+    memcpy(holder_seed_commit_, enroll_commit_hash_, 32);
+  }
+
   // Compute binding_hash = SHA-256(first_attr_v1[0..31]).
   // Must be called after compute_witness() (which fills attr_bytes_).
   // The first attribute's CBOR value bytes are at the v1 position in the
