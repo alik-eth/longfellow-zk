@@ -448,42 +448,45 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
 constexpr uint32_t kBlobSchemaVersion = 12;
 
 // ===========================================================================
-// Hash-circuit public-input layout (v11). v11 (Task 34) adds two new
-// public inputs between nonce_bytes and the MAC region: a 256-bit
-// `nullifier` output (32 × v8) and a 32-bit `trust_anchor_index`
-// (v32). Task 36 activated the trust_anchor_index with an in-circuit
-// `vlt(index, kTrustAnchorCount)` bound check against the compile-
-// time `kTrustAnchors[]` table defined in sub/p7s_signature.h.
-// MAC-region position shifts by their combined width; kHashMacIndex
-// is still derived from kHashPubPreMac so every downstream index is
-// correct.
+// Hash-circuit public-input layout (v12). v11 added `nullifier` (256b)
+// + `trust_anchor_index` (32b) between `nonce_bytes` and the MAC
+// region. v12 inserts `enroll_commit` (256b) + `enroll_nullifier`
+// (256b) between `nullifier` and `trust_anchor_index` — matching the
+// 233-byte public blob layout. MAC-region position shifts by 512b;
+// kHashMacIndex is still derived from kHashPubPreMac so every
+// downstream index is correct.
 //
 //   [0]                              = const 1
 //   [1 .. 1 + 256)                   = context_hash v256
 //   [257 .. 257 + 520)               = pk_bytes (65 × v8)
 //   [777 .. 777 + 256)               = nonce_bytes (32 × v8)
 //   [1033 .. 1033 + 256)             = nullifier_bytes (32 × v8)    ← v11
-//   [1289 .. 1289 + 32)              = trust_anchor_index v32       ← v11
-//   [1321 .. 1321 + kTotalMacValues) = mac values (EltW each).
-//   [1321 + kTotalMacValues]         = av (EltW)
-//   npub_in_hash = 1321 + kTotalMacValues + 1 = 1330
+//   [1289 .. 1289 + 256)             = enroll_commit_bytes v256     ← v12
+//   [1545 .. 1545 + 256)             = enroll_nullifier_bytes v256  ← v12
+//   [1801 .. 1801 + 32)              = trust_anchor_index v32
+//   [1833 .. 1833 + kTotalMacValues) = mac values (EltW each).
+//   [1833 + kTotalMacValues]         = av (EltW)
+//   npub_in_hash = 1833 + kTotalMacValues + 1 = 1842
 constexpr size_t kHashPubConst = 1;
 constexpr size_t kHashPubContextHash = 256;
-constexpr size_t kHashPubPk = kPkBytes * 8;              // 520
-constexpr size_t kHashPubNonce = kNonceBytes * 8;        // 256
-constexpr size_t kHashPubNullifier = kNullifierLen * 8;  // 256
-constexpr size_t kHashPubTrustAnchorIdx = 32;            // v32 placeholder
+constexpr size_t kHashPubPk = kPkBytes * 8;                   // 520
+constexpr size_t kHashPubNonce = kNonceBytes * 8;             // 256
+constexpr size_t kHashPubNullifier = kNullifierLen * 8;       // 256
+constexpr size_t kHashPubEnrollCommit = kEnrollCommitLen * 8;       // 256 (v12)
+constexpr size_t kHashPubEnrollNullifier = kEnrollNullifierLen * 8; // 256 (v12)
+constexpr size_t kHashPubTrustAnchorIdx = 32;                 // v32 placeholder
 constexpr size_t kHashPubPreMac =
     kHashPubConst + kHashPubContextHash + kHashPubPk + kHashPubNonce +
-    kHashPubNullifier + kHashPubTrustAnchorIdx;
+    kHashPubNullifier + kHashPubEnrollCommit + kHashPubEnrollNullifier +
+    kHashPubTrustAnchorIdx;
 // Each hash-side MAC public input is 1 native EltW (GF2_128 is 128b
 // wide, and a v128 IS an EltW here). kTotalMacValues mac values +
 // 1 av = (kTotalMacValues + 1) EltW.
 constexpr size_t kHashMacInputWires = kTotalMacValues + 1;
 constexpr size_t kHashPubTotal = kHashPubPreMac + kHashMacInputWires;
-static_assert(kHashPubPreMac == 1321,
+static_assert(kHashPubPreMac == 1833,
               "layout drift — update kHashPubPreMac comment & index");
-static_assert(kHashPubTotal == 1330,
+static_assert(kHashPubTotal == 1842,
               "layout drift — update npub_in_hash comment");
 
 // Index (in the DENSE Wit array) where the hash MAC region begins.
@@ -1671,6 +1674,36 @@ void push_invariant10_witness(DenseFiller<F>& filler,
   push_uint(filler, json_declaration_offset, kSignedContentLogN, Fs);
 }
 
+// v12 (Plan 1, 2026-04-27) — invariant 13 witness fill:
+//   json_holder_seed_commit_offset (kSignedContentLogN bits)
+//   holder_seed_commit_hex[64] (raw lowercase hex chars)
+//   hsc_nibbles[64] (per-char nibble values, derived via `nibble_of`)
+//   holder_seed_commit_bytes[32] (decoded bytes)
+// Mirror of `push_invariant4_witness` shape (offset → hex → nibbles)
+// plus a trailing decoded-bytes block for the v12 byte-eq vs
+// `enroll_commit_target`. Caller-supplied raw bytes are derived from
+// the host's binding-JSON parse (Task 2.2 / 2.3).
+void push_invariant13_witness(
+    DenseFiller<F>& filler, uint32_t json_holder_seed_commit_offset,
+    const uint8_t holder_seed_commit_hex[kHolderSeedCommitHexLen],
+    const F& Fs) {
+  push_uint(filler, json_holder_seed_commit_offset, kSignedContentLogN, Fs);
+  for (size_t i = 0; i < kHolderSeedCommitHexLen; ++i) {
+    push_v8(filler, holder_seed_commit_hex[i], Fs);
+  }
+  for (size_t i = 0; i < kHolderSeedCommitHexLen; ++i) {
+    push_v8(filler, nibble_of(holder_seed_commit_hex[i]), Fs);
+  }
+  // Decoded bytes — pairs of nibbles per byte. The hex_decode gadget
+  // re-derives them in-circuit; we supply the same value here so the
+  // wire equality with enroll_commit_target survives.
+  for (size_t i = 0; i < kHolderSeedCommitBytes; ++i) {
+    uint8_t hi = nibble_of(holder_seed_commit_hex[2 * i]);
+    uint8_t lo = nibble_of(holder_seed_commit_hex[2 * i + 1]);
+    push_v8(filler, static_cast<uint8_t>((hi << 4) | lo), Fs);
+  }
+}
+
 // ========================== MAC plumbing ===================================
 
 // Sample av from the (shared) transcript. Called exactly once, AFTER
@@ -2354,6 +2387,15 @@ static P7sErrorCode p7s_prove_impl(
   push_hash_mac_placeholders(hash_filler, Fs);
 
   // Private section.
+  // v12 (Plan 1, 2026-04-27) — `holder_seed[32]` is declared FIRST in
+  // the private witness section (right after `Q.private_input()`), so
+  // it must also be the first push here. Re-used by invariants 7 + 14
+  // via shared circuit wires; supplied by host as a 32-byte tail
+  // field of the v12 witness blob.
+  for (size_t i = 0; i < kHolderSeedLen; ++i) {
+    push_v8(hash_filler, wit.holder_seed[i], Fs);
+  }
+
   push_v8(hash_filler, ctx_sw.numb, Fs);
   push_sha_padded_bytes<kContextMaxBlocks>(hash_filler, ctx_sw, Fs);
   push_sha_block_witnesses<kContextMaxBlocks>(hash_filler, ctx_sw, Fs);
@@ -2362,6 +2404,18 @@ static P7sErrorCode p7s_prove_impl(
   push_invariant5_witness(hash_filler, wit.json_nonce_offset, wit.nonce_hex, Fs);
   push_invariant6_witness(hash_filler, wit.json_context_offset, Fs);
   push_invariant10_witness(hash_filler, wit.json_declaration_offset, Fs);
+
+  // v12 (Plan 1) — invariant 13 witness fill. The host's binding-JSON
+  // parser populates `wit.json_holder_seed_commit_offset` and the
+  // 64-char `wit.holder_seed_commit_hex`; the prover-side filler
+  // pushes them plus derived nibbles + decoded bytes. Until Phase 2's
+  // host parser update lands (Tasks 2.2 / 2.3), the witness blob has
+  // no `holder_seed_commit` fields — we push zero placeholders here
+  // so wire counts match. Prove will fail at the in-circuit byte-eq
+  // between `holder_seed_commit_bytes` and `enroll_commit_target`,
+  // not at the FFI parse boundary.
+  uint8_t hsc_hex_zero[kHolderSeedCommitHexLen] = {};
+  push_invariant13_witness(hash_filler, /*offset=*/0, hsc_hex_zero, Fs);
   push_v8(hash_filler, sc_sw.numb, Fs);
   push_sha_block_witnesses<kSignedContentMaxBlocks>(hash_filler, sc_sw, Fs);
   for (size_t i = 0; i < kMessageDigestLen; ++i) {
@@ -2430,6 +2484,38 @@ static P7sErrorCode p7s_prove_impl(
   push_v8(hash_filler, null_sw.numb, Fs);
   push_sha_padded_bytes<kNullifierShaBlocks>(hash_filler, null_sw, Fs);
   push_sha_block_witnesses<kNullifierShaBlocks>(hash_filler, null_sw, Fs);
+
+  // v12 (Plan 1) — invariant 14 (enroll_commit) private witness fill.
+  // Preimage = `0x03 || holder_seed[32]` (33 bytes raw → 1 SHA block).
+  // FlatSHA pads off-circuit; the in-circuit constraints (Task 1.5)
+  // assert byte-equality with the SHA pad constants and the shared
+  // `holder_seed[i]` wires.
+  uint8_t enroll_commit_raw[1 + kHolderSeedLen] = {};
+  enroll_commit_raw[0] = kDsTagEnrollCommit;
+  std::memcpy(&enroll_commit_raw[1], wit.holder_seed, kHolderSeedLen);
+  ShaWitness<kEnrollCommitShaBlocks> ec_sw;
+  compute_sha_witness<kEnrollCommitShaBlocks>(
+      enroll_commit_raw, sizeof(enroll_commit_raw), ec_sw);
+  push_sha_padded_bytes<kEnrollCommitShaBlocks>(hash_filler, ec_sw, Fs);
+  push_sha_block_witnesses<kEnrollCommitShaBlocks>(hash_filler, ec_sw, Fs);
+
+  // v12 (Plan 1) — invariant 12 (enroll_nullifier) private witness fill.
+  // Preimage = `0x02 || stable_id[16] || ENROLL_DOMAIN_SEP[16]` (33
+  // bytes raw → 1 SHA block). stable_id is sourced from cert_tbs at
+  // the same `subject_sn_offset_in_tbs + 9` slot invariant 12 binds
+  // via the routed `sn_window`.
+  uint8_t enroll_nullifier_raw[1 + kStableIdLen + kEnrollDomainSepLen] = {};
+  enroll_nullifier_raw[0] = kDsTagEnrollNullifier;
+  std::memcpy(&enroll_nullifier_raw[1],
+              &wit.cert_tbs[wit.subject_sn_offset_in_tbs + kSubjectSnAnchorLen],
+              kStableIdLen);
+  std::memcpy(&enroll_nullifier_raw[1 + kStableIdLen],
+              kEnrollDomainSep, kEnrollDomainSepLen);
+  ShaWitness<kEnrollNullifierShaBlocks> en_sw;
+  compute_sha_witness<kEnrollNullifierShaBlocks>(
+      enroll_nullifier_raw, sizeof(enroll_nullifier_raw), en_sw);
+  push_sha_padded_bytes<kEnrollNullifierShaBlocks>(hash_filler, en_sw, Fs);
+  push_sha_block_witnesses<kEnrollNullifierShaBlocks>(hash_filler, en_sw, Fs);
 
   // Task 25a/26: prover's committed `ap` halves. kTotalMacValues
   // EltWs = 4 MAC witnesses × 2 halves/witness. Order must match
