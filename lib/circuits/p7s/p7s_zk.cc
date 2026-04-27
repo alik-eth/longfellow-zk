@@ -433,7 +433,19 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
               "kSignedContentLogN must equal log2(kMaxSignedContent)");
 
 // Blob schema version.
-constexpr uint32_t kBlobSchemaVersion = 11;
+//
+// v12 (Plan 1, 2026-04-27) — issuer-pseudonym privacy via wallet-bound
+// nullifier. Hard fork from v11; v11 verifiers reject v12 inputs by
+// version-byte mismatch. Schema additions:
+//   * Witness blob: appends `holder_seed[32]` at the tail of the v11
+//     layout (after `trust_anchor_index`).
+//   * Public blob: inserts `enroll_commit[32]` + `enroll_nullifier[32]`
+//     between `nullifier` and `trust_anchor_index`. Total length grows
+//     from 169 to 233 bytes.
+//   * Circuit: rewrites invariant 7 (per-app nullifier preimage), adds
+//     invariants 12 (enroll_nullifier), 13 (holder_seed_commit binding),
+//     14 (enroll_commit), 15 (holder_seed wire equality across 7+14).
+constexpr uint32_t kBlobSchemaVersion = 12;
 
 // ===========================================================================
 // Hash-circuit public-input layout (v11). v11 (Task 34) adds two new
@@ -1774,14 +1786,28 @@ struct ParsedWitness {
   uint32_t subject_sn_offset_in_tbs;
   uint32_t subject_dn_start_offset_in_tbs;
   uint32_t trust_anchor_index;
+  // v12 (Plan 1, 2026-04-27) — 32-byte holder secret. Path A derives
+  // it from a deterministic-ECDSA wallet signature; Path B from
+  // TEE-ECDH. Opaque to the parser; fed to invariants 7 + 14 as a
+  // private witness. Appended at the tail of the v11 layout to keep
+  // the parse additive.
+  uint8_t holder_seed[kHolderSeedLen];
 };
 
 struct ParsedPublic {
   uint8_t context_hash[32];
   uint8_t pk[kPkBytes];
   uint8_t nonce[kNonceBytes];
-  // v11 (Task 34) — invariant 7 public output + trust-anchor placeholder.
+  // v11 (Task 34) — invariant 7 public output. v12 keeps the field
+  // shape; the preimage is rewritten in the circuit (now
+  // `0x01 || holder_seed || context_hash`).
   uint8_t nullifier[kNullifierLen];
+  // v12 (Plan 1, 2026-04-27) — invariant 14 / invariant 12 public
+  // outputs. Layout: 233-byte public blob inserts these between
+  // `nullifier` and `trust_anchor_index` at offsets [165..197) and
+  // [197..229). Mirror of `crates/zk-eidas-p7s-circuit/src/verifier.rs`.
+  uint8_t enroll_commit[kEnrollCommitLen];
+  uint8_t enroll_nullifier[kEnrollNullifierLen];
   uint32_t trust_anchor_index;
 };
 
@@ -1991,6 +2017,17 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
     }
   }
 
+  // v12 (Plan 1, 2026-04-27) — `holder_seed[32]` at the tail. Path
+  // A's deterministic-ECDSA derivation and Path B's TEE-ECDH both
+  // produce a 32-byte secret the host emits as the trailing field of
+  // the v12 witness blob. No host-side anchor check — `holder_seed`
+  // is opaque entropy; the in-circuit invariant 13 (holder_seed_commit
+  // binding to JSON) is what proves the holder used the seed for
+  // which the credential was issued.
+  if (end - p < static_cast<ptrdiff_t>(kHolderSeedLen)) return false;
+  std::memcpy(out.holder_seed, p, kHolderSeedLen);
+  p += kHolderSeedLen;
+
   if (p != end) return false;
   return true;
 }
@@ -2016,13 +2053,24 @@ bool parse_public_blob(const uint8_t* blob, size_t blob_len,
   std::memcpy(out.nonce, p, kNonceBytes);
   p += kNonceBytes;
 
-  // v11 (Task 34) — public nullifier output + trust_anchor_index
-  // (activated by Task #36; bound-checked to match the in-circuit
-  // `vlt(index, kTrustAnchorCount)` so verify-time rejects out-of-
-  // range values before re-deriving the hash public inputs).
+  // v11 (Task 34) — public nullifier output.
   if (end - p < static_cast<ptrdiff_t>(kNullifierLen)) return false;
   std::memcpy(out.nullifier, p, kNullifierLen);
   p += kNullifierLen;
+
+  // v12 (Plan 1) — invariant 14 / 12 public outputs. Same big-endian
+  // 32-byte shape as `nullifier`. Inserted at [165..197) and [197..229)
+  // of the 233-byte v12 public blob, before `trust_anchor_index`.
+  if (end - p < static_cast<ptrdiff_t>(kEnrollCommitLen)) return false;
+  std::memcpy(out.enroll_commit, p, kEnrollCommitLen);
+  p += kEnrollCommitLen;
+  if (end - p < static_cast<ptrdiff_t>(kEnrollNullifierLen)) return false;
+  std::memcpy(out.enroll_nullifier, p, kEnrollNullifierLen);
+  p += kEnrollNullifierLen;
+
+  // v11 (Task #36) — trust_anchor_index. Bound-checked against the
+  // compile-time table size to mirror the in-circuit
+  // `vlt(index, kTrustAnchorCount)` constraint.
   if (!read_u32(p, end, out.trust_anchor_index)) return false;
   if (out.trust_anchor_index >= kTrustAnchorCount) return false;
 
@@ -2043,11 +2091,20 @@ void fill_hash_public_inputs(DenseFiller<F>& filler, const ParsedPublic& pub,
   push_target(filler, pub.context_hash, Fs);
   push_pk_public(filler, pub.pk, Fs);
   push_nonce_public(filler, pub.nonce, Fs);
-  // v11 (Task 34) — invariant 7 public output.
+  // v11 (Task 34) — invariant 7 public output. v12 keeps the field
+  // shape; only the in-circuit preimage shape changed.
   // `push_target` uses the same big-endian bit layout the circuit's
   // `nullifier_v256_flatsha` view extracts from `nullifier_bytes[]`
   // via `(255 - j) / 8` / `j % 8`. Safe to reuse.
   push_target(filler, pub.nullifier, Fs);
+  // v12 (Plan 1) — invariant 14 / 12 public outputs. Order matches
+  // the public-blob byte layout ([165..197) enroll_commit,
+  // [197..229) enroll_nullifier) AND the wire-declaration order in
+  // `build_hash_circuit` (enroll_commit_target before
+  // enroll_nullifier_target). Same FlatSHA bit-decomposition
+  // convention as `nullifier`.
+  push_target(filler, pub.enroll_commit, Fs);
+  push_target(filler, pub.enroll_nullifier, Fs);
   // v11 (Task 34, activated by Task 36) — trust-anchor index
   // (v32 LSB-first). Bound-checked in-circuit against
   // `kTrustAnchorCount` via `vlt`; `push_uint` streams the u32 LSB-
