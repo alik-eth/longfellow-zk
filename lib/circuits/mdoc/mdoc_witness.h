@@ -576,6 +576,35 @@ class MdocSignatureWitness {
                                       const uint8_t mdoc[/* len */], size_t len,
                                       const uint8_t transcript[/* tlen */],
                                       size_t tlen) {
+    return compute_witness_with_optional_v12_aad(pkX, pkY, mdoc, len, transcript,
+                                                  tlen, /*v12_aad=*/nullptr);
+  }
+
+  // v12 variant: rebuild the COSE1 Sig_structure with the 51-byte v12
+  // prefix, injecting `holder_seed_commit` into the external_aad slot
+  // (offset 18..50). The issuer signature was made over THESE bytes for
+  // a v12 mdoc; without this rebuild the message digest mismatches and
+  // ECDSA verify fails (returns MDOC_PROVER_SIGNATURE_FAILURE).
+  //
+  // The 32-byte holder_seed_commit is a host input (the prover supplies
+  // it; in production it is computed from holder_seed via SHA(0x03||seed)
+  // and is the same value the issuer pre-committed to before signing).
+  MdocProverErrorCode compute_witness_v12(
+      Elt pkX, Elt pkY, const uint8_t mdoc[/* len */], size_t len,
+      const uint8_t transcript[/* tlen */], size_t tlen,
+      const uint8_t holder_seed_commit[/* 32 */]) {
+    return compute_witness_with_optional_v12_aad(pkX, pkY, mdoc, len, transcript,
+                                                  tlen, holder_seed_commit);
+  }
+
+ private:
+  // Shared body: builds the Sig_structure preimage for either v11 (when
+  // v12_aad is null) or v12 (when v12_aad points to 32 bytes of
+  // holder_seed_commit), then runs the rest of compute_witness uniformly.
+  MdocProverErrorCode compute_witness_with_optional_v12_aad(
+      Elt pkX, Elt pkY, const uint8_t mdoc[/* len */], size_t len,
+      const uint8_t transcript[/* tlen */], size_t tlen,
+      const uint8_t v12_aad[/* 32 or null */]) {
     ParsedMdoc pm;
 
     MdocProverErrorCode err = pm.parse_device_response(len, mdoc);
@@ -583,8 +612,29 @@ class MdocSignatureWitness {
       return err;
     }
 
-    Nat ne = nat_from_hash<Nat>(pm.tagged_mso_bytes_.data(),
-                                pm.tagged_mso_bytes_.size());
+    // For v12, replace the v11-prefixed tagged_mso_bytes_ that
+    // parse_device_response built with a v12-prefixed buffer that injects
+    // holder_seed_commit into the external_aad slot. The MSO payload
+    // bytes (pm.t_mso_.pos/len) are unchanged.
+    std::vector<uint8_t> sig_preimage;
+    if (v12_aad != nullptr) {
+      sig_preimage.assign(std::begin(kCose1PrefixV12), std::end(kCose1PrefixV12));
+      for (size_t i = 0; i < kHolderSeedCommitWitnessLen; ++i) {
+        sig_preimage[kHolderSeedCommitPrefixOffset + i] = v12_aad[i];
+      }
+      // 2-byte payload length suffix (after byte 50 = 0x59)
+      sig_preimage.push_back((pm.t_mso_.len >> 8) & 0xff);
+      sig_preimage.push_back(pm.t_mso_.len & 0xff);
+      for (size_t i = 0; i < pm.t_mso_.len; ++i) {
+        sig_preimage.push_back(mdoc[pm.t_mso_.pos + i]);
+      }
+    }
+    const uint8_t* sig_data =
+        v12_aad != nullptr ? sig_preimage.data() : pm.tagged_mso_bytes_.data();
+    size_t sig_size =
+        v12_aad != nullptr ? sig_preimage.size() : pm.tagged_mso_bytes_.size();
+
+    Nat ne = nat_from_hash<Nat>(sig_data, sig_size);
     e_ = ec_.f_.to_montgomery(ne);
 
     // Parse (r,s).
@@ -612,6 +662,8 @@ class MdocSignatureWitness {
     }
     return MDOC_PROVER_SUCCESS;
   }
+
+ public:
 };
 
 // EC: implements the elliptic curve for the mdoc

@@ -61,7 +61,10 @@ size_t getHashMacIndex(size_t numAttrs, size_t version) {
   // The length of the attribute field that is added in version 4.
   // Nullifier: 320 wires (8*8 contract_hash + 256 nullifier_target).
   // Binding: 256 wires (256 binding_target).
-  return numAttrs * 8 * (96 + (version < 7 ? 1 : 2)) + 160 + 320 + 256 + 256 + 1;
+  // Escrow:   256 wires (256 escrow_target).
+  // v12 extras: 256 wires enroll_commit_target + 256 wires enroll_nullifier_target.
+  return numAttrs * 8 * (96 + (version < 7 ? 1 : 2)) + 160 + 320 + 256 + 256
+         + 256 + 256 + 1;
 }
 
 namespace proofs {
@@ -331,8 +334,16 @@ MdocProverErrorCode fill_witness(
   memcpy(enroll_commit_out, hw->enroll_commit_hash_, 32);
   memcpy(enroll_nullifier_out, hw->enroll_nullifier_hash_, 32);
 
+  // Signature-circuit witness. For v12 callers (holder_seed != null) the
+  // issuer signed over the v12 COSE1 Sig_structure with holder_seed_commit
+  // in the external_aad slot, so the signature-circuit must rebuild that
+  // exact preimage to match the issuer's e. v11 callers use the legacy
+  // path that hashes the v11-prefixed tagged_mso_bytes.
   MdocProverErrorCode ok_s =
-      sw->compute_witness(pkX, pkY, mdoc, mdoc_len, tr, tr_len);
+      (holder_seed != nullptr)
+          ? sw->compute_witness_v12(pkX, pkY, mdoc, mdoc_len, tr, tr_len,
+                                    hw->holder_seed_commit_)
+          : sw->compute_witness(pkX, pkY, mdoc, mdoc_len, tr, tr_len);
   if (ok_s != MDOC_PROVER_SUCCESS) return ok_s;
 
   // signature public inputs
