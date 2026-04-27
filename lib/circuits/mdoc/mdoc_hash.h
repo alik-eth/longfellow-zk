@@ -257,6 +257,8 @@ class MdocHash {
                               const v256& nullifier_target,
                               const v256& binding_target,
                               const v256& escrow_target,
+                              const v256& enroll_commit_target,
+                              const v256& enroll_nullifier_target,
                               const v256& e,
                               const v256& dpkx, const v256& dpky,
                               const Witness& vw) const {
@@ -313,6 +315,18 @@ class MdocHash {
 
     // Identity escrow: SHA-256(escrow_fields[0..255]) == escrow_target
     assert_escrow_digest(escrow_target, vw);
+
+    // v12 enroll-commit: SHA-256(0x03 || holder_seed) == enroll_commit_target,
+    // plus invariant 13 byte-equality between enroll_commit_target and the
+    // holder_seed_commit witness routed into the COSE1 external_aad slot
+    // (binds the deviceKey signature to holder_seed).
+    assert_enroll_commit(vw, enroll_commit_target);
+
+    // v12 enroll-nullifier: SHA-256(0x02 || e || ENROLL_DOMAIN_SEP)
+    // == enroll_nullifier_target. e here is the same MSO digest already
+    // checked by the COSE1 hash assertion above, so this binds the
+    // enroll-nullifier to the issuer-signed credential.
+    assert_enroll_nullifier(vw, e, enroll_nullifier_target);
 
     // Attributes parsing
     // valueDigests, ignore byte 13 \in {A1,A2} representing map size.

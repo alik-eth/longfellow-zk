@@ -154,6 +154,13 @@ CircuitGenerationErrorCode generate_circuit(const ZkSpecStruct* zk_spec,
     // Identity escrow public input: 256-bit target digest
     v256 escrow_target = lc.template vinput<256>();
 
+    // v12 enroll-commit public output (= holder_seed_commit, the bytes
+    // routed into the COSE1 external_aad slot at proof time).
+    v256 enroll_commit_target = lc.template vinput<256>();
+
+    // v12 enroll-nullifier public output (= SHA-256(0x02||e||ENROLL_DOMAIN_SEP)).
+    v256 enroll_nullifier_target = lc.template vinput<256>();
+
     MACTag mac[7]; /* 3 macs + av */
     for (size_t i = 0; i < 7; ++i) {
       mac[i] = lc.eltw_input();
@@ -177,6 +184,8 @@ CircuitGenerationErrorCode generate_circuit(const ZkSpecStruct* zk_spec,
     mdoc_h.assert_valid_hash_mdoc(oa.data(), now, contract_hash,
                                     nullifier_target, binding_target,
                                     escrow_target,
+                                    enroll_commit_target,
+                                    enroll_nullifier_target,
                                     e, dpkx, dpky, *w);
 
     MACTag a_v = mac[6];

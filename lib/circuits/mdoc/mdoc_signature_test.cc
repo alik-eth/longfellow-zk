@@ -369,6 +369,10 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
     // Escrow target public input
     v256 escrow_target = LC.template vinput<256>();
 
+    // v12 enroll-commit + enroll-nullifier public outputs
+    v256 enroll_commit_target = LC.template vinput<256>();
+    v256 enroll_nullifier_target = LC.template vinput<256>();
+
     Q.private_input();
     v256 e = LC.template vinput<256>();
     v256 dpkx = LC.template vinput<256>();
@@ -379,7 +383,10 @@ void mdoc_hash_run(const typename Field::Elt& omega, uint64_t omega_order,
 
     mdoc_hash.assert_valid_hash_mdoc(oa.data(), now, contract_hash,
                                      nullifier_target, binding_target,
-                                     escrow_target, e, dpkx, dpky, vwc);
+                                     escrow_target,
+                                     enroll_commit_target,
+                                     enroll_nullifier_target,
+                                     e, dpkx, dpky, vwc);
 
     CIRCUIT = Q.mkcircuit(/*nc=*/1);
     dump_info("mdoc hash and parse", Q);
