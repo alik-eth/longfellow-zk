@@ -2817,4 +2817,64 @@ P7sErrorCode p7s_verify(const uint8_t* public_blob, size_t public_blob_len,
 
 void p7s_free_proof(uint8_t* proof) { free(proof); }
 
+// =========================== Circuit byte-dump =============================
+//
+// Serialize the static p7s hash + sig circuits to malloc'd byte buffers
+// using `CircuitRep<F>::to_bytes` — the same wire format `mdoc_generate_circuit`
+// produces (uncompressed; the mdoc generator zstd-compresses afterwards but
+// we keep the raw bytes here to stay symmetric with `Circuit::decode` on the
+// Rust consumer side, which doesn't currently zstd-decompress).
+//
+// Used by the Rust port (`crates/longfellow/src/p7s_zk/`) to obtain canonical
+// circuit bytes for `Circuit::<Field2_128>::decode` / `Circuit::<FieldP256>::decode`
+// (the migration spec's option-(c) amendment retains C++ as a build-time
+// circuit-generator tool; this helper is the runtime → pre-compiled-bytes seam).
+// Caller frees both buffers via `p7s_free_proof` (it just calls `free`).
+P7sErrorCode p7s_dump_circuits(uint8_t** hash_out, size_t* hash_len_out,
+                               uint8_t** sig_out, size_t* sig_len_out) {
+  using namespace proofs;
+  using namespace proofs::p7s;
+
+  if (hash_out == nullptr || hash_len_out == nullptr ||
+      sig_out == nullptr || sig_len_out == nullptr) {
+    return P7S_NULL_INPUT;
+  }
+
+  // Hash circuit (GF(2^128)).
+  std::vector<uint8_t> hash_bytes;
+  {
+    const F Fs;
+    const Circuit<F>& c_hash = get_hash_circuit();
+    CircuitRep<F> cr(Fs, GF2_128_ID);
+    cr.to_bytes(c_hash, hash_bytes);
+  }
+
+  // Sig circuit (Fp256Base).
+  std::vector<uint8_t> sig_bytes;
+  {
+    const Circuit<Fp256Base>& c_sig = get_sig_circuit();
+    CircuitRep<Fp256Base> cr(p256_base, P256_ID);
+    cr.to_bytes(c_sig, sig_bytes);
+  }
+
+  // Allocate malloc'd output buffers and copy. Caller frees via
+  // `p7s_free_proof` (free()); we use the same allocator so ownership
+  // semantics are uniform across the FFI surface.
+  uint8_t* h = static_cast<uint8_t*>(malloc(hash_bytes.size()));
+  if (!h) return P7S_MEMORY_FAILURE;
+  uint8_t* s = static_cast<uint8_t*>(malloc(sig_bytes.size()));
+  if (!s) {
+    free(h);
+    return P7S_MEMORY_FAILURE;
+  }
+  memcpy(h, hash_bytes.data(), hash_bytes.size());
+  memcpy(s, sig_bytes.data(), sig_bytes.size());
+
+  *hash_out = h;
+  *hash_len_out = hash_bytes.size();
+  *sig_out = s;
+  *sig_len_out = sig_bytes.size();
+  return P7S_SUCCESS;
+}
+
 }  // extern "C"
