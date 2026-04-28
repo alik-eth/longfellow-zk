@@ -489,6 +489,30 @@ static_assert(kHashPubPreMac == 1833,
 static_assert(kHashPubTotal == 1842,
               "layout drift — update npub_in_hash comment");
 
+// Expected total wire count for the hash circuit (public + private +
+// SHA witnesses + MAC region). Pinned-value runtime guard symmetric
+// to `c_hash.npub_in == kHashPubTotal`. The WIRECOUNT log lines in
+// `build_hash_circuit` enumerate the per-region breakdown:
+//   1842   public inputs (kHashPubTotal)
+//    256   holder_seed[32]    × 8 bits
+//   3464   ctx region (numb + bw[1] + ctx_in[32])
+//   8192   signed_content[1024] × 8
+//   2090   inv4 (json_pk_offset + pk_hex[130] + nibbles[130])
+//   1034   inv5 (json_nonce_offset + nonce_hex[64] + nibbles[64])
+//     20   inv6 + inv10 (two log2(1024) offsets)
+//     10   inv13 offset
+//    512   inv13 hex chars
+//    512   inv13 nibbles
+//    256   inv13 bytes
+//   ... + signed_content_bw + cert_tbs + cert_tbs_bw + signed_attrs +
+//   signed_attrs_bw + nullifier/enroll witnesses + their bw +
+//   message_digest + e/e2 digest_bytes + sig-bw witnesses + ...
+//
+// New `vinput<W>()` calls in `build_hash_circuit` shift this total —
+// re-run the canary, read the new total from the eval_quad / build
+// log, update both the constant and the WIRECOUNT comment above.
+constexpr size_t kExpectedHashWitnessTotal_v12 = 273504;
+
 // Index (in the DENSE Wit array) where the hash MAC region begins.
 // update_mac_in_dense writes (kTotalMacValues + 1) native EltW at this
 // position. Must match the circuit's declared public-input order —
@@ -2290,6 +2314,21 @@ static P7sErrorCode p7s_prove_impl(
   // time (silent pass if the layout coincidentally cancels out).
   if (c_hash.npub_in != kHashPubTotal) return P7S_INVALID_INPUT;
   if (c_sig.npub_in != kSigPubTotal) return P7S_INVALID_INPUT;
+  // v12 (Plan 1) — hash-witness total guard. Catches the class of bug
+  // where a `vinput<W>()` is added in `build_hash_circuit` without a
+  // matching push in `run_p7s_prover`, OR vice versa: the existing
+  // `hash_filler.size() != c_hash.ninputs` check (below) only fires
+  // if the divergence happens to land on the same path; a value-pinned
+  // total catches accidental decl/fill drift earlier and surfaces it
+  // as a clean P7S_INVALID_INPUT instead of an opaque sumcheck
+  // assert-zero deep in `eval_quad`.
+  if (c_hash.ninputs != kExpectedHashWitnessTotal_v12) {
+    log(ERROR,
+        "v12 hash-witness total drift: c_hash.ninputs=%zu expected=%zu "
+        "— update kExpectedHashWitnessTotal_v12 + WIRECOUNT comment",
+        c_hash.ninputs, kExpectedHashWitnessTotal_v12);
+    return P7S_INVALID_INPUT;
+  }
 
   // Compute SHA witnesses off-circuit. For signedAttrs, the input to
   // FlatSHA is the CAdES-canonical form `[0x31, body[1..]]` — we
