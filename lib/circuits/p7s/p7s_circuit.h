@@ -132,18 +132,31 @@ constexpr size_t kSignedAttrsMdWindowLen =
 // sybil handle), not invariant 7. The dual-match anchor + range check
 // machinery is unchanged; only the SHA preimage shape moved.
 //
-// Anchor literal (unchanged from v11):
-//   30 17                  Attribute SEQUENCE hdr (l=23)
+// Anchor literal (9-byte X.520 serialNumber ATV DER prefix):
+//   30 SS                  Attribute SEQUENCE hdr (content len S = L + 7)
 //   06 03 55 04 05         OID 2.5.4.5 (id-at-serialNumber)
-//   13 10                  PrintableString hdr (l=16)
-// 9 bytes total; stable-ID value follows at window[9..25].
+//   13 LL                  PrintableString hdr (value len L)
+// 9 bytes total; stable-ID value follows at window[9 .. 9 + L].
 //
-// v1 limitation: stable-ID length is fixed at 16 bytes (DIIA RNOKPP).
-// Non-DIIA QTSPs with different lengths are deferred to Task #37.
-constexpr size_t kStableIdLen = 16;
+// v13 (Task #37, 2026-05-21) — variable-length serialNumber for
+// pan-eIDAS support. v12 hardcoded `kStableIdLen = 16` (DIIA RNOKPP:
+// `TINUA-` + 10 digits). v13 makes the value length `L` variable: of
+// the 9 anchor bytes, 7 are truly constant (`30`, `06 03 55 04 05`,
+// `13`) and 2 are length-dependent — `S` at index 1 and `L` at
+// index 8, linked by `S == L + 7`. `L` is a routed byte of the
+// ECDSA-verified `cert_tbs`, never a free witness.
+//
+// kStableIdMaxLen = 37 keeps the enroll_nullifier SHA at a fixed
+// 1 block: the backward-compatible preimage is `1 + L + 16` raw, and
+// `1 + 37 + 16 + 9 (pad floor) = 63 <= 64`. 37 covers every plausible
+// EU natural-person ETSI identifier (`{3}{2}-` prefix + national
+// value); see the design doc EU-format survey (2026-05-21).
+// kStableIdMinLen = 8 is a sane floor (`{3}{2}-` prefix + >=2 value).
+constexpr size_t kStableIdMaxLen = 37;
+constexpr size_t kStableIdMinLen = 8;
 constexpr size_t kSubjectSnAnchorLen = 9;
 constexpr size_t kSubjectSnWindowLen =
-    kSubjectSnAnchorLen + kStableIdLen;  // 25
+    kSubjectSnAnchorLen + kStableIdMaxLen;  // 46
 
 // v12 nullifier SHA input is `0x01 || holder_seed[32] || context_hash[32]`
 // = 65 bytes raw. SHA-256 Merkle-Damgård padding adds ≥9 bytes (0x80 +
@@ -163,12 +176,19 @@ constexpr size_t kEnrollCommitShaMaxBytes = 64 * kEnrollCommitShaBlocks;  // 64
 // log2(33) → 6.
 constexpr size_t kEnrollCommitShaLenBits = 6;
 
-// v12 enroll_nullifier SHA input is `0x02 || stable_id[16] ||
-// ENROLL_DOMAIN_SEP[16]` = 33 bytes raw → exactly 1 block.
+// v13 enroll_nullifier SHA input is `0x02 || stable_id[0..L] ||
+// ENROLL_DOMAIN_SEP[16]` = `1 + L + 16` bytes raw. For every L in
+// [kStableIdMinLen, kStableIdMaxLen] = [8, 37] the raw length is in
+// [25, 54]; with the >=9-byte SHA-256 Merkle-Damgaard pad floor the
+// padded length is <= 63 <= 64 → still exactly 1 block. NO length-
+// prefix byte and NO fixed-MAX masked buffer: only `1 + L + 16` raw
+// bytes are fed to the SHA; the 0x80 pad sits at the L-dependent
+// offset `1 + L + 16`. For L = 16 this preimage is byte-identical to
+// v12's `0x02 || stable_id[16] || ENROLL_DOMAIN_SEP[16]`.
 constexpr size_t kEnrollNullifierShaBlocks = 1;
 constexpr size_t kEnrollNullifierShaMaxBytes = 64 * kEnrollNullifierShaBlocks;  // 64
-// log2(33) → 6.
-constexpr size_t kEnrollNullifierShaLenBits = 6;
+// Worst-case bit-length is 8 * (1 + 37 + 16) = 432; log2(432) → 9.
+constexpr size_t kEnrollNullifierShaLenBits = 9;
 
 // v12 invariant 13 — `holder_seed_commit` JSON field is a 32-byte
 // SHA-256 digest serialized as 64 lowercase hex characters in the

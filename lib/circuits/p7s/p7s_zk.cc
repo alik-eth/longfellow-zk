@@ -345,19 +345,32 @@ constexpr uint8_t kSpkiP256Prefix[kSpkiPrefixLen] = {
                                                    //                unused=0)
 };
 
-// 9-byte X.520 serialNumber attribute DER prefix for a 16-byte
-// stable-ID (DIIA RNOKPP format: `TINUA-` + 10 digits, which the v1
-// lengths are dimensioned for). Attribute SEQUENCE hdr (l=23) + OID
-// 2.5.4.5 + PrintableString hdr (l=16). Asserted on-wire at
-// `cert_tbs[subject_sn_offset..+9]`. Mirrored in
+// 9-byte X.520 serialNumber attribute DER prefix. v13 (Task #37)
+// makes the value length variable: of the 9 bytes only 7 are truly
+// constant — the SEQUENCE tag `30` at index 0, the OID
+// `06 03 55 04 05` at indices 2..7, and the PrintableString tag `13`
+// at index 7. The two length bytes are `S` at index 1 (ATV SEQUENCE
+// content length = L + 7) and `L` at index 8 (PrintableString value
+// length). Index positions of the constant bytes are listed in
+// `kSubjectSnAnchorConstIdx` below; the circuit asserts ONLY those 7
+// and binds `S == L + 7` separately. The `0x17`/`0x10` here are the
+// DIIA RNOKPP (L = 16) values, kept so a 16-byte cert still matches a
+// full-9-byte memcmp on the host side. Mirrored in
 // `crates/zk-eidas-p7s/src/parser.rs`'s `X520_SUBJECT_SN_ANCHOR`.
-// Any change requires updating both sites. v1 fixes lengths at 23/16;
-// non-DIIA QTSPs with variable lengths are Task #37.
 constexpr uint8_t kSubjectSnAnchor[kSubjectSnAnchorLen] = {
-    0x30, 0x17,                                    // ATV SEQUENCE (l=23)
+    0x30, 0x17,                                    // ATV SEQUENCE (l=S; 0x17=23
+                                                   //              for L=16)
     0x06, 0x03, 0x55, 0x04, 0x05,                  // OID 2.5.4.5 (serialNumber)
-    0x13, 0x10,                                    // PrintableString (l=16)
+    0x13, 0x10,                                    // PrintableString (l=L;
+                                                   //              0x10=16)
 };
+
+// Indices within the 9-byte anchor of the 7 TRULY CONSTANT bytes
+// (v13): tag 0x30, OID 06 03 55 04 05, tag 0x13. Indices 1 (S) and 8
+// (L) are length-dependent and excluded — they are bound via the
+// `S == L + 7` and `kStableIdMinLen <= L <= kStableIdMaxLen`
+// constraints instead.
+constexpr size_t kSubjectSnAnchorConstIdx[7] = {0, 2, 3, 4, 5, 6, 7};
 
 // 17-byte CMS messageDigest attribute DER prefix (RFC 5652). Fixed for
 // all CMS SignedData whose messageDigest is SHA-256 (all modern CAdES
@@ -445,7 +458,26 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
 //   * Circuit: rewrites invariant 7 (per-app nullifier preimage), adds
 //     invariants 12 (enroll_nullifier), 13 (holder_seed_commit binding),
 //     14 (enroll_commit), 15 (holder_seed wire equality across 7+14).
-constexpr uint32_t kBlobSchemaVersion = 12;
+//
+// v13 (Task #37, 2026-05-21) — variable-length serialNumber for
+// pan-eIDAS. Hard fork from v12; v12 verifiers reject v13 inputs by
+// version-byte mismatch. The public-input wire layout is UNCHANGED
+// (enroll_nullifier is already a 256-wire public output; no new
+// public wires). What changes:
+//   * Circuit: invariant 7's stable-ID window grows from a fixed 25
+//     bytes to the max 46 (9 anchor + kStableIdMaxLen=37); only the 7
+//     truly-constant anchor bytes are asserted; the length byte L is
+//     range-checked and `S == L + 7` is enforced; NEW ETSI
+//     natural-person prefix validation (`[A-Z]{5}-`); invariant 12's
+//     enroll_nullifier SHA preimage becomes variable-length
+//     (`0x02 || stable_id[0..L] || ENROLL_DOMAIN_SEP[16]`), still 1
+//     block, with an L-positioned pad.
+//   * Witness blob: layout unchanged (subject_sn_offset already
+//     present); the deserializer reinterprets the window as variable.
+// BACKWARD COMPATIBILITY: for a 16-byte UA serialNumber the v13
+// enroll_nullifier is byte-identical to v12 (the preimage reduces to
+// the exact v12 33-byte shape when L=16).
+constexpr uint32_t kBlobSchemaVersion = 13;
 
 // ===========================================================================
 // Hash-circuit public-input layout (v12). v11 added `nullifier` (256b)
@@ -1146,29 +1178,74 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
     spki_y_v256_mac[j] = spki_window[kSpkiYStart + be_byte_idx][bit_idx];
   }
 
-  // Task 34 / invariant 7 — nullifier from stable-ID.
+  // Task 34 / invariant 7 — stable-ID extraction (v13: variable L).
   //
-  // Step 1: route a 25-byte (9 + 16) stable-ID window from cert_tbs at
-  // `subject_sn_offset`. The 9-byte DER anchor + 16-byte
-  // PrintableString value occupy a contiguous range; the shifter
-  // extracts it verbatim.
+  // Step 1: route a max-size window `9 + kStableIdMaxLen` (= 46) from
+  // cert_tbs at `subject_sn_offset`. The 9-byte DER anchor + the
+  // variable-length PrintableString value (up to kStableIdMaxLen
+  // bytes) occupy a contiguous range; the shifter extracts the max
+  // window verbatim. Bytes past `9 + L` are simply not consumed by
+  // any downstream constraint.
   std::vector<typename LC::v8> sn_window(kSubjectSnWindowLen);
   routing.template shift<typename LC::v8, kCertTbsLenBits>(
       subject_sn_offset, kSubjectSnWindowLen, sn_window.data(),
       kCertTbsMaxBytes, cert_tbs.data(), zz, /*unroll=*/3);
 
-  // Step 2: 9-byte DER anchor assertion. Without this the prover could
-  // aim the shifter at arbitrary 25 bytes of cert_tbs — e.g. a
-  // PrintableString inside an unrelated extension whose first 9 bytes
-  // coincidentally spell `30 17 06 03 55 04 05 13 10`.
-  std::vector<typename LC::v8> sn_anchor_expected(kSubjectSnAnchorLen);
-  for (size_t i = 0; i < kSubjectSnAnchorLen; ++i) {
-    sn_anchor_expected[i] = lc.template vbit<8>(kSubjectSnAnchor[i]);
+  // Step 2: assert ONLY the 7 truly-constant DER anchor bytes
+  // (`30`, `06 03 55 04 05`, `13`). Without this the prover could aim
+  // the shifter at arbitrary bytes of cert_tbs whose first bytes
+  // coincidentally spell the X.520 serialNumber ATV shape. The two
+  // length bytes `S` (index 1) and `L` (index 8) are NOT asserted
+  // here — they are length-dependent and bound below.
+  for (size_t k = 0; k < 7; ++k) {
+    size_t idx = kSubjectSnAnchorConstIdx[k];
+    typename LC::v8 anchor_byte = lc.template vbit<8>(kSubjectSnAnchor[idx]);
+    breq.assert_eq(&sn_window[idx], &anchor_byte, 1);
   }
-  breq.assert_eq(sn_window.data(), sn_anchor_expected.data(),
-                 kSubjectSnAnchorLen);
 
-  // Step 3: dual-match range check. The identical 9-byte anchor also
+  // Step 2b (v13, §5.2): variable length wire. `L := sn_window[8]` is
+  // the PrintableString value length and `S := sn_window[1]` is the
+  // ATV SEQUENCE content length — both are routed bytes of the
+  // ECDSA-verified `cert_tbs`, not free witnesses, so they cannot be
+  // forged without breaking the cert signature (invariant 1).
+  //   * `S == L + 7` links the two DER length bytes. v8 addition;
+  //     for the in-range L the sum never overflows 8 bits
+  //     (37 + 7 = 44 < 256).
+  //   * `kStableIdMinLen <= L <= kStableIdMaxLen` range-checks L so
+  //     the downstream variable SHA preimage stays inside one block.
+  const typename LC::v8& sn_len_l = sn_window[8];   // L
+  const typename LC::v8& sn_len_s = sn_window[1];   // S
+  {
+    typename LC::v8 l_plus_7 = lc.vadd(sn_len_l, uint64_t{7});
+    lc.vassert_eq(sn_len_s, l_plus_7);
+    // kStableIdMinLen <= L  <=>  NOT (L < kStableIdMinLen).
+    lc.assert1(lc.lnot(lc.vlt(sn_len_l, uint64_t{kStableIdMinLen})));
+    // L <= kStableIdMaxLen.
+    lc.assert1(lc.vleq(sn_len_l, uint64_t{kStableIdMaxLen}));
+  }
+
+  // Step 2c (v13, §5.3): ETSI natural-person semantics validation.
+  // An X.520 serialNumber is only an ETSI tax/person identifier when
+  // it has the EN 319 412-1 shape `{3-char type}{2-char country}-…`.
+  // Reject proprietary serialNumbers (e.g. a Microsec QES cert whose
+  // serialNumber is the OID-shaped `1.3.6.1.4.1.21528.2.2.3.136`) by
+  // asserting on the value `v = sn_window[9..]`:
+  //   * `v[5] == '-'` (0x2D) — the type/country / value delimiter.
+  //   * `v[0..5]` are all uppercase ASCII letters `A`-`Z`.
+  // The min-length floor (kStableIdMinLen = 8) guarantees indices
+  // 9..15 are within the asserted value.
+  {
+    typename LC::v8 dash = lc.template vbit<8>(0x2D);
+    breq.assert_eq(&sn_window[kSubjectSnAnchorLen + 5], &dash, 1);
+    for (size_t i = 0; i < 5; ++i) {
+      const typename LC::v8& c = sn_window[kSubjectSnAnchorLen + i];
+      // 'A' (0x41) <= c <= 'Z' (0x5A).
+      lc.assert1(lc.lnot(lc.vlt(c, uint64_t{0x41})));
+      lc.assert1(lc.vleq(c, uint64_t{0x5A}));
+    }
+  }
+
+  // Step 3: dual-match range check. The identical anchor also
   // appears at the ISSUER DN's serialNumber attribute (the issuer's
   // registration code fits the same X.520 ATV shape). Without this
   // check the prover could bind `nullifier` to the issuer's ID,
@@ -1319,46 +1396,109 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
         enroll_commit_target, enroll_commit_input_bw.data());
   }
 
-  // v12 (Plan 1) — invariant 12 (enroll_nullifier).
-  //   enroll_nullifier == SHA-256(0x02 || stable_id[16] ||
+  // v13 (Task #37) — invariant 12 (enroll_nullifier), variable length.
+  //   enroll_nullifier == SHA-256(0x02 || stable_id[0..L] ||
   //                               ENROLL_DOMAIN_SEP[16])
   //
-  // Preimage is 33 bytes raw → 1 SHA-256 block. The stable_id wires
-  // come from `sn_window[kSubjectSnAnchorLen..kSubjectSnAnchorLen +
-  // kStableIdLen)` (the same routed cert_tbs window invariant 7 used
-  // in v11 for its nullifier — preserved for v12 to feed enroll_nullifier
-  // instead). The dual-match anchor + range check assertions above
-  // remain the soundness gate that this stable_id is the holder's,
-  // not the issuer QTSP's registration code.
+  // Raw preimage is `1 + L + 16` bytes; for L in [8, 37] that is
+  // [25, 54] bytes, which after the >=9-byte SHA-256 Merkle-Damgaard
+  // pad still fits in exactly ONE 64-byte block. There is NO
+  // length-prefix byte and NO fixed-MAX masked stable_id buffer: only
+  // the `1 + L + 16` raw bytes are fed to the SHA. The 0x80 pad, the
+  // zero pad, and the 64-bit length field all sit at L-dependent
+  // offsets, constrained below by masked assertions over the routed
+  // `L = sn_window[8]`.
+  //
+  // BACKWARD COMPATIBILITY: for L = 16 the preimage is exactly
+  // `0x02 || stable_id[16] || ENROLL_DOMAIN_SEP[16]` (33 raw bytes),
+  // byte-identical to v12. A v12 Ukrainian holder gets the same
+  // enroll_nullifier under v13. (Verify: the buffer construction
+  // below — tag at [0], stable_id at [1..17), ENROLL_DOMAIN_SEP at
+  // [17..33), 0x80 at [33], zeros at [34..62), 0x01 0x08 at
+  // [62..64) — reduces to the v12 layout when L=16.)
+  //
+  // Every one of the 64 buffer bytes is constrained (each by exactly
+  // one masked predicate, since the predicates partition the index
+  // space given kStableIdMinLen <= L <= kStableIdMaxLen); no buffer
+  // byte enters the single hashed block unconstrained.
+  //
+  // `L` and the stable_id value bytes are routed from the
+  // ECDSA-verified `cert_tbs` — the dual-match anchor + range check +
+  // ETSI prefix assertions above are the soundness gate that this is
+  // the holder's true ETSI identifier, not the issuer QTSP's code.
   {
     // (a) Domain-separation tag at byte 0.
     typename LC::v8 ds_tag = lc.template vbit<8>(kDsTagEnrollNullifier);
     breq.assert_eq(&enroll_nullifier_input[0], &ds_tag, 1);
 
-    // (b) stable_id[16] at bytes 1..17 — REUSE the routed sn_window.
-    breq.assert_eq(&enroll_nullifier_input[1],
-                   &sn_window[kSubjectSnAnchorLen], kStableIdLen);
-
-    // (c) ENROLL_DOMAIN_SEP[16] at bytes 17..33 — compile-time constant.
-    for (size_t i = 0; i < kEnrollDomainSepLen; ++i) {
-      typename LC::v8 ds_byte = lc.template vbit<8>(kEnrollDomainSep[i]);
-      breq.assert_eq(&enroll_nullifier_input[1 + kStableIdLen + i],
-                     &ds_byte, 1);
-    }
-
-    // (d) SHA pad for 33-byte message → 1 block. Same layout as
-    // invariant 14 (33 bytes raw, 264-bit length-field tail
-    // `0x01 0x08`).
     typename LC::v8 pad80 = lc.template vbit<8>(0x80);
     typename LC::v8 pad00 = lc.template vbit<8>(0x00);
-    typename LC::v8 len_hi = lc.template vbit<8>(0x01);
-    typename LC::v8 len_lo = lc.template vbit<8>(0x08);
-    breq.assert_eq(&enroll_nullifier_input[33], &pad80, 1);
-    for (size_t i = 34; i < 62; ++i) {
+
+    // (b) stable_id[0..L] at buffer bytes [1 .. 1+L). stable_id byte j
+    // is `sn_window[kSubjectSnAnchorLen + j]`; it occupies the fixed
+    // buffer index `1 + j` and is constrained only when `j < L`.
+    for (size_t j = 0; j < kStableIdMaxLen; ++j) {
+      typename LC::BitW in_id = lc.vlt(j, sn_len_l);
+      typename LC::BitW eq =
+          lc.veq(enroll_nullifier_input[1 + j],
+                 sn_window[kSubjectSnAnchorLen + j]);
+      lc.assert_implies(in_id, eq);
+    }
+
+    // (c) ENROLL_DOMAIN_SEP[16] at buffer bytes [1+L .. 1+L+16).
+    // Domain-sep byte m sits at buffer index `1 + L + m`, an
+    // L-dependent position. For each m scan every reachable buffer
+    // index i and assert equality when `L == i - 1 - m`.
+    for (size_t m = 0; m < kEnrollDomainSepLen; ++m) {
+      typename LC::v8 ds_byte = lc.template vbit<8>(kEnrollDomainSep[m]);
+      size_t i_lo = 1 + kStableIdMinLen + m;
+      size_t i_hi = 1 + kStableIdMaxLen + m;
+      for (size_t i = i_lo; i <= i_hi; ++i) {
+        // L == i - 1 - m.
+        typename LC::BitW is_here = lc.veq(sn_len_l, uint64_t{i - 1 - m});
+        typename LC::BitW eq = lc.veq(enroll_nullifier_input[i], ds_byte);
+        lc.assert_implies(is_here, eq);
+      }
+    }
+
+    // (d) SHA-256 0x80 pad byte at buffer index `1 + L + 16` = L + 17.
+    // For L in [8, 37] the index is in [25, 54].
+    for (size_t i = kStableIdMinLen + 17; i <= kStableIdMaxLen + 17; ++i) {
+      typename LC::BitW is_here = lc.veq(sn_len_l, uint64_t{i - 17});
+      typename LC::BitW eq = lc.veq(enroll_nullifier_input[i], pad80);
+      lc.assert_implies(is_here, eq);
+    }
+
+    // (e) zero pad between the 0x80 byte and the 64-bit length field:
+    // buffer indices [L+18 .. 56). Index L+18 is in [26, 55]; the
+    // last possible zero-pad index is 55 (length field starts at 56).
+    for (size_t i = kStableIdMinLen + 18; i < 56; ++i) {
+      // zero when `L + 18 <= i`, i.e. `L <= i - 18`.
+      typename LC::BitW is_zero = lc.vleq(sn_len_l, uint64_t{i - 18});
+      typename LC::BitW eq = lc.veq(enroll_nullifier_input[i], pad00);
+      lc.assert_implies(is_zero, eq);
+    }
+    // Buffer bytes [56..62) are the high 6 bytes of the 8-byte BE
+    // length field. The max bit-length is 8 * (1 + 37 + 16) = 432,
+    // which fits in 2 bytes, so these 6 bytes are unconditionally 0.
+    for (size_t i = 56; i < 62; ++i) {
       breq.assert_eq(&enroll_nullifier_input[i], &pad00, 1);
     }
-    breq.assert_eq(&enroll_nullifier_input[62], &len_hi, 1);
-    breq.assert_eq(&enroll_nullifier_input[63], &len_lo, 1);
+
+    // (f) 64-bit BE length field low 2 bytes at [62..64). The SHA
+    // message bit-length is `8 * (1 + L + 16)` = `(L + 17) << 3`.
+    // Compute it as a 16-bit value derived from the routed `L` and
+    // assert the two tail bytes equal its big-endian halves.
+    {
+      typename LC::v16 l_ext =
+          lc.vappend(sn_len_l, lc.template vbit<8>(0));   // zext L to 16b
+      typename LC::v16 raw_len = lc.vadd(l_ext, uint64_t{17});  // L + 17
+      typename LC::v16 bit_len = lc.vshl(raw_len, 3);           // * 8
+      typename LC::v8 len_lo = lc.template slice<0, 8>(bit_len);
+      typename LC::v8 len_hi = lc.template slice<8, 16>(bit_len);
+      lc.vassert_eq(enroll_nullifier_input[62], len_hi);
+      lc.vassert_eq(enroll_nullifier_input[63], len_lo);
+    }
 
     // SHA block count fixed = 1.
     typename LC::v8 numb_const =
@@ -2043,11 +2183,25 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
   // index placeholder. Order must match Rust
   // `crates/zk-eidas-p7s-circuit/src/witness.rs`'s `to_ffi_bytes()` tail.
   if (!read_u32(p, end, out.subject_sn_offset_in_tbs)) return false;
-  // The 9+16-byte stable-ID window must fit inside real cert_tbs
-  // content (not the zero-pad region) — the anchor bytes we assert are
-  // non-zero.
-  if (out.subject_sn_offset_in_tbs + kSubjectSnWindowLen > out.cert_tbs_len) {
+  // v13 (Task #37): the 9-byte DER anchor + the variable-length value
+  // must fit inside real cert_tbs content (not the zero-pad region) —
+  // the anchor bytes we assert are non-zero. The actual value length
+  // L is the PrintableString length byte at anchor index 8; bound
+  // `subject_sn_offset + 9 + L <= cert_tbs_len`. First range-check the
+  // offset so reading the anchor stays inside the buffer.
+  if (out.subject_sn_offset_in_tbs + kSubjectSnAnchorLen > out.cert_tbs_len) {
     return false;
+  }
+  {
+    size_t sn_value_len =
+        out.cert_tbs[out.subject_sn_offset_in_tbs + 8];  // L
+    if (sn_value_len < kStableIdMinLen || sn_value_len > kStableIdMaxLen) {
+      return false;
+    }
+    if (out.subject_sn_offset_in_tbs + kSubjectSnAnchorLen + sn_value_len >
+        out.cert_tbs_len) {
+      return false;
+    }
   }
   if (!read_u32(p, end, out.subject_dn_start_offset_in_tbs)) return false;
   // Range sanity: subject_dn_start must precede subject_sn (the
@@ -2082,14 +2236,26 @@ bool parse_witness_blob(const uint8_t* blob, size_t blob_len,
     if (out.trust_anchor_index >= kTrustAnchorCount) return false;
   }
 
-  // Belt-and-suspenders: 9-byte X.520 serialNumber DER anchor at the
-  // witnessed offset. Gated by `skip_host_anchors` for parity with the
-  // SPKI / messageDigest anchors; `p7s_prove_test_bypass_host_anchors`
-  // skips this so invariant_7 tests can exercise the in-circuit anchor
-  // as the sole enforcement layer.
+  // Belt-and-suspenders: v13 (Task #37) — assert only the 7 truly
+  // constant X.520 serialNumber DER anchor bytes at the witnessed
+  // offset (the two length bytes S and L are variable). Mirrors the
+  // in-circuit per-byte anchor assertion. Gated by `skip_host_anchors`
+  // for parity with the SPKI / messageDigest anchors;
+  // `p7s_prove_test_bypass_host_anchors` skips this so invariant_7
+  // tests can exercise the in-circuit anchor as the sole enforcement
+  // layer.
   if (!skip_host_anchors) {
-    if (std::memcmp(&out.cert_tbs[out.subject_sn_offset_in_tbs],
-                    kSubjectSnAnchor, kSubjectSnAnchorLen) != 0) {
+    for (size_t k = 0; k < 7; ++k) {
+      size_t idx = kSubjectSnAnchorConstIdx[k];
+      if (out.cert_tbs[out.subject_sn_offset_in_tbs + idx] !=
+          kSubjectSnAnchor[idx]) {
+        return false;
+      }
+    }
+    // Link the two DER length bytes: S (index 1) == L (index 8) + 7.
+    if (out.cert_tbs[out.subject_sn_offset_in_tbs + 1] !=
+        static_cast<uint8_t>(out.cert_tbs[out.subject_sn_offset_in_tbs + 8] +
+                             7)) {
       return false;
     }
   }
@@ -2554,21 +2720,26 @@ static P7sErrorCode p7s_prove_impl(
   push_sha_padded_bytes<kEnrollCommitShaBlocks>(hash_filler, ec_sw, Fs);
   push_sha_block_witnesses<kEnrollCommitShaBlocks>(hash_filler, ec_sw, Fs);
 
-  // v12 (Plan 1) — invariant 12 (enroll_nullifier) private witness fill.
-  // Preimage = `0x02 || stable_id[16] || ENROLL_DOMAIN_SEP[16]` (33
-  // bytes raw → 1 SHA block). stable_id is sourced from cert_tbs at
-  // the same `subject_sn_offset_in_tbs + 9` slot invariant 12 binds
-  // via the routed `sn_window`.
-  uint8_t enroll_nullifier_raw[1 + kStableIdLen + kEnrollDomainSepLen] = {};
+  // v13 (Task #37) — invariant 12 (enroll_nullifier) private witness
+  // fill, variable length. Preimage = `0x02 || stable_id[0..L] ||
+  // ENROLL_DOMAIN_SEP[16]` where L is the PrintableString value
+  // length byte routed from cert_tbs at `subject_sn_offset + 8`. Raw
+  // length is `1 + L + 16` (<= 54 for L <= kStableIdMaxLen); still
+  // exactly 1 SHA block after Merkle-Damgaard padding. For L = 16
+  // this is byte-identical to the v12 preimage.
+  size_t en_stable_id_len =
+      wit.cert_tbs[wit.subject_sn_offset_in_tbs + 8];  // L = sn_window[8]
+  uint8_t enroll_nullifier_raw[1 + kStableIdMaxLen + kEnrollDomainSepLen] = {};
   enroll_nullifier_raw[0] = kDsTagEnrollNullifier;
   std::memcpy(&enroll_nullifier_raw[1],
               &wit.cert_tbs[wit.subject_sn_offset_in_tbs + kSubjectSnAnchorLen],
-              kStableIdLen);
-  std::memcpy(&enroll_nullifier_raw[1 + kStableIdLen],
+              en_stable_id_len);
+  std::memcpy(&enroll_nullifier_raw[1 + en_stable_id_len],
               kEnrollDomainSep, kEnrollDomainSepLen);
+  size_t enroll_nullifier_raw_len = 1 + en_stable_id_len + kEnrollDomainSepLen;
   ShaWitness<kEnrollNullifierShaBlocks> en_sw;
   compute_sha_witness<kEnrollNullifierShaBlocks>(
-      enroll_nullifier_raw, sizeof(enroll_nullifier_raw), en_sw);
+      enroll_nullifier_raw, enroll_nullifier_raw_len, en_sw);
   push_sha_padded_bytes<kEnrollNullifierShaBlocks>(hash_filler, en_sw, Fs);
   push_sha_block_witnesses<kEnrollNullifierShaBlocks>(hash_filler, en_sw, Fs);
 
