@@ -14,3 +14,6 @@
 
 proofs_add_tests(p256_sswu_test)
 target_link_libraries(p256_sswu_test ec util)
+
+proofs_add_tests(hash_to_curve_test)
+target_link_libraries(hash_to_curve_test ec util flatsha)
