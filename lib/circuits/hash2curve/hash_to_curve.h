@@ -19,10 +19,12 @@
 #include <cstdint>
 
 #include "arrays/dense.h"
+#include "circuits/ec2/ec_ops.h"
 #include "circuits/hash2curve/expand_xmd.h"
 #include "circuits/hash2curve/hash_to_curve_witness.h"
 #include "circuits/hash2curve/p256_sswu.h"
 #include "circuits/hash2curve/p256_sswu_witness.h"
+#include "ec/p256.h"
 
 /*
 In-circuit RFC 9380 hash_to_curve for the suite P256_XMD:SHA-256_SSWU_RO_.
@@ -96,11 +98,8 @@ class P256HashToCurve {
   };
 
   explicit P256HashToCurve(const LogicCircuit& lc)
-      : lc_(lc), sswu_(lc), xmd_(lc), ref_(lc.f_) {
+      : lc_(lc), sswu_(lc), xmd_(lc), ref_(lc.f_), ec_ops_(lc, p256) {
     const Field& F = lc.f_;
-    // 3*b for the complete-addition formula (a = -3 short Weierstrass).
-    k3b_ = F.mulf(F.of_scalar(3), ref_.B());
-    a_ = ref_.A();
     c256_ = F.of_scalar(256);
   }
 
@@ -124,15 +123,15 @@ class P256HashToCurve {
 
     // 4) P = Q0 + Q1 (complete projective addition, affine inputs z=1).
     EltW X3, Y3, Z3;
-    addE(X3, Y3, Z3, q0x, q0y, lc_.konst(lc_.f_.one()), q1x, q1y,
-         lc_.konst(lc_.f_.one()));
+    ec_ops_.addE(X3, Y3, Z3, q0x, q0y, lc_.konst(lc_.f_.one()), q1x, q1y,
+                 lc_.konst(lc_.f_.one()));
 
     // 5) affine normalise with witnessed inverse, then on-curve check.
     EltW one = lc_.konst(lc_.f_.one());
     lc_.assert_eq(lc_.mul(Z3, w.zinv), one);  // Z * zinv == 1
     px = lc_.mul(X3, w.zinv);
     py = lc_.mul(Y3, w.zinv);
-    is_on_curve(px, py);
+    ec_ops_.is_on_curve(px, py);
   }
 
   // Horner: acc = acc*256 + byte, MSB-first.  byte = sum_i bit_i 2^i.
@@ -156,69 +155,12 @@ class P256HashToCurve {
     return acc;
   }
 
-  void is_on_curve(const EltW& x, const EltW& y) const {
-    EltW yy = lc_.mul(y, y);
-    EltW xx = lc_.mul(x, x);
-    EltW xxx = lc_.mul(x, xx);
-    EltW ax = lc_.mul(a_, x);
-    EltW rhs = lc_.add(lc_.add(xxx, ax), lc_.konst(ref_.B()));
-    lc_.assert_eq(yy, rhs);
-  }
-
-  // Complete projective addition for a = -3 short Weierstrass (RCB 2016),
-  // identical to ecdsa/verify_circuit.h::addE.
-  void addE(EltW& X3, EltW& Y3, EltW& Z3, EltW X1, EltW Y1, EltW Z1, EltW X2,
-            EltW Y2, EltW Z2) const {
-    EltW t0 = lc_.mul(X1, X2);
-    EltW t1 = lc_.mul(Y1, Y2);
-    EltW t2 = lc_.mul(Z1, Z2);
-    EltW t3 = lc_.add(X1, Y1);
-    EltW t4 = lc_.add(X2, Y2);
-    t3 = lc_.mul(t3, t4);
-    t4 = lc_.add(t0, t1);
-    t3 = lc_.sub(t3, t4);
-    t4 = lc_.add(X1, Z1);
-    EltW t5 = lc_.add(X2, Z2);
-    t4 = lc_.mul(t4, t5);
-    t5 = lc_.add(t0, t2);
-    t4 = lc_.sub(t4, t5);
-    t5 = lc_.add(Y1, Z1);
-    EltW X3t = lc_.add(Y2, Z2);
-    t5 = lc_.mul(t5, X3t);
-    X3t = lc_.add(t1, t2);
-    t5 = lc_.sub(t5, X3t);
-    EltW Z3t = lc_.mul(a_, t4);
-    X3t = lc_.mul(k3b_, t2);
-    Z3t = lc_.add(X3t, Z3t);
-    X3t = lc_.sub(t1, Z3t);
-    Z3t = lc_.add(t1, Z3t);
-    EltW Y3t = lc_.mul(X3t, Z3t);
-    t1 = lc_.add(t0, t0);
-    t1 = lc_.add(t1, t0);
-    t2 = lc_.mul(a_, t2);
-    t4 = lc_.mul(k3b_, t4);
-    t1 = lc_.add(t1, t2);
-    t2 = lc_.sub(t0, t2);
-    t2 = lc_.mul(a_, t2);
-    t4 = lc_.add(t4, t2);
-    t0 = lc_.mul(t1, t4);
-    Y3t = lc_.add(Y3t, t0);
-    t0 = lc_.mul(t5, t4);
-    X3t = lc_.mul(t3, X3t);
-    X3t = lc_.sub(X3t, t0);
-    t0 = lc_.mul(t3, t1);
-    Z3t = lc_.mul(t5, Z3t);
-    Z3t = lc_.add(Z3t, t0);
-    X3 = X3t;
-    Y3 = Y3t;
-    Z3 = Z3t;
-  }
-
   const LogicCircuit& lc_;
   Sswu sswu_;
   Xmd xmd_;
   P256SswuReference<Field> ref_;
-  Elt a_, k3b_, c256_;
+  ECOps<LogicCircuit, P256> ec_ops_;
+  Elt c256_;
 };
 
 }  // namespace proofs
