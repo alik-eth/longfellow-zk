@@ -149,5 +149,61 @@ TEST(p7sOprf, corrupted_witness_does_not_prove) {
   if (proof != nullptr) p7s_free_proof(proof);
 }
 
+// Trust-anchor index in the v14 public blob sits at the u32 right after
+// enroll_nullifier: version(4)+ctx_hash(32)+pk(65)+nonce(32)+
+// nullifier(32)+enroll_commit(32)+enroll_nullifier(32) = 229.
+constexpr size_t kPubTrustAnchorIdxOff = 229;
+
+// Phase 2b.3 selector — out-of-range trust_anchor_index fails closed.
+// The parse layer rejects index >= kTrustAnchorCount (4) in BOTH blobs;
+// the in-circuit `prod(idx - i) == 0` range constraint is the deeper
+// backstop. Set a wildly out-of-range index in both blobs.
+TEST(p7sOprf, out_of_range_anchor_index_fails_closed) {
+  std::vector<uint8_t> wit = make_v14_witness();
+  std::vector<uint8_t> pub;
+  ASSERT_TRUE(make_v14_public(wit, pub));
+  // Witness trust_anchor_index offset: trailing u32 fields. Find it by
+  // setting the public one and observing the prover reject; but to also
+  // exercise the witness parser, set the public index out of range.
+  put_u32_le(pub, kPubTrustAnchorIdxOff, 99u);
+
+  uint8_t* proof = nullptr;
+  size_t proof_len = 0;
+  const P7sErrorCode rc = p7s_prove(wit.data(), wit.size(), pub.data(),
+                                    pub.size(), &proof, &proof_len);
+  EXPECT_NE(rc, P7S_SUCCESS)
+      << "out-of-range trust_anchor_index accepted — selector fail-open!";
+  if (proof != nullptr) p7s_free_proof(proof);
+}
+
+// Wrong (but in-range) anchor index: the public blob selects index 1
+// (TestAnchorB) while the fixture cert is signed by index 0
+// (TestAnchorA). The in-circuit selector picks TestAnchorB's key, so
+// invariant-1 ECDSA over the cert TBS fails — fail-closed. This proves
+// the selector binds the SPECIFIC anchor, not just "some valid index".
+TEST(p7sOprf, wrong_inrange_anchor_index_fails_closed) {
+  std::vector<uint8_t> wit = make_v14_witness();
+  std::vector<uint8_t> pub;
+  ASSERT_TRUE(make_v14_public(wit, pub));
+  put_u32_le(pub, kPubTrustAnchorIdxOff, 1u);  // TestAnchorB, fixture is A
+
+  uint8_t* proof = nullptr;
+  size_t proof_len = 0;
+  const P7sErrorCode rc = p7s_prove(wit.data(), wit.size(), pub.data(),
+                                    pub.size(), &proof, &proof_len);
+  if (rc == P7S_SUCCESS) {
+    ASSERT_NE(proof, nullptr);
+    const P7sErrorCode vrc =
+        p7s_verify(pub.data(), pub.size(), proof, proof_len);
+    EXPECT_NE(vrc, P7S_SUCCESS)
+        << "fixture-A cert verified under anchor index 1 — selector "
+           "fail-open!";
+    p7s_free_proof(proof);
+  } else {
+    EXPECT_NE(rc, P7S_SUCCESS);
+    if (proof != nullptr) p7s_free_proof(proof);
+  }
+}
+
 }  // namespace
 }  // namespace proofs

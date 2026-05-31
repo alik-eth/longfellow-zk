@@ -152,13 +152,60 @@ constexpr char kTestAnchorBRootPkY_decimal[] =
     "84549035652812971100161935258006361651891028412283608100255874746995940229"
     "187";
 
+// Real Diia QTSP CA P-256 root public keys (Phase 2b.3, §8.1). These
+// are PUBLIC keys of Ukraine's "Diia" Qualified Trust Services Provider
+// CA — the issuer of citizen QES leaf certs (subject
+// `serialNumber=TINUA-<RNOKPP>`). Source:
+//   http://ca.diia.gov.ua/uploads/certificates/diia_ecdsa.p7b
+// (also Ukraine's national Trusted List). Two are pinned because the
+// issuer rotates CA keys; both are valid leaf issuers in the Diia.Підпис
+// ECDSA hierarchy (avoid the DSTU 4145 / RSA branches). A real citizen
+// leaf (ECDSA-P256) verifies under the -2311 CA. SEC1 uncompressed.
+//
+// ROTATION GOVERNANCE (future): as Diia rotates CA keys the allowed set
+// changes. A later enhancement makes the pinned set an admin-settable
+// on-chain commitment (Merkle root of allowed CA keys) the circuit
+// reads, rather than this compile-time table. A compile-time set is
+// fine for now — rotation is rare and recompile-to-rotate is acceptable
+// at this stage.
+//
+// UA-43395033-2311:
+//   X 0x8500048265e919c1738e873572c1f6443895a0c03985fc71bd96a6f62a53bcc8
+//   Y 0x69d23ca6e6a2a7dc443bbb2a0b914ee35f1c74e282ecd8e6c5287c7a3d4aee10
+constexpr char kDiiaUA2311RootPkX_decimal[] =
+    "60157639984085317032243857144591567409916300241404119731688357596981577891"
+    "016";
+constexpr char kDiiaUA2311RootPkY_decimal[] =
+    "47864305589267125428873492369100630325836418204952516382052455720647888924"
+    "176";
+// UA-43395033-2503:
+//   X 0xc8b3546f4a34c021a31b3578057d1de304cbf1743a391b2032cd5b7d37184148
+//   Y 0xc2440ea2fba10872b0bc90a92371ad50f59d0e9c0216ed52fd259b8a8cc9ee54
+constexpr char kDiiaUA2503RootPkX_decimal[] =
+    "90779418088310628816706020968158030531241837634267785377256434346519973871"
+    "944";
+constexpr char kDiiaUA2503RootPkY_decimal[] =
+    "87868939244018454967800774829639315729556263329937970677956700290484567404"
+    "116";
+
 // ===========================================================================
-// Trust-anchor table (Task 36, extended to N=2 by Task #44). Compile-
-// time array of ETSI-compliant QTSP root pubkeys. The witness-driven
-// `trust_anchor_index` (a v32 public-input wire on the hash side)
-// selects which row the sig circuit's cert-sig ECDSA verifies under.
-// Phase 2b ships with N=2 (TestAnchorA + TestAnchorB, both synthetic);
-// real production anchors arrive with Task #37.
+// Trust-anchor table (Task 36; N=2 by Task #44; N=4 by Phase 2b.3).
+// Compile-time array of ETSI-compliant QTSP root pubkeys. The witness-
+// driven `trust_anchor_index` (a v32 public-input wire on the hash
+// side) selects which row the sig circuit's cert-sig ECDSA verifies
+// under, via a general one-hot / Lagrange selector in build_sig_circuit
+// (sound for any N — see there).
+//
+// Index order (Phase 3's Rust `TRUST_ANCHOR_PROBES` MUST mirror this):
+//   0  TestAnchorA  (synthetic) — the synthetic fixture cert is signed
+//                                 by this key; KEEP for tests.
+//   1  TestAnchorB  (synthetic)
+//   2  Diia UA-43395033-2311 (REAL Diia QTSP CA P-256 root)
+//   3  Diia UA-43395033-2503 (REAL Diia QTSP CA P-256 root)
+// Real citizen proofs select index 2 or 3; synthetic test fixtures
+// select 0 (or 1). The real-vs-synthetic split is fine: invariant 1's
+// ECDSA verifies the leaf TBS under whichever key the index selects, so
+// a fixture signed by TestAnchorA only verifies at index 0.
 //
 // All current anchors share:
 //   * P-256 (prime256v1) curve — prime256v1 OID baked into the 26-byte
@@ -210,7 +257,19 @@ inline const TrustAnchor kTrustAnchors[] = {
         StaticString(kTestAnchorBRootPkY_decimal),
         "TestAnchorB (synthetic, P-256)",
     },
-    // Future QTSP entries appended here (Task #37 — fixture-gated).
+    // Index 2 — REAL Diia QTSP CA root UA-43395033-2311 (Phase 2b.3).
+    {
+        StaticString(kDiiaUA2311RootPkX_decimal),
+        StaticString(kDiiaUA2311RootPkY_decimal),
+        "Diia UA-43395033-2311 (real QTSP CA, P-256)",
+    },
+    // Index 3 — REAL Diia QTSP CA root UA-43395033-2503 (Phase 2b.3).
+    {
+        StaticString(kDiiaUA2503RootPkX_decimal),
+        StaticString(kDiiaUA2503RootPkY_decimal),
+        "Diia UA-43395033-2503 (real QTSP CA, P-256)",
+    },
+    // Future QTSP entries appended here (rotation → on-chain Merkle set).
 };
 
 constexpr size_t kTrustAnchorCount =
@@ -222,14 +281,17 @@ constexpr size_t kTrustAnchorCount =
 static_assert(kTrustAnchorCount >= 1,
               "kTrustAnchors must contain at least one entry");
 
-// N=2 multiplexer (Task #44): the sig circuit's cert-sig ECDSA
-// verifies under a `(root_pk_x, root_pk_y)` pair selected from
-// `kTrustAnchors[]` by a one-hot multiplexer over the public
-// `trust_anchor_index` wire. The hash circuit still asserts
-// `vlt(trust_anchor_index, kTrustAnchorCount)` for the bound check.
-// Appending a third anchor is purely additive: extend the table
-// here, extend `TRUST_ANCHOR_PROBES` in `parser.rs` in the same
-// order, and the multiplexer picks up the new row automatically.
+// General N-entry selector (Phase 2b.3): the sig circuit's cert-sig
+// ECDSA verifies under a `(root_pk_x, root_pk_y)` pair selected from
+// `kTrustAnchors[]` by a Lagrange / one-hot selector over the public
+// `trust_anchor_index` wire (see build_sig_circuit). The hash circuit
+// still asserts `vlt(trust_anchor_index, kTrustAnchorCount)`; the sig
+// circuit independently asserts `prod_{i<N}(idx - i) == 0` (idx is one
+// of {0..N-1}) and selects `Σ_i L_i(idx)·k_i`, so out-of-range / forged
+// indices fail closed and exactly the selected anchor's key is used.
+// Appending an anchor is purely additive: extend the table here, extend
+// `TRUST_ANCHOR_PROBES` in `parser.rs` in the same order; the selector
+// picks up the new row automatically (no N hard-coded in the circuit).
 
 // Bit-width of the `trust_anchor_index` wire the hash circuit reads
 // from the public blob. 32 is overkill for small N but matches the

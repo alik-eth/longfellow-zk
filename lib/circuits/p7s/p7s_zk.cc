@@ -1749,38 +1749,81 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   // `idx * (idx - 1) == 0` which for N=2 also forces `idx ∈ {0, 1}`.
   // The two constraints agree on the valid-index set by construction.
   //
-  // For N=2, the one-hot mux `k0 + idx*(k1 - k0)` collapses to `k0`
-  // when idx == 0 and `k1` when idx == 1. The product-of-differences
-  // zero check below is the canonical `idx ∈ {0, 1}` constraint.
+  // General N-entry anchor selector (Phase 2b.3), sound for any
+  // kTrustAnchorCount via a Lagrange interpolation over the integer
+  // nodes {0, 1, ..., N-1}:
+  //
+  //   (range)  prod_{i=0}^{N-1} (idx - i) == 0
+  //            forces idx ∈ {0,...,N-1}. A forged / out-of-range idx
+  //            makes every factor non-zero ⇒ product != 0 ⇒ fails
+  //            closed. (Independent of, and stronger than, the hash
+  //            circuit's vlt(idx, N) check.)
+  //
+  //   (select) root_pk_{x,y} = Σ_i L_i(idx) · k_i^{x,y}
+  //            with  L_i(idx) = [ prod_{j≠i} (idx - j) ] · c_i,
+  //            c_i = prod_{j≠i} 1/(i - j)  (compile-time constants).
+  //            For idx ∈ {0,...,N-1}, L_i(idx) = [idx == i] (Kronecker),
+  //            so EXACTLY kTrustAnchors[idx] is selected. For N=2 this
+  //            reduces to the previous `k0 + idx·(k1-k0)` form.
   //
   // `of_string` returns Elts already in Montgomery form (fp_generic.h
-  // 329-336), so `lc.konst(...)` binds the right internal
-  // representation directly.
-  static_assert(kTrustAnchorCount == 2,
-                "N=2 sig-side mux expects exactly 2 entries. To extend "
-                "to N>2, replace the 2-way `k0 + idx*(k1-k0)` expression "
-                "with a generic Σ_i Lagrange_i(idx) * k_i construction "
-                "and update the `idx * (idx - 1) == 0` bound check.");
-  typename LC256::EltW k0_x =
-      lc.konst(p256_base.of_string(kTrustAnchors[0].root_pk_x_decimal));
-  typename LC256::EltW k0_y =
-      lc.konst(p256_base.of_string(kTrustAnchors[0].root_pk_y_decimal));
-  typename LC256::EltW k1_x =
-      lc.konst(p256_base.of_string(kTrustAnchors[1].root_pk_x_decimal));
-  typename LC256::EltW k1_y =
-      lc.konst(p256_base.of_string(kTrustAnchors[1].root_pk_y_decimal));
-  typename LC256::EltW one_elt = lc.konst(p256_base.one());
+  // 329-336), so `lc.konst(...)` binds the right internal representation.
+  static_assert(kTrustAnchorCount >= 1, "need at least one trust anchor");
 
-  // idx ∈ {0, 1}: (idx) * (idx - 1) == 0.
-  typename LC256::EltW idx_minus_one = lc.sub(trust_anchor_idx, one_elt);
-  typename LC256::EltW idx_product = lc.mul(trust_anchor_idx, idx_minus_one);
-  lc.assert_eq(idx_product, lc.konst(p256_base.zero()));
+  // Constant nodes 0..N-1 as field elements + their EltW konst wires.
+  typename LC256::EltW node_w[kTrustAnchorCount];
+  for (size_t j = 0; j < kTrustAnchorCount; ++j) {
+    node_w[j] = lc.konst(p256_base.of_scalar(static_cast<uint64_t>(j)));
+  }
 
-  // root_pk = k0 + idx * (k1 - k0).
-  typename LC256::EltW root_pk_x =
-      lc.add(k0_x, lc.mul(trust_anchor_idx, lc.sub(k1_x, k0_x)));
-  typename LC256::EltW root_pk_y =
-      lc.add(k0_y, lc.mul(trust_anchor_idx, lc.sub(k1_y, k0_y)));
+  // (idx - j) factors, computed once and reused for both the range
+  // product and every L_i numerator.
+  typename LC256::EltW diff_w[kTrustAnchorCount];
+  for (size_t j = 0; j < kTrustAnchorCount; ++j) {
+    diff_w[j] = lc.sub(trust_anchor_idx, node_w[j]);
+  }
+
+  // (range) prod_{i} (idx - i) == 0.
+  {
+    typename LC256::EltW prod = diff_w[0];
+    for (size_t j = 1; j < kTrustAnchorCount; ++j) {
+      prod = lc.mul(prod, diff_w[j]);
+    }
+    lc.assert_eq(prod, lc.konst(p256_base.zero()));
+  }
+
+  // (select) root_pk = Σ_i L_i(idx) · k_i.
+  typename LC256::EltW root_pk_x = lc.konst(p256_base.zero());
+  typename LC256::EltW root_pk_y = lc.konst(p256_base.zero());
+  for (size_t i = 0; i < kTrustAnchorCount; ++i) {
+    // Numerator prod_{j != i} (idx - j).
+    typename LC256::EltW num;
+    bool started = false;
+    for (size_t j = 0; j < kTrustAnchorCount; ++j) {
+      if (j == i) continue;
+      num = started ? lc.mul(num, diff_w[j]) : diff_w[j];
+      started = true;
+    }
+    // Denominator constant c_i = prod_{j != i} 1/(i - j), at build time.
+    Fp256Base::Elt c = p256_base.one();
+    for (size_t j = 0; j < kTrustAnchorCount; ++j) {
+      if (j == i) continue;
+      Fp256Base::Elt diff_ij = p256_base.subf(
+          p256_base.of_scalar(static_cast<uint64_t>(i)),
+          p256_base.of_scalar(static_cast<uint64_t>(j)));
+      c = p256_base.mulf(c, p256_base.invertf(diff_ij));
+    }
+    // L_i(idx) = num · c.  For N==1 the numerator is empty ⇒ L_0 == 1.
+    typename LC256::EltW li =
+        (kTrustAnchorCount == 1) ? lc.konst(c) : lc.mul(num, lc.konst(c));
+
+    typename LC256::EltW kx =
+        lc.konst(p256_base.of_string(kTrustAnchors[i].root_pk_x_decimal));
+    typename LC256::EltW ky =
+        lc.konst(p256_base.of_string(kTrustAnchors[i].root_pk_y_decimal));
+    root_pk_x = lc.add(root_pk_x, lc.mul(li, kx));
+    root_pk_y = lc.add(root_pk_y, lc.mul(li, ky));
+  }
 
   P7sSigCircuit sig_gadget(lc, p256, n256_order);
   // mac_pub layout (matches kMacMsgIdx*):
