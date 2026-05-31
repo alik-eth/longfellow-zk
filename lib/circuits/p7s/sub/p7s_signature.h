@@ -75,19 +75,29 @@ constexpr size_t kMacPluckerBits = 2;
 // Number of distinct 256-bit messages the p7s circuits bind across
 // the hash/sig field split. Task 25a bound 1 sentinel; Task 29 bound
 // `e = SHA-256(cert_tbs)`; Task 26 (invariant 2a + SPKI binding)
-// bumps to 4:
+// bumped to 4; the OPRF-fusion (feat/p7s-v13) bumps to 5:
 //   message 0 = `e  = SHA-256(cert_tbs)`
 //   message 1 = `e2 = SHA-256(signedAttrs_rewritten)`
 //   message 2 = cert_tbs SPKI X coordinate (LE-ordered 32 bytes)
 //   message 3 = cert_tbs SPKI Y coordinate (LE-ordered 32 bytes)
-constexpr size_t kMacMessagesCount = 4;
+//   message 4 = `stable_id` — the cert-verified X.520 serialNumber
+//               value (DIIA RNOKPP `TINUA-<10 digits>`, 16 bytes),
+//               packed (LE-ordered, zero-padded) into ONE 256-bit
+//               MAC message. This is the SOUNDNESS GATE for the OPRF:
+//               the OPRF's `rnokpp` input on the sig side MUST equal
+//               this cert-verified value, NOT a free witness. Without
+//               this binding one valid cert could mint unlimited OPRF
+//               identities (Sybil). See the doc on `kStableIdMacBytes`
+//               in p7s_circuit.h for the UA-fixed-length constraint.
+constexpr size_t kMacMessagesCount = 5;
 
 // Message indices — keeps layout-dependent code (MAC index slicing,
 // dense-array fillers, etc.) readable.
-constexpr size_t kMacMsgIdxE       = 0;
-constexpr size_t kMacMsgIdxE2      = 1;
-constexpr size_t kMacMsgIdxSpkiX   = 2;
-constexpr size_t kMacMsgIdxSpkiY   = 3;
+constexpr size_t kMacMsgIdxE        = 0;
+constexpr size_t kMacMsgIdxE2       = 1;
+constexpr size_t kMacMsgIdxSpkiX    = 2;
+constexpr size_t kMacMsgIdxSpkiY    = 3;
+constexpr size_t kMacMsgIdxStableId = 4;
 
 // MAC produces 2 GF(2^128) values per bound message (low + high
 // halves of the 256-bit value). Part of the primitive, not per-task.
@@ -308,12 +318,22 @@ class P7sSignature {
   // private-witness section. Their binding to the actual cert_tbs
   // SPKI bytes is enforced by the MAC unpack_msg on `vw.macs_[2]` /
   // `vw.macs_[3]` below.
+  //   (G) `stable_id` cross-binds to the cert_tbs serialNumber bytes
+  //       (hash side). `stable_id` is a PRIVATE Fp256Base EltW the
+  //       caller declared via `eltw_input()`; its binding to the
+  //       cert-verified X.520 serialNumber value is enforced by the
+  //       MAC unpack_msg on `vw.macs_[4]`. The OPRF block (fused in a
+  //       later step) recomposes the SAME field element from its
+  //       `rnokpp` byte wires and asserts equality, so the OPRF input
+  //       is provably the cert identity — the Sybil gate.
   void assert_signature(EltW root_pk_x, EltW root_pk_y, EltW holder_pk_x,
                         EltW holder_pk_y, EltW msg_e, EltW msg_e2,
+                        EltW stable_id,
                         const v128 mac_e[kMacValuesPerMessage],
                         const v128 mac_e2[kMacValuesPerMessage],
                         const v128 mac_spki_x[kMacValuesPerMessage],
                         const v128 mac_spki_y[kMacValuesPerMessage],
+                        const v128 mac_stable_id[kMacValuesPerMessage],
                         const v128& av, const Witness& vw) const {
     Ecdsa ecc(lc_, ec_, order_);
 
@@ -325,13 +345,14 @@ class P7sSignature {
                           vw.ecdsa_content_);
 
     // MAC gadget — per-message cross-field binding. Same `av` across
-    // all four (sampled once from the shared transcript post-commit);
+    // all five (sampled once from the shared transcript post-commit);
     // per-message `ap` committed pre-commit in the mac witnesses.
     mac macc(lc_);
-    macc.verify_mac(msg_e,       mac_e,       av, vw.macs_[kMacMsgIdxE],     order_);
-    macc.verify_mac(msg_e2,      mac_e2,      av, vw.macs_[kMacMsgIdxE2],    order_);
-    macc.verify_mac(holder_pk_x, mac_spki_x,  av, vw.macs_[kMacMsgIdxSpkiX], order_);
-    macc.verify_mac(holder_pk_y, mac_spki_y,  av, vw.macs_[kMacMsgIdxSpkiY], order_);
+    macc.verify_mac(msg_e,       mac_e,         av, vw.macs_[kMacMsgIdxE],        order_);
+    macc.verify_mac(msg_e2,      mac_e2,        av, vw.macs_[kMacMsgIdxE2],       order_);
+    macc.verify_mac(holder_pk_x, mac_spki_x,    av, vw.macs_[kMacMsgIdxSpkiX],    order_);
+    macc.verify_mac(holder_pk_y, mac_spki_y,    av, vw.macs_[kMacMsgIdxSpkiY],    order_);
+    macc.verify_mac(stable_id,   mac_stable_id, av, vw.macs_[kMacMsgIdxStableId], order_);
   }
 };
 

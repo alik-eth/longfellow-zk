@@ -30,3 +30,11 @@ install(FILES p7s_zk.h DESTINATION include)
 add_executable(p7s_v12_smoke_test p7s_v12_smoke_test.cc)
 target_link_libraries(p7s_v12_smoke_test p7s_static crypto)
 proofs_add_testing_libraries(p7s_v12_smoke_test)
+
+# OPRF-fusion (feat/p7s-v13) — MAC message #4 (stable_id) Sybil-gate
+# test. Fast (EvaluationBackend, no full prove): asserts the honest
+# stable_id binding verifies and that a sig-side value differing from
+# the hash-side cert-extracted value trips the MAC (fail-closed).
+add_executable(p7s_stable_id_mac_test p7s_stable_id_mac_test.cc)
+target_link_libraries(p7s_stable_id_mac_test p7s_static crypto)
+proofs_add_testing_libraries(p7s_stable_id_mac_test)

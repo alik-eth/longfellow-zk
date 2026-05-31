@@ -158,6 +158,25 @@ constexpr size_t kSubjectSnAnchorLen = 9;
 constexpr size_t kSubjectSnWindowLen =
     kSubjectSnAnchorLen + kStableIdMaxLen;  // 46
 
+// OPRF-fusion (feat/p7s-v13) — number of stable_id value bytes bound
+// across the hash/sig field split as MAC message #4 (the Sybil gate).
+//
+// The cross-field MAC primitive binds a SINGLE 256-bit message that
+// must reduce below the P-256 curve order. A `stable_id` value is
+// therefore MAC-bound as ONE field element recomposed (big-endian)
+// from EXACTLY kStableIdMacBytes value bytes. For the DIIA RNOKPP
+// format `TINUA-<10 digits>` this is 16 bytes — which fits trivially
+// below the order. The hash circuit additionally asserts
+// `L == kStableIdMacBytes` so the MAC covers the WHOLE identifier:
+// a longer (L > 16) or shorter cert serialNumber fails closed rather
+// than letting the OPRF hash a truncated / mismatched prefix (a Sybil
+// risk for variable-length non-UA IDs). Multi-country support with
+// L != 16 needs either per-country kStableIdMacBytes or a multi-field
+// MAC; deferred. This constant defines the UA OPRF pack scope.
+constexpr size_t kStableIdMacBytes = 16;
+static_assert(kStableIdMacBytes <= kStableIdMaxLen,
+              "stable_id MAC window must fit inside the routed value");
+
 // v12 nullifier SHA input is `0x01 || holder_seed[32] || context_hash[32]`
 // = 65 bytes raw. SHA-256 Merkle-Damgård padding adds ≥9 bytes (0x80 +
 // pad zeros + 64-bit length), so the minimum padded length is 74 bytes,

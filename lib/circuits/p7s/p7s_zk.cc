@@ -498,7 +498,9 @@ constexpr uint32_t kBlobSchemaVersion = 13;
 //   [1801 .. 1801 + 32)              = trust_anchor_index v32
 //   [1833 .. 1833 + kTotalMacValues) = mac values (EltW each).
 //   [1833 + kTotalMacValues]         = av (EltW)
-//   npub_in_hash = 1833 + kTotalMacValues + 1 = 1842
+//   npub_in_hash = 1833 + kTotalMacValues + 1
+//     v12 (4 MAC msgs): kTotalMacValues=8  → 1842
+//     v13 OPRF-fusion (5 MAC msgs): kTotalMacValues=10 → 1844
 constexpr size_t kHashPubConst = 1;
 constexpr size_t kHashPubContextHash = 256;
 constexpr size_t kHashPubPk = kPkBytes * 8;                   // 520
@@ -518,8 +520,9 @@ constexpr size_t kHashMacInputWires = kTotalMacValues + 1;
 constexpr size_t kHashPubTotal = kHashPubPreMac + kHashMacInputWires;
 static_assert(kHashPubPreMac == 1833,
               "layout drift — update kHashPubPreMac comment & index");
-static_assert(kHashPubTotal == 1842,
-              "layout drift — update npub_in_hash comment");
+static_assert(kHashPubTotal == 1844,
+              "layout drift — update npub_in_hash comment "
+              "(v13 OPRF-fusion: 5 MAC messages → kTotalMacValues=10)");
 
 // Expected total wire count for the hash circuit (public + private +
 // SHA witnesses + MAC region). Pinned-value runtime guard symmetric
@@ -543,7 +546,10 @@ static_assert(kHashPubTotal == 1842,
 // New `vinput<W>()` calls in `build_hash_circuit` shift this total —
 // re-run the canary, read the new total from the eval_quad / build
 // log, update both the constant and the WIRECOUNT comment above.
-constexpr size_t kExpectedHashWitnessTotal_v12 = 273504;
+// v13 OPRF-fusion: +4 vs v12 — the 5th MAC message (stable_id) adds 2
+// hash-side public MAC EltW (kHashMacInputWires) + 2 private `ap`
+// halves (mac_witness_stable_id), i.e. 273504 → 273508.
+constexpr size_t kExpectedHashWitnessTotal_v12 = 273508;
 
 // Index (in the DENSE Wit array) where the hash MAC region begins.
 // update_mac_in_dense writes (kTotalMacValues + 1) native EltW at this
@@ -576,8 +582,12 @@ constexpr size_t kHashMacIndex = kHashPubPreMac;
 //   [642 .. 642 + 128)               = mac values[5] (mac_spki_x[1])
 //   [770 .. 770 + 128)               = mac values[6] (mac_spki_y[0])
 //   [898 .. 898 + 128)               = mac values[7] (mac_spki_y[1])
-//   [1026 .. 1026 + 128)             = av (v128)
-//   npub_in_sig = 1 + 1 + 9 × 128    = 1154
+//   [1026 .. 1026 + 128)             = mac values[8] (mac_stable_id[0]) ← v13
+//   [1154 .. 1154 + 128)             = mac values[9] (mac_stable_id[1]) ← v13
+//   [1282 .. 1282 + 128)             = av (v128)
+//   npub_in_sig = 1 + 1 + (kTotalMacValues+1) × 128
+//     v12 (4 MAC msgs): 1 + 1 + 9 × 128  = 1154
+//     v13 OPRF-fusion (5 MAC msgs): 1 + 1 + 11 × 128 = 1410
 constexpr size_t kSigPubConst = 1;
 // Single Fp256Base EltW carrying the trust_anchor_index (small u32
 // value, range-constrained by the in-circuit `idx * (idx - 1) == 0`
@@ -591,8 +601,9 @@ constexpr size_t kSigMacInputWires =
     (kTotalMacValues + 1) * kSigMacBitsPerWire;  // 9 × 128 = 1152
 constexpr size_t kSigPubTotal =
     kSigPubConst + kSigPubTrustAnchorIdx + kSigMacInputWires;
-static_assert(kSigPubTotal == 1154,
-              "layout drift — update npub_in_sig comment");
+static_assert(kSigPubTotal == 1410,
+              "layout drift — update npub_in_sig comment "
+              "(v13 OPRF-fusion: 5 MAC messages → kSigMacInputWires=11×128)");
 
 // Index (in the DENSE W_sig array) where the sig MAC region begins.
 // update_mac_in_dense writes 128 wires per MAC value (one field
@@ -948,6 +959,10 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   mac_witness_spki_x.input(lc);
   MACHWitness mac_witness_spki_y;
   mac_witness_spki_y.input(lc);
+  // OPRF-fusion (feat/p7s-v13) — 5th MAC message: the cert-verified
+  // stable_id (X.520 serialNumber value), the Sybil gate for the OPRF.
+  MACHWitness mac_witness_stable_id;
+  mac_witness_stable_id.input(lc);
 
   // ---- Constraints (unchanged from v6) ----
   // Invariant 9 — context hash.
@@ -1525,6 +1540,40 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
     e2_digest_v256_mac[j] = e2_digest_bytes[be_byte_idx][bit_idx];
   }
 
+  // OPRF-fusion (feat/p7s-v13) — MAC message #4: stable_id (Sybil gate).
+  //
+  // Bind the cert-verified X.520 serialNumber VALUE bytes
+  // `sn_window[kSubjectSnAnchorLen + i]` (i in [0, kStableIdMacBytes))
+  // as ONE 256-bit MAC message. The value is interpreted big-endian as
+  // a field element (byte 0 most significant), zero-padded above the
+  // kStableIdMacBytes-th byte, so the LE-bit MAC convention places
+  // value byte i at MAC bytes (kStableIdMacBytes - 1 - i):
+  //   stable_id_mac[j] = sn_window[anchor + (kStableIdMacBytes-1-(j/8))]
+  // for j/8 < kStableIdMacBytes, else 0. The sig side recomposes the
+  // SAME field element (host: nat_from_be over the same value bytes →
+  // Montgomery; circuit: MAC::unpack_msg over the LE message) so the
+  // OPRF `rnokpp` is provably the cert identity.
+  //
+  // GATE: assert L == kStableIdMacBytes so the MAC'd window is the WHOLE
+  // serialNumber value. A cert whose serialNumber is longer/shorter than
+  // the UA RNOKPP length fails closed here (no truncated-prefix Sybil).
+  {
+    typename LC::v8 want_len = lc.template vbit<8>(kStableIdMacBytes);
+    lc.vassert_eq(sn_len_l, want_len);
+  }
+  typename LC::v256 stable_id_v256_mac;
+  for (size_t j = 0; j < 256; ++j) {
+    size_t le_byte_idx = j / 8;
+    size_t bit_idx = j % 8;
+    if (le_byte_idx < kStableIdMacBytes) {
+      size_t be_byte_idx = kStableIdMacBytes - 1 - le_byte_idx;
+      stable_id_v256_mac[j] =
+          sn_window[kSubjectSnAnchorLen + be_byte_idx][bit_idx];
+    } else {
+      stable_id_v256_mac[j] = lc.bit(0);
+    }
+  }
+
   MACH mac_check(lc);
   // mac_pub layout (matches kMacMsgIdx*):
   //   [0..2)   = mac_e[0..2]
@@ -1532,21 +1581,24 @@ std::unique_ptr<Circuit<F>> build_hash_circuit() {
   //   [4..6)   = mac_spki_x[0..2]
   //   [6..8)   = mac_spki_y[0..2]
   //   [8]      = av
-  typename LC::EltW mac_e_vals     [kMacValuesPerMessage];
-  typename LC::EltW mac_e2_vals    [kMacValuesPerMessage];
-  typename LC::EltW mac_spki_x_vals[kMacValuesPerMessage];
-  typename LC::EltW mac_spki_y_vals[kMacValuesPerMessage];
+  typename LC::EltW mac_e_vals        [kMacValuesPerMessage];
+  typename LC::EltW mac_e2_vals       [kMacValuesPerMessage];
+  typename LC::EltW mac_spki_x_vals   [kMacValuesPerMessage];
+  typename LC::EltW mac_spki_y_vals   [kMacValuesPerMessage];
+  typename LC::EltW mac_stable_id_vals[kMacValuesPerMessage];
   for (size_t i = 0; i < kMacValuesPerMessage; ++i) {
-    mac_e_vals     [i] = mac_pub[kMacMsgIdxE     * kMacValuesPerMessage + i];
-    mac_e2_vals    [i] = mac_pub[kMacMsgIdxE2    * kMacValuesPerMessage + i];
-    mac_spki_x_vals[i] = mac_pub[kMacMsgIdxSpkiX * kMacValuesPerMessage + i];
-    mac_spki_y_vals[i] = mac_pub[kMacMsgIdxSpkiY * kMacValuesPerMessage + i];
+    mac_e_vals        [i] = mac_pub[kMacMsgIdxE        * kMacValuesPerMessage + i];
+    mac_e2_vals       [i] = mac_pub[kMacMsgIdxE2       * kMacValuesPerMessage + i];
+    mac_spki_x_vals   [i] = mac_pub[kMacMsgIdxSpkiX    * kMacValuesPerMessage + i];
+    mac_spki_y_vals   [i] = mac_pub[kMacMsgIdxSpkiY    * kMacValuesPerMessage + i];
+    mac_stable_id_vals[i] = mac_pub[kMacMsgIdxStableId * kMacValuesPerMessage + i];
   }
   typename LC::EltW av_h = mac_pub[kTotalMacValues];
-  mac_check.verify_mac(mac_e_vals,      av_h, e_digest_v256_mac,  mac_witness_e);
-  mac_check.verify_mac(mac_e2_vals,     av_h, e2_digest_v256_mac, mac_witness_e2);
-  mac_check.verify_mac(mac_spki_x_vals, av_h, spki_x_v256_mac,    mac_witness_spki_x);
-  mac_check.verify_mac(mac_spki_y_vals, av_h, spki_y_v256_mac,    mac_witness_spki_y);
+  mac_check.verify_mac(mac_e_vals,         av_h, e_digest_v256_mac,  mac_witness_e);
+  mac_check.verify_mac(mac_e2_vals,        av_h, e2_digest_v256_mac, mac_witness_e2);
+  mac_check.verify_mac(mac_spki_x_vals,    av_h, spki_x_v256_mac,    mac_witness_spki_x);
+  mac_check.verify_mac(mac_spki_y_vals,    av_h, spki_y_v256_mac,    mac_witness_spki_y);
+  mac_check.verify_mac(mac_stable_id_vals, av_h, stable_id_v256_mac, mac_witness_stable_id);
 
   return Q.mkcircuit(/*nc=*/1);
 }
@@ -1595,6 +1647,15 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   // is via MAC (messages 0 and 1), not via exposing them.
   typename LC256::EltW e_wit  = lc.eltw_input();
   typename LC256::EltW e2_wit = lc.eltw_input();
+
+  // OPRF-fusion (feat/p7s-v13) — stable_id as a PRIVATE Fp256Base EltW,
+  // bound to the hash circuit's cert_tbs serialNumber bytes via MAC
+  // message #4. The OPRF block (fused in a later step) recomposes the
+  // SAME field element from its `rnokpp` byte wires and asserts
+  // equality, so the OPRF input is provably the cert identity (Sybil
+  // gate). Privacy: kept PRIVATE (a fixed serialNumber would otherwise
+  // be a stable cross-proof identifier).
+  typename LC256::EltW stable_id_wit = lc.eltw_input();
 
   P7sSigWitness sig_witness;
   sig_witness.input(lc);
@@ -1649,25 +1710,28 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
   // mac_pub layout (matches kMacMsgIdx*):
   //   [0..2) = mac_e, [2..4) = mac_e2, [4..6) = mac_spki_x,
   //   [6..8) = mac_spki_y, [8] = av.
-  typename LC256::v128 mac_e_vals     [kMacValuesPerMessage]{};
-  typename LC256::v128 mac_e2_vals    [kMacValuesPerMessage]{};
-  typename LC256::v128 mac_spki_x_vals[kMacValuesPerMessage]{};
-  typename LC256::v128 mac_spki_y_vals[kMacValuesPerMessage]{};
+  typename LC256::v128 mac_e_vals        [kMacValuesPerMessage]{};
+  typename LC256::v128 mac_e2_vals       [kMacValuesPerMessage]{};
+  typename LC256::v128 mac_spki_x_vals   [kMacValuesPerMessage]{};
+  typename LC256::v128 mac_spki_y_vals   [kMacValuesPerMessage]{};
+  typename LC256::v128 mac_stable_id_vals[kMacValuesPerMessage]{};
   for (size_t i = 0; i < kMacValuesPerMessage; ++i) {
-    mac_e_vals     [i] = mac_pub[kMacMsgIdxE     * kMacValuesPerMessage + i];
-    mac_e2_vals    [i] = mac_pub[kMacMsgIdxE2    * kMacValuesPerMessage + i];
-    mac_spki_x_vals[i] = mac_pub[kMacMsgIdxSpkiX * kMacValuesPerMessage + i];
-    mac_spki_y_vals[i] = mac_pub[kMacMsgIdxSpkiY * kMacValuesPerMessage + i];
+    mac_e_vals        [i] = mac_pub[kMacMsgIdxE        * kMacValuesPerMessage + i];
+    mac_e2_vals       [i] = mac_pub[kMacMsgIdxE2       * kMacValuesPerMessage + i];
+    mac_spki_x_vals   [i] = mac_pub[kMacMsgIdxSpkiX    * kMacValuesPerMessage + i];
+    mac_spki_y_vals   [i] = mac_pub[kMacMsgIdxSpkiY    * kMacValuesPerMessage + i];
+    mac_stable_id_vals[i] = mac_pub[kMacMsgIdxStableId * kMacValuesPerMessage + i];
   }
   typename LC256::v128 av_s{};
   av_s = mac_pub[kTotalMacValues];
 
-  // Both ECDSA verifications + four MAC bindings in one call. Soundness
+  // Both ECDSA verifications + five MAC bindings in one call. Soundness
   // argument lives in P7sSignature::assert_signature's doc comment.
   sig_gadget.assert_signature(root_pk_x, root_pk_y, holder_pk_x, holder_pk_y,
-                              e_wit, e2_wit,
+                              e_wit, e2_wit, stable_id_wit,
                               mac_e_vals, mac_e2_vals,
                               mac_spki_x_vals, mac_spki_y_vals,
+                              mac_stable_id_vals,
                               av_s, sig_witness);
 
   return Q.mkcircuit(/*nc=*/1);
@@ -2577,6 +2641,37 @@ static P7sErrorCode p7s_prove_impl(
   Fp256Base::Elt holder_pkX = p256_base.to_montgomery(nhxnat);
   Fp256Base::Elt holder_pkY = p256_base.to_montgomery(nhynat);
 
+  // OPRF-fusion (feat/p7s-v13) — stable_id (MAC message #4, Sybil gate).
+  // The cert-verified X.520 serialNumber VALUE bytes start at
+  // `subject_sn_offset + kSubjectSnAnchorLen`. The hash circuit asserts
+  // `L == kStableIdMacBytes`, so a non-UA-length cert is rejected
+  // in-circuit; mirror that constraint here so an honest prover with a
+  // wrong-length cert fails cleanly rather than building an
+  // inconsistent witness.
+  const size_t kStableIdValAbs =
+      wit.subject_sn_offset_in_tbs + kSubjectSnAnchorLen;
+  if (kStableIdValAbs + kStableIdMacBytes > wit.cert_tbs_len) {
+    return P7S_INVALID_INPUT;
+  }
+  if (wit.cert_tbs[wit.subject_sn_offset_in_tbs + 8] != kStableIdMacBytes) {
+    // L (PrintableString value length) must equal the UA RNOKPP length
+    // for the OPRF pack; the hash circuit's `L == kStableIdMacBytes`
+    // assertion would otherwise trip at prove time.
+    return P7S_INVALID_INPUT;
+  }
+  uint8_t stable_id_be[kStableIdMacBytes];
+  std::memcpy(stable_id_be, &wit.cert_tbs[kStableIdValAbs], kStableIdMacBytes);
+  // Field element bound on the sig side: big-endian value of the
+  // kStableIdMacBytes bytes (byte 0 most significant), reduced mod p
+  // via to_montgomery. nat_from_be is defined over Nat::kBytes (32), so
+  // zero-extend the 16-byte value into a 32-byte big-endian buffer
+  // first (high 16 bytes zero ⇒ same integer).
+  uint8_t stable_id_be32[Fp256Nat::kBytes] = {0};
+  std::memcpy(&stable_id_be32[Fp256Nat::kBytes - kStableIdMacBytes],
+              stable_id_be, kStableIdMacBytes);
+  Fp256Nat nsidnat = nat_from_be<Fp256Nat>(stable_id_be32);
+  Fp256Base::Elt stable_id_elt = p256_base.to_montgomery(nsidnat);
+
   // Build BOTH sig-side ECDSA witnesses. Failures here mean the
   // prover supplied (r, s) that don't verify under the respective
   // public key — malicious prover or fixture mismatch.
@@ -2773,6 +2868,11 @@ static P7sErrorCode p7s_prove_impl(
   sig_filler.push_back(holder_pkY);
   sig_filler.push_back(e_elt);
   sig_filler.push_back(e2_elt);
+  // OPRF-fusion (feat/p7s-v13) — stable_id private EltW (declared right
+  // after e2_wit in build_sig_circuit). Field element == big-endian
+  // value of the cert serialNumber bytes; bound to the hash side via
+  // MAC message #4.
+  sig_filler.push_back(stable_id_elt);
 
   // MAC witnesses — LE-ordered 32 bytes of each bound message.
   // `spki_x_be` / `spki_y_be` and `kSpkiXAbs` / `kSpkiYAbs` were
@@ -2792,6 +2892,18 @@ static P7sErrorCode p7s_prove_impl(
   for (size_t i = 0; i < kSpkiXYLen; ++i) {
     spki_x_le[i] = spki_x_be[kSpkiXYLen - 1 - i];
     spki_y_le[i] = spki_y_be[kSpkiXYLen - 1 - i];
+  }
+  // OPRF-fusion (feat/p7s-v13) — stable_id LE message (MAC message #4).
+  // The 256-bit MAC message is the big-endian value of the
+  // kStableIdMacBytes serialNumber bytes, zero-extended to 32 bytes,
+  // then expressed little-endian (byte i = value byte at LE position i).
+  // This is byte-identical to the hash circuit's `stable_id_v256_mac`
+  // view (le_byte_idx < kStableIdMacBytes ⇒ value byte
+  // kStableIdMacBytes-1-le_byte_idx; else 0) and to the field element
+  // `stable_id_elt` recomposed via nat_from_be above.
+  uint8_t stable_id_le[kMacMessageBytes] = {0};
+  for (size_t i = 0; i < kStableIdMacBytes; ++i) {
+    stable_id_le[i] = stable_id_be[kStableIdMacBytes - 1 - i];
   }
   // Note: ap halves are sliced per-message; ap[0..2] pair with e,
   // ap[2..4] with e2, ap[4..6] with SPKI_X, ap[6..8] with SPKI_Y.
@@ -2813,6 +2925,12 @@ static P7sErrorCode p7s_prove_impl(
   {
     MacWitness<Fp256Base> mw(p256_base, Fs);
     mw.compute_witness(&ap[kMacMsgIdxSpkiY * kMacValuesPerMessage], spki_y_le);
+    mw.fill_witness(sig_filler);
+  }
+  {
+    MacWitness<Fp256Base> mw(p256_base, Fs);
+    mw.compute_witness(&ap[kMacMsgIdxStableId * kMacValuesPerMessage],
+                       stable_id_le);
     mw.fill_witness(sig_filler);
   }
 
@@ -2867,6 +2985,8 @@ static P7sErrorCode p7s_prove_impl(
                   &ap  [kMacMsgIdxSpkiX * kMacValuesPerMessage], spki_x_le);
   mac_ref.compute(&macs[kMacMsgIdxSpkiY * kMacValuesPerMessage], av,
                   &ap  [kMacMsgIdxSpkiY * kMacValuesPerMessage], spki_y_le);
+  mac_ref.compute(&macs[kMacMsgIdxStableId * kMacValuesPerMessage], av,
+                  &ap  [kMacMsgIdxStableId * kMacValuesPerMessage], stable_id_le);
 
   // Write the MAC values + av into both dense arrays' MAC slots.
   // DOES NOT touch the committed snapshot — commit() captured the
