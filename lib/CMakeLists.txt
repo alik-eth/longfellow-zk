@@ -72,6 +72,7 @@ add_subdirectory(circuits/hash2curve)
 add_subdirectory(circuits/logic)
 add_subdirectory(circuits/mac)
 add_subdirectory(circuits/mdoc)
+add_subdirectory(circuits/oprf)
 add_subdirectory(circuits/p7s)
 add_subdirectory(circuits/sha)
 
