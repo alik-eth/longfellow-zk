@@ -38,3 +38,12 @@ proofs_add_testing_libraries(p7s_v12_smoke_test)
 add_executable(p7s_stable_id_mac_test p7s_stable_id_mac_test.cc)
 target_link_libraries(p7s_stable_id_mac_test p7s_static crypto)
 proofs_add_testing_libraries(p7s_stable_id_mac_test)
+
+# OPRF-fusion (Phase 2b.2) — full fused p7s+OPRF prove/verify smoke
+# test. Builds a v14 witness/public pair from the v13 fixture (+
+# synthetic OPRF Y/M/s) and runs the full pipeline; the positive prove
+# now includes the OPRF block (H2C + 2 scalar-muls + SHA on the sig
+# side), so it is slower than the v12 smoke test.
+add_executable(p7s_oprf_smoke_test p7s_oprf_smoke_test.cc)
+target_link_libraries(p7s_oprf_smoke_test p7s_static crypto)
+proofs_add_testing_libraries(p7s_oprf_smoke_test)

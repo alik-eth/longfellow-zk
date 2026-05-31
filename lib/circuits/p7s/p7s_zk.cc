@@ -283,6 +283,8 @@
 #include "circuits/logic/routing.h"
 #include "circuits/mac/mac_reference.h"
 #include "circuits/mac/mac_witness.h"
+#include "circuits/oprf/oprf_blind.h"
+#include "circuits/oprf/oprf_blind_witness.h"
 #include "circuits/p7s/p7s_circuit.h"
 #include "circuits/p7s/p7s_hash.h"
 #include "circuits/p7s/sub/byte_range_eq.h"
@@ -407,6 +409,17 @@ using LC256 = Logic<Fp256Base, CB256>;
 using P7sSigCircuit = P7sSignature<LC256, Fp256Base, P256>;
 using P7sSigWitness = typename P7sSigCircuit::Witness;
 
+// OPRF-fusion (feat/p7s-v13, Phase 2b.2) — the in-circuit OPRF blinding
+// block runs on the SIG side over Fp256Base. Its `rnokpp` message is
+// the kStableIdMacBytes (16) cert-verified serialNumber value bytes
+// fed in natural order (rnokpp[0] = 'T', ...); the gadget recomposition
+// of those bytes (big-endian) is asserted == `stable_id_wit`, the MAC
+// message-#4 field element, so the OPRF identity is provably the cert
+// identity (Sybil gate from MAC #5).
+constexpr size_t kRnokppBytes = kStableIdMacBytes;  // 16
+using OprfBlindCircuit = OprfBlind<LC256, Fp256Base, kRnokppBytes>;
+using OprfBlindHostWitness = OprfBlindWitness<Fp256Base, kRnokppBytes>;
+
 // Root of unity for the f_p256^2 extension field (same as mdoc_zk.cc).
 static constexpr char kRootX[] =
     "112649224146410281873500457609690258373018840430489408729223714171582664"
@@ -477,7 +490,19 @@ static_assert((size_t{1} << kSignedContentLogN) == kMaxSignedContent,
 // BACKWARD COMPATIBILITY: for a 16-byte UA serialNumber the v13
 // enroll_nullifier is byte-identical to v12 (the preimage reduces to
 // the exact v12 33-byte shape when L=16).
-constexpr uint32_t kBlobSchemaVersion = 13;
+// v14 (OPRF-fusion, Phase 2b.2): the public blob gains the OPRF
+// values appended after `trust_anchor_index`:
+//   u8 Y.x[32]  (public input  — service-provided OPRF eval point)
+//   u8 Y.y[32]  (public input)
+//   u8 M.x[32]  (public output — blinded request point r·H2C(stable_id))
+//   u8 M.y[32]  (public output)
+//   u8 s[32]    (public output — SHA-256(N.x||N.y))
+// all 32-byte BIG-ENDIAN. Public blob grows 233 → 393 bytes. The
+// witness blob is unchanged (the OPRF host witness — k, r, N, the
+// scalar-mul / H2C / SHA sub-traces — is derived inside p7s_prove from
+// the cert's stable_id + a synthetic service key, not carried in the
+// blob; see the OPRF host-witness construction in p7s_prove_impl).
+constexpr uint32_t kBlobSchemaVersion = 14;
 
 // ===========================================================================
 // Hash-circuit public-input layout (v12). v11 added `nullifier` (256b)
@@ -585,9 +610,27 @@ constexpr size_t kHashMacIndex = kHashPubPreMac;
 //   [1026 .. 1026 + 128)             = mac values[8] (mac_stable_id[0]) ← v13
 //   [1154 .. 1154 + 128)             = mac values[9] (mac_stable_id[1]) ← v13
 //   [1282 .. 1282 + 128)             = av (v128)
-//   npub_in_sig = 1 + 1 + (kTotalMacValues+1) × 128
-//     v12 (4 MAC msgs): 1 + 1 + 9 × 128  = 1154
-//     v13 OPRF-fusion (5 MAC msgs): 1 + 1 + 11 × 128 = 1410
+//
+//   ---- OPRF public I/O (Phase 2b.2, appended after the MAC region) ----
+//   [1410]                           = OPRF Y.x   (EltW, PUBLIC INPUT)
+//   [1411]                           = OPRF Y.y   (EltW, PUBLIC INPUT)
+//   [1412]                           = OPRF M.x   (EltW, PUBLIC OUTPUT)
+//   [1413]                           = OPRF M.y   (EltW, PUBLIC OUTPUT)
+//   [1414 .. 1414 + 256)             = OPRF s[32] (32 × v8, PUBLIC OUTPUT)
+//   npub_in_sig = 1 + 1 + (kTotalMacValues+1) × 128 + 4 + 256
+//     v12 (4 MAC msgs):               1 + 1 + 9 × 128            = 1154
+//     v13 MAC #5 (5 MAC msgs):        1 + 1 + 11 × 128           = 1410
+//     v14 OPRF-fusion (+Y,M,s):       1410 + 4 + 256             = 1670
+//
+// NB: M, s, Y are modeled as PUBLIC INPUTS (not sumcheck `lc.output`)
+// asserted in-circuit, exactly like the hash circuit's `nullifier` /
+// `enroll_commit` / `enroll_nullifier` "public outputs". The p7s ZK
+// proof path (ZkProver/ZkVerifier + Ligero) binds public *inputs* the
+// verifier supplies from the public blob; it has no channel for
+// sumcheck circuit outputs (`nv`). The verifier supplies the claimed
+// M, s, Y and the circuit asserts they equal the OprfBlind result, so
+// the soundness is identical to a true output (a wrong M/s/Y makes the
+// assert_eq trip, the proof fails to verify).
 constexpr size_t kSigPubConst = 1;
 // Single Fp256Base EltW carrying the trust_anchor_index (small u32
 // value, range-constrained by the in-circuit `idx * (idx - 1) == 0`
@@ -598,17 +641,32 @@ constexpr size_t kSigPubTrustAnchorIdx = 1;
 // field element, so it's bit-decomposed).
 constexpr size_t kSigMacBitsPerWire = 128;
 constexpr size_t kSigMacInputWires =
-    (kTotalMacValues + 1) * kSigMacBitsPerWire;  // 9 × 128 = 1152
+    (kTotalMacValues + 1) * kSigMacBitsPerWire;  // 11 × 128 = 1408
+// OPRF public I/O appended after the MAC region: Y.x, Y.y, M.x, M.y as
+// single Fp256Base EltWs (4 wires) + s as 32 v8 (256 bit wires).
+constexpr size_t kSigPubOprfYMxy = 4;            // Yx, Yy, Mx, My
+constexpr size_t kSigPubOprfS = 32 * 8;          // s[32] bit-decomposed
+constexpr size_t kSigPubOprf = kSigPubOprfYMxy + kSigPubOprfS;  // 260
 constexpr size_t kSigPubTotal =
-    kSigPubConst + kSigPubTrustAnchorIdx + kSigMacInputWires;
-static_assert(kSigPubTotal == 1410,
+    kSigPubConst + kSigPubTrustAnchorIdx + kSigMacInputWires + kSigPubOprf;
+static_assert(kSigPubTotal == 1670,
               "layout drift — update npub_in_sig comment "
-              "(v13 OPRF-fusion: 5 MAC messages → kSigMacInputWires=11×128)");
+              "(v14 OPRF-fusion: MAC region 11×128 + Y(2) + M(2) + s(256))");
 
 // Index (in the DENSE W_sig array) where the sig MAC region begins.
 // update_mac_in_dense writes 128 wires per MAC value (one field
 // element per bit).
 constexpr size_t kSigMacIndex = kSigPubConst + kSigPubTrustAnchorIdx;  // 2
+// Index where the OPRF public I/O region begins (right after the MAC
+// region: const + idx + (kTotalMacValues+1)×128).
+constexpr size_t kSigOprfIndex =
+    kSigPubConst + kSigPubTrustAnchorIdx + kSigMacInputWires;  // 1410
+static_assert(kSigOprfIndex == 1410,
+              "OPRF public-I/O region must start right after the MAC "
+              "region (const + idx + 11×128). Phase-3 Rust mirror pins "
+              "this offset.");
+static_assert(kSigOprfIndex + kSigPubOprf == kSigPubTotal,
+              "OPRF public-I/O region must end exactly at npub_in_sig.");
 
 // ===========================================================================
 // Hash circuit builder — keeps every pre-v7 constraint intact and adds
@@ -1630,6 +1688,17 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
     mac_pub[i] = lc.template vinput<128>();
   }
 
+  // OPRF public I/O (Phase 2b.2), appended after the MAC region at
+  // kSigOprfIndex. Y = (Yx, Yy) is the PUBLIC INPUT eval point; M =
+  // (Mx, My) and s[32] are PUBLIC OUTPUTS the verifier supplies and the
+  // OprfBlind result is asserted against (see kSigPubTotal note).
+  typename LC256::EltW oprf_yx = lc.eltw_input();
+  typename LC256::EltW oprf_yy = lc.eltw_input();
+  typename LC256::EltW oprf_mx = lc.eltw_input();
+  typename LC256::EltW oprf_my = lc.eltw_input();
+  typename LC256::v8 oprf_s[32];
+  for (size_t i = 0; i < 32; ++i) oprf_s[i] = lc.template vinput<8>();
+
   // ---- Private witness ----
   Q.private_input();
 
@@ -1659,6 +1728,13 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
 
   P7sSigWitness sig_witness;
   sig_witness.input(lc);
+
+  // OPRF-fusion (Phase 2b.2) — the OprfBlind private witness bundle
+  // (rnokpp bytes, shared scalar r, point N + its SHA preimage, the
+  // H2C / scalar-mul / SHA sub-witnesses). Declared after the signature
+  // witness so the prover-side fill order matches.
+  typename OprfBlindCircuit::Witness oprf_wit;
+  oprf_wit.input(lc);
 
   // ---- Constraints ----
   // Trust-anchor root public key: one-hot multiplexer over
@@ -1733,6 +1809,42 @@ std::unique_ptr<Circuit<Fp256Base>> build_sig_circuit() {
                               mac_spki_x_vals, mac_spki_y_vals,
                               mac_stable_id_vals,
                               av_s, sig_witness);
+
+  // ===== OPRF blinding block (Phase 2b.2) =====
+  //
+  // (1) Bind the OprfBlind `rnokpp` input to the MAC-bound stable_id
+  //     (Sybil gate). `rnokpp[i]` is the serialNumber value byte i in
+  //     NATURAL order (rnokpp[0] = 'T'). Recompose the big-endian field
+  //     element sum_i rnokpp[i]·256^(15-i) and assert it equals
+  //     `stable_id_wit` — which MAC #4 binds to the cert-extracted
+  //     serialNumber (big-endian value, byte 0 most significant). So
+  //     the OPRF hashes EXACTLY the cert identity, not a free witness.
+  {
+    typename LC256::EltW c256 = lc.konst(p256_base.of_scalar(256));
+    typename LC256::EltW acc = lc.konst(p256_base.zero());
+    for (size_t i = 0; i < kRnokppBytes; ++i) {
+      // byte -> field element (LSB-first bit recomposition).
+      typename LC256::EltW b = lc.konst(p256_base.zero());
+      typename LC256::Elt p = p256_base.one();
+      for (size_t k = 0; k < 8; ++k) {
+        b = lc.axpy(b, p, lc.eval(oprf_wit.rnokpp[i][k]));
+        p = p256_base.addf(p, p);
+      }
+      acc = lc.add(lc.mul(c256, acc), b);
+    }
+    lc.assert_eq(acc, stable_id_wit);
+  }
+
+  // (2) Run the OPRF block: M = r·H2C(rnokpp); r·N == Y; s = SHA256(N).
+  //     Y is the public eval-point INPUT; the gadget exposes M and s,
+  //     which we assert equal the public OUTPUT wires.
+  OprfBlindCircuit oprf(lc);
+  typename LC256::EltW oprf_Mx, oprf_My;
+  typename LC256::v8 oprf_s_out[32];
+  oprf.blind(oprf_wit, oprf_yx, oprf_yy, oprf_Mx, oprf_My, oprf_s_out);
+  lc.assert_eq(oprf_Mx, oprf_mx);
+  lc.assert_eq(oprf_My, oprf_my);
+  for (size_t i = 0; i < 32; ++i) lc.vassert_eq(oprf_s_out[i], oprf_s[i]);
 
   return Q.mkcircuit(/*nc=*/1);
 }
@@ -2074,6 +2186,16 @@ struct ParsedPublic {
   uint8_t enroll_commit[kEnrollCommitLen];
   uint8_t enroll_nullifier[kEnrollNullifierLen];
   uint32_t trust_anchor_index;
+  // v14 (OPRF-fusion, Phase 2b.2) — OPRF public I/O, all 32-byte
+  // big-endian P-256 coordinates / 32-byte SHA output. `Y` is a public
+  // INPUT (the service eval point); `M` and `s` are public OUTPUTS the
+  // verifier supplies and the sig circuit asserts equal to the OprfBlind
+  // result over the MAC-bound stable_id.
+  uint8_t oprf_yx[32];
+  uint8_t oprf_yy[32];
+  uint8_t oprf_mx[32];
+  uint8_t oprf_my[32];
+  uint8_t oprf_s[32];
 };
 
 // If `skip_host_anchors` is true, the host-side DER-prefix assertions
@@ -2381,6 +2503,15 @@ bool parse_public_blob(const uint8_t* blob, size_t blob_len,
   if (!read_u32(p, end, out.trust_anchor_index)) return false;
   if (out.trust_anchor_index >= kTrustAnchorCount) return false;
 
+  // v14 (OPRF-fusion) — OPRF public I/O: Y.x, Y.y, M.x, M.y, s, each
+  // 32 big-endian bytes, in that order.
+  if (end - p < 32 * 5) return false;
+  std::memcpy(out.oprf_yx, p, 32); p += 32;
+  std::memcpy(out.oprf_yy, p, 32); p += 32;
+  std::memcpy(out.oprf_mx, p, 32); p += 32;
+  std::memcpy(out.oprf_my, p, 32); p += 32;
+  std::memcpy(out.oprf_s,  p, 32); p += 32;
+
   if (p != end) return false;
   return true;
 }
@@ -2455,6 +2586,65 @@ Nat nat_from_be(const uint8_t be[/* Nat::kBytes */]) {
   return Nat::of_bytes(tmp);
 }
 
+// ============================ OPRF host witness ============================
+//
+// Phase 2b.2 synthetic OPRF. In production the blinding scalar `r` is
+// fresh client randomness and the service key `k` lives only in the
+// OPRF node (it returns Y = k·M, never k). For this self-contained
+// bring-up we derive BOTH deterministically so the C++ smoke test can
+// assemble a public blob whose (Y, M, s) match the prover witness
+// exactly. The values are fixed test scalars (< n256_order), identical
+// in shape to oprf_blind_test's key1()/blind1().
+//
+// SECURITY NOTE: deterministic r here is a TEST artifact. The real
+// flow keeps r as fresh per-request randomness (unlinkability) — this
+// helper is only for the synthetic smoke fixture, never the shipped
+// prover entry. Documented as a concern in the handoff.
+inline Fp256Nat oprf_synthetic_k() {
+  return Fp256Nat(
+      "0x39a3e7b6f1c2d4e5a6b7c8d9e0f10213243546576879a0b1c2d3e4f506172839");
+}
+inline Fp256Nat oprf_synthetic_r() {
+  return Fp256Nat(
+      "0x0123456789abcdeffedcba98765432100f1e2d3c4b5a69788796a5b4c3d2e1f0");
+}
+
+// Build the full OprfBlind host witness over the cert-verified stable_id
+// (16 serialNumber value bytes, NATURAL order: rnokpp[0]='T', ...) with
+// the synthetic (k, r). Returns false if any OPRF host check trips
+// (identity points etc. — astronomically unlikely for a valid id).
+bool build_oprf_host_witness(const uint8_t stable_id_natural[kRnokppBytes],
+                             OprfBlindHostWitness& out) {
+  const Fp256Nat k = oprf_synthetic_k();
+  const Fp256Nat r = oprf_synthetic_r();
+  // oprf_blind_witness check()s on identity points (panics) — guard the
+  // (impossible-for-valid-input) degenerate cases by trusting the
+  // helper; a real id never hits them. The helper fills h2c, mul_h,
+  // mul_n, sha sub-witnesses + the public mx/my/yx/yy/s fields.
+  oprf_blind_witness<Fp256Base, kRnokppBytes>(p256_base, p256, k,
+                                              stable_id_natural, r, out);
+  return true;
+}
+
+// Push the OPRF public I/O region of the SIG circuit (Phase 2b.2):
+//   Yx, Yy, Mx, My — each one Fp256Base EltW (Montgomery form), from
+//                    the big-endian coordinate bytes in the public blob;
+//   s[32]          — 32 v8, each byte LSB-first (8 bit wires).
+// Used by BOTH the prove and verify paths (both have ParsedPublic).
+void push_sig_oprf_public(DenseFiller<Fp256Base>& filler,
+                          const ParsedPublic& pub) {
+  filler.push_back(p256_base.to_montgomery(nat_from_be<Fp256Nat>(pub.oprf_yx)));
+  filler.push_back(p256_base.to_montgomery(nat_from_be<Fp256Nat>(pub.oprf_yy)));
+  filler.push_back(p256_base.to_montgomery(nat_from_be<Fp256Nat>(pub.oprf_mx)));
+  filler.push_back(p256_base.to_montgomery(nat_from_be<Fp256Nat>(pub.oprf_my)));
+  for (size_t i = 0; i < 32; ++i) {
+    for (size_t k = 0; k < 8; ++k) {
+      filler.push_back((pub.oprf_s[i] >> k) & 1 ? p256_base.one()
+                                                : p256_base.zero());
+    }
+  }
+}
+
 // =========================== Proof serialization ===========================
 
 // Little-endian u32 write into a byte vector.
@@ -2501,6 +2691,40 @@ P7sErrorCode p7s_prove_test_bypass_host_anchors(
   return p7s_prove_impl(witness_blob, witness_blob_len, public_blob,
                         public_blob_len, proof_out, proof_len_out,
                         /*skip_host_anchors=*/true);
+}
+
+// TEST-ONLY (Phase 2b.2) — compute the synthetic OPRF public I/O for a
+// witness blob so the vendor smoke test can build a self-consistent
+// v14 public blob.
+P7sErrorCode p7s_oprf_public_for_witness(const uint8_t* witness_blob,
+                                         size_t witness_blob_len,
+                                         uint8_t* out160) {
+  using namespace proofs;
+  using namespace proofs::p7s;
+  if (witness_blob == nullptr || out160 == nullptr) return P7S_NULL_INPUT;
+
+  ParsedWitness wit{};
+  if (!parse_witness_blob(witness_blob, witness_blob_len, wit,
+                          /*skip_host_anchors=*/false)) {
+    return P7S_INVALID_INPUT;
+  }
+  const size_t off = wit.subject_sn_offset_in_tbs + kSubjectSnAnchorLen;
+  if (off + kRnokppBytes > wit.cert_tbs_len) return P7S_INVALID_INPUT;
+  if (wit.cert_tbs[wit.subject_sn_offset_in_tbs + 8] != kStableIdMacBytes) {
+    return P7S_INVALID_INPUT;
+  }
+  uint8_t stable_id_natural[kRnokppBytes];
+  std::memcpy(stable_id_natural, &wit.cert_tbs[off], kRnokppBytes);
+
+  OprfBlindHostWitness h;
+  if (!build_oprf_host_witness(stable_id_natural, h)) return P7S_INVALID_INPUT;
+
+  oprf_elt_to_be32<Fp256Base>(p256_base, h.yx, out160 + 0);
+  oprf_elt_to_be32<Fp256Base>(p256_base, h.yy, out160 + 32);
+  oprf_elt_to_be32<Fp256Base>(p256_base, h.mx, out160 + 64);
+  oprf_elt_to_be32<Fp256Base>(p256_base, h.my, out160 + 96);
+  std::memcpy(out160 + 128, h.s, 32);
+  return P7S_SUCCESS;
 }
 
 static P7sErrorCode p7s_prove_impl(
@@ -2671,6 +2895,31 @@ static P7sErrorCode p7s_prove_impl(
               stable_id_be, kStableIdMacBytes);
   Fp256Nat nsidnat = nat_from_be<Fp256Nat>(stable_id_be32);
   Fp256Base::Elt stable_id_elt = p256_base.to_montgomery(nsidnat);
+
+  // OPRF host witness over the cert-verified stable_id (natural order:
+  // stable_id_be[0] = serialNumber byte 0 = 'T'). `stable_id_be` holds
+  // exactly the kRnokppBytes (16) value bytes in natural order, so it
+  // doubles as the OprfBlind `rnokpp`. Computes M = r·H2C(stable_id),
+  // Y = k·M, N = k·H, s = SHA256(N) with the synthetic (k, r).
+  OprfBlindHostWitness oprf_host;
+  if (!build_oprf_host_witness(stable_id_be, oprf_host)) {
+    return P7S_INVALID_INPUT;
+  }
+  // The verifier supplies (Y, M, s) via the public blob; the prover's
+  // computed values MUST match or the in-circuit assert_eq (and thus
+  // verification) fails. Self-check here for a clean early error.
+  {
+    uint8_t be[32];
+    oprf_elt_to_be32<Fp256Base>(p256_base, oprf_host.yx, be);
+    if (std::memcmp(be, pub.oprf_yx, 32) != 0) return P7S_INVALID_INPUT;
+    oprf_elt_to_be32<Fp256Base>(p256_base, oprf_host.yy, be);
+    if (std::memcmp(be, pub.oprf_yy, 32) != 0) return P7S_INVALID_INPUT;
+    oprf_elt_to_be32<Fp256Base>(p256_base, oprf_host.mx, be);
+    if (std::memcmp(be, pub.oprf_mx, 32) != 0) return P7S_INVALID_INPUT;
+    oprf_elt_to_be32<Fp256Base>(p256_base, oprf_host.my, be);
+    if (std::memcmp(be, pub.oprf_my, 32) != 0) return P7S_INVALID_INPUT;
+    if (std::memcmp(oprf_host.s, pub.oprf_s, 32) != 0) return P7S_INVALID_INPUT;
+  }
 
   // Build BOTH sig-side ECDSA witnesses. Failures here mean the
   // prover supplied (r, s) that don't verify under the respective
@@ -2861,9 +3110,16 @@ static P7sErrorCode p7s_prove_impl(
       p256_base.of_scalar(static_cast<uint64_t>(pub.trust_anchor_index)));
   push_sig_mac_placeholders(sig_filler);
 
+  // OPRF public I/O (Phase 2b.2) — Yx, Yy, Mx, My (EltW) + s[32] (v8).
+  // Order MUST match build_sig_circuit's public-input declaration
+  // (right after the MAC region). Filled from the public blob (the
+  // prover self-checked its computed values == the blob above).
+  push_sig_oprf_public(sig_filler, pub);
+
   // Private section — order MUST match build_sig_circuit's declaration:
-  //   holder_pk_x, holder_pk_y, e_wit, e2_wit, then
-  //   P7sSigWitness (macs_[0..4], ecdsa_cert_, ecdsa_content_).
+  //   holder_pk_x, holder_pk_y, e_wit, e2_wit, stable_id_wit,
+  //   P7sSigWitness (macs_[0..5], ecdsa_cert_, ecdsa_content_),
+  //   then the OprfBlind witness.
   sig_filler.push_back(holder_pkX);
   sig_filler.push_back(holder_pkY);
   sig_filler.push_back(e_elt);
@@ -2938,6 +3194,13 @@ static P7sErrorCode p7s_prove_impl(
   // ecdsa_cert_ first, then ecdsa_content_.
   ecdsa_cert_wit.fill_witness(sig_filler);
   ecdsa_content_wit.fill_witness(sig_filler);
+
+  // OPRF private witness (Phase 2b.2) — declared LAST in the sig
+  // private section (after the P7sSigWitness). The OprfBlind static
+  // fill emits rnokpp bytes, shared r bits, N coords + SHA preimage,
+  // and the H2C / scalar-mul / SHA sub-witnesses in the exact order
+  // OprfBlind::Witness::input() consumed them.
+  OprfBlindCircuit::Witness::fill(sig_filler, p256_base, oprf_host);
 
   if (sig_filler.size() != c_sig.ninputs) return P7S_INVALID_INPUT;
 
@@ -3099,6 +3362,9 @@ P7sErrorCode p7s_verify(const uint8_t* public_blob, size_t public_blob_len,
   // layout). The remaining public-input wires are the MAC region —
   // filled below.
   push_sig_mac_values(sig_filler, macs, av);
+  // OPRF public I/O (Phase 2b.2) — Yx, Yy, Mx, My, s from the public
+  // blob. Same order as the prove path / circuit declaration.
+  push_sig_oprf_public(sig_filler, pub);
   if (sig_filler.size() != c_sig.npub_in) return P7S_VERIFIER_FAILURE;
 
   bool ok_h = hash_v.verify(pr_hash, pub_hash, tv);

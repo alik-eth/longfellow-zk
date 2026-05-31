@@ -141,6 +141,16 @@ extern P7sErrorCode p7s_verify(
 // Free a proof buffer returned by p7s_prove.
 extern void p7s_free_proof(uint8_t* proof);
 
+// TEST-ONLY (Phase 2b.2): given a v14 witness blob, extract the
+// cert-verified stable_id and compute the synthetic OPRF public I/O
+// (Y, M, s) using the same deterministic (k, r) the prover uses.
+// Writes 5 × 32 = 160 big-endian bytes to `out` in the public-blob
+// order: Y.x | Y.y | M.x | M.y | s. Lets the vendor smoke test build a
+// self-consistent v14 public blob without re-implementing the OPRF
+// host derivation. Returns P7S_SUCCESS on success.
+extern P7sErrorCode p7s_oprf_public_for_witness(
+    const uint8_t* witness_blob, size_t witness_blob_len, uint8_t* out160);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
