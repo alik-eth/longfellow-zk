@@ -229,6 +229,64 @@ TEST(P256Sswu, NegativeTestsTripAssertion) {
 }
 
 // ---------------------------------------------------------------------------
+// 3b) Adversarial canonical-range test: a non-canonical alias (value + p) of
+//     a sgn0-feeding decomposition has the SAME field element but a flipped
+//     bit[0] (since p is odd).  The < p range check must reject it.
+// ---------------------------------------------------------------------------
+TEST(P256Sswu, NonCanonicalSgn0AliasRejected) {
+  using Nat = Field::N;
+  using EvalBackend = EvaluationBackend<Field>;
+  using LogicCircuit = Logic<Field, EvalBackend>;
+  using Gadget = P256SswuCircuit<LogicCircuit, Field>;
+  using BitW = LogicCircuit::BitW;
+
+  const Field& F = p256_base;
+  const EvalBackend ebk(F, false);  // do not panic; read assertion_failed()
+  const LogicCircuit lc(&ebk, F);
+  Gadget g(lc);
+
+  const Nat p(
+      "0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff");
+
+  // For an element with a small canonical integer `value`, the only other
+  // 256-bit integer congruent to it mod p is value + p (value + 2p overflows
+  // 256 bits).  This alias is >= p and, since p is odd, has the opposite
+  // bit[0] -- exactly the sgn0-forgery the range check must block.
+  //
+  // Drive decompose_and_pin() directly: the checked element `v` is fixed to
+  // the canonical small value, and we feed it the alias bits.  recon == v
+  // still holds in-field (alias reduces to value), so ONLY the < p check can
+  // reject it.
+  auto run_bits = [&](uint64_t value, bool use_alias) -> bool {
+    Nat n(value);
+    if (use_alias) n.add(p);  // value + p (>= p, fits in 256 bits)
+    Elt v = F.of_scalar(value);
+    BitW bits[256];
+    for (size_t k = 0; k < 256; ++k) bits[k] = lc.bit(n.bit(k) & 1);
+    (void)g.decompose_and_pin(lc.konst(v), bits);
+    return ebk.assertion_failed();
+  };
+
+  // Honest canonical decompositions must pass (both parities).
+  EXPECT_FALSE(run_bits(4u, /*use_alias=*/false)) << "honest even value tripped";
+  EXPECT_FALSE(run_bits(7u, /*use_alias=*/false)) << "honest odd value tripped";
+
+  // Sanity: value + p flips bit[0] for both parities.
+  {
+    Nat a(4u);
+    a.add(p);
+    EXPECT_NE(a.bit(0) & 1, Nat(4u).bit(0) & 1);
+  }
+
+  // The non-canonical aliases (same field element, flipped sgn0) must be
+  // rejected by the < p range check.
+  EXPECT_TRUE(run_bits(4u, /*use_alias=*/true))
+      << "non-canonical alias of even value not rejected";
+  EXPECT_TRUE(run_bits(7u, /*use_alias=*/true))
+      << "non-canonical alias of odd value not rejected";
+}
+
+// ---------------------------------------------------------------------------
 // 4) One full compiled prove -> verify round-trip, public (x, y).
 // ---------------------------------------------------------------------------
 std::unique_ptr<Circuit<Field>> make_circuit() {

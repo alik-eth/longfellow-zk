@@ -136,6 +136,14 @@ class P256SswuCircuit {
       pow2_[i] = p;
       p = F.addf(p, p);
     }
+    // Little-endian bits of the field modulus, for the canonical-range
+    // (value < p) check on the sgn0 bit decompositions.  p =
+    // 2^256 - 2^224 + 2^192 + 2^96 - 1 (Fp256Base).
+    Nat modulus(
+        "0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff");
+    for (size_t i = 0; i < kBits; ++i) {
+      mod_bits_[i] = lc.bit(modulus.bit(i) & 1);
+    }
   }
 
   // g(x) = x^3 + A*x + B in-circuit.
@@ -214,27 +222,40 @@ class P256SswuCircuit {
     y_out = y;
   }
 
- private:
   // Assert each bit is a bit, reconstruct sum b[i] 2^i, assert it equals v,
-  // and return bit[0] (the sgn0 bit).
+  // assert the 256-bit value is < p (canonical), and return bit[0] (sgn0).
+  // Public so the canonical-range defense can be exercised in isolation.
   BitW decompose_and_pin(const EltW& v, const BitW bits[kBits]) const {
     // recon = sum_i bit[i] * 2^i, using precomputed power-of-two constants
     // (Logic::as_scalar relies on F.beta(), which only supports i < 64).
+    typename LogicCircuit::template bitvec<kBits> bv;
     EltW recon = lc_.konst(lc_.f_.zero());
     for (size_t i = 0; i < kBits; ++i) {
       lc_.assert_is_bit(bits[i]);
+      bv[i] = bits[i];
       // bit[i] as a field wire times 2^i, accumulated.
       recon = lc_.axpy(recon, pow2_[i], lc_.eval(bits[i]));
     }
     lc_.assert_eq(recon, v);
+
+    // Canonical-range check: the 256-bit value must be < p.  Without this,
+    // since 2^256 > p, a prover could supply the non-canonical alias
+    // (value + p) -- same field element, but a flipped bit[0] -- and thereby
+    // flip sgn0 to forge -y.  RFC 9380 sgn0 is defined on the canonical
+    // integer in [0, p).  Reuses the same bitwise less-than the ecdsa gadget
+    // uses to bound scalars by the curve order.
+    lc_.assert1(lc_.vlt(bv, mod_bits_));
+
     return bits[0];
   }
 
+ private:
   const LogicCircuit& lc_;
   Ref ref_;
   Elt a_, b_, z_, znr_;
   Elt minusB_over_A_, B_over_ZA_;
   Elt pow2_[kBits];
+  typename LogicCircuit::template bitvec<kBits> mod_bits_;
 };
 
 }  // namespace proofs
